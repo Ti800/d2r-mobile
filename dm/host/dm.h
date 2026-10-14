@@ -6,6 +6,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+// 手机产品（iOS、安卓）：玩家装的包——缺省开触屏默认设置、真实声音、性能记录、3D 渲染比例等；与之相对的是 Mac 开发宿主（闸门 / 对拍缺省全关）。
+// 只表示「产品缺省」；真正依赖 iOS 系统的分支（内嵌签名代码段、CoreFoundation 等）仍按 TARGET_OS_IPHONE。
+// Phone product (iOS, Android): the package players install -- touch default settings, real sound, performance logging, 3D render scale etc. are on by default; the counterpart is the Mac development host (gates / A-B comparisons, all off by default).
+// It only means "product defaults"; branches that truly depend on the iOS system (embedded signed code segments, CoreFoundation, etc.) still use TARGET_OS_IPHONE.
+#if defined(__ANDROID__) || (defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
+#define DM_PHONE 1
+#else
+#define DM_PHONE 0
+#endif
 
 #define MAX_MOD 8
 #define LOG(...) do { fprintf(stderr, "[dm] " __VA_ARGS__); fputc('\n', stderr); } while (0)

@@ -8,8 +8,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
+#endif
 #include "hle.h"
 
 module_t g_mod[MAX_MOD];
@@ -19,6 +21,7 @@ pthread_key_t g_keyres[2], g_keyaspect, g_keyaspectui;   // g_keyaspect：宽高
 enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_KRES0, KEY_KRES1, KEY_KASPECT, KEY_KASPECTUI, KEY_N };
 
 uint64_t resolve_import(module_t *m, const char *name);
+static void tsd_probe(void);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
 
 static pthread_key_t key_value(unsigned i) {
@@ -36,16 +39,53 @@ static void create_keys(void) {
     if (pthread_key_create(&g_keyres[0], NULL) || pthread_key_create(&g_keyres[1], NULL) ||
         pthread_key_create(&g_keyaspect, NULL) || pthread_key_create(&g_keyaspectui, NULL)) die("创建参数位键失败");
     LOG("键号 K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu KRES0=%lu KRES1=%lu KASPECT=%lu KASPECTUI=%lu",
-        g_key18, g_keytls, g_keytlr, g_keygate, g_keyres[0], g_keyres[1], g_keyaspect, g_keyaspectui);
+        (unsigned long)g_key18, (unsigned long)g_keytls, (unsigned long)g_keytlr, (unsigned long)g_keygate,
+        (unsigned long)g_keyres[0], (unsigned long)g_keyres[1], (unsigned long)g_keyaspect, (unsigned long)g_keyaspectui);
+    tsd_probe();
 }
 
-// K 槽校验：pthread TSD 布局固定，槽 = tpidrro_el0 + 8*key
-// K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
+// 线程槽基址与键号 → 槽偏移（与 patch_nso.py emit_tp 一一对应）。
+// 苹果：pthread TSD 布局固定，槽 = tpidrro_el0 + 8*key。
+// 安卓：tpidr_el0 → bionic TCB，TCB[-1]（TLS_SLOT_BIONIC_TLS）= bionic_tls，键 k 的值在 bionic_tls + 键表偏移 + 16k + 8
+// （pthread_key_data_t = {seq, data}）。键表偏移是 bionic 内部布局，不写死：装载时设一个已知值、在 bionic_tls 里找到它反推，再用第二个键复核。
+// Thread slot base and key number → slot offset (one-to-one with patch_nso.py emit_tp).
+// Apple: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key.
+// Android: tpidr_el0 → bionic TCB, TCB[-1] (TLS_SLOT_BIONIC_TLS) = bionic_tls, the value of key k lives at bionic_tls + key table offset + 16k + 8
+// (pthread_key_data_t = {seq, data}). The key table offset is a bionic internal layout and is not hard-coded: at load time set a known value, find it in bionic_tls to derive the offset, then re-check with a second key.
+#ifdef __ANDROID__
+#define DM_PATCH_TARGET 1
+static uint64_t g_tsd_off;
+static uint8_t *tsd_base(void) { uint64_t tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp)); return ((uint8_t **)tp)[-1]; }
+// bionic 的键号 = 键表下标 | KEY_VALID_FLAG（第 31 位，实测 0x80000006 这种），取下标要去掉标记位
+// A bionic key number = key table index | KEY_VALID_FLAG (bit 31; measured values look like 0x80000006); strip the flag bit to get the index
+static uint64_t key_index(pthread_key_t k) { return (uint32_t)k & 0x7fffffffu; }
+static uint64_t slot_off(pthread_key_t k) { return g_tsd_off + key_index(k) * 16 + 8; }
+static void tsd_probe(void) {
+    void *const magic = (void *)0x6d4d7d5d4d3d2d1dull, *const magic2 = (void *)0x1d2d3d4d5d7d4d6dull;
+    pthread_setspecific(g_key18, magic);
+    uint8_t *b = tsd_base(); uint64_t at = 0;
+    for (uint64_t o = 8; o < 0x4000 && !at; o += 8) if (*(void **)(b + o) == magic) at = o;
+    pthread_setspecific(g_key18, 0);
+    if (!at || at < key_index(g_key18) * 16 + 8) die("bionic 键表没找到（键 %#x 设的值不在 bionic_tls 前 16 KB 里）", (unsigned)g_key18);
+    g_tsd_off = at - key_index(g_key18) * 16 - 8;
+    pthread_setspecific(g_keygate, magic2);
+    int ok = *(void **)(b + slot_off(g_keygate)) == magic2;
+    pthread_setspecific(g_keygate, 0);
+    if (!ok) die("bionic 键表布局不符（键表偏移 %#llx 对键 %#x 不成立）", (unsigned long long)g_tsd_off, (unsigned)g_keygate);
+    LOG("bionic 键表偏移 %#llx", (unsigned long long)g_tsd_off);
+}
+#else
+#define DM_PATCH_TARGET 0
+static uint8_t *tsd_base(void) { uint64_t b; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(b)); return (uint8_t *)(b & ~7ull); }
+static uint64_t slot_off(pthread_key_t k) { return (uint64_t)k * 8; }
+static void tsd_probe(void) {}
+#endif
+// K 槽校验：经键页取到的槽与 pthread_setspecific 写的是同一格
+// K slot check: the slot reached through the key page is the same cell that pthread_setspecific writes
 static void tsd_check(void) {
     pthread_setspecific(g_key18, (void *)0x1234);
-    uint64_t base; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
     uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
-    if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD 布局不符");
+    if (*(uint64_t *)(tsd_base() + off) != 0x1234) die("TSD 布局不符");
     pthread_setspecific(g_key18, 0);
 }
 
@@ -124,7 +164,7 @@ static uint64_t resolve_sym(module_t *m, const char *name) {
 // Forced take-over table (hle.h HLE_FORCE, the __DATA,swforce section): a hit overrides the definition inside the module
 static const hle_force_ent *g_force; static unsigned g_nforce; static unsigned *g_force_hits;
 static void force_init(void) {
-    unsigned long sz; g_force = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &sz);
+    unsigned long sz; DM_SECT_GET(swforce, const hle_force_ent, g_force, sz);
     g_nforce = g_force ? (unsigned)(sz / sizeof *g_force) : 0;
     g_force_hits = calloc(g_nforce + 1, sizeof *g_force_hits);
     for (unsigned i = 0; i < g_nforce; i++)
@@ -154,10 +194,11 @@ static void read_layout(module_t *m, const char *dir) {
     FILE *f = fopen(path, "r");
     if (!f) die("open %s", path);
     static const char *kn[8] = {"K18", "KTLS", "KTLR", "KGATE", "KRES0", "KRES1", "KASPECT", "KASPECTUI"};
-    char line[256], key[32]; unsigned long v; unsigned seen = 0;
+    char line[256], key[32]; unsigned long v, target = 0; unsigned seen = 0;   // 没有 TARGET 行的产物 = 苹果（早于安卓的产物） | A build output without a TARGET line = Apple (predates Android)
     while (fgets(line, sizeof line, f)) {
         if (sscanf(line, "# %31s %lx", key, &v) != 2) die("%s: 产物是旧改写器出的，换成当前代号（dm/PRODUCT）的产物", path);
-        if (!strcmp(key, "PATCH_OFF")) m->patch_off = v;
+        if (!strcmp(key, "TARGET")) target = v;
+        else if (!strcmp(key, "PATCH_OFF")) m->patch_off = v;
         else if (!strcmp(key, "KEY_PAGE_OFF")) m->key_page_off = v;
         else if (!strcmp(key, "KEY_PAGE_SIZE")) m->key_page_size = v;
         else if (!strcmp(key, "TEXT_END")) m->text_end = v;
@@ -173,15 +214,15 @@ static void read_layout(module_t *m, const char *dir) {
     fclose(f);
     if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != 0xff)
         die("%s: 产物是旧改写器出的，换成当前代号（dm/PRODUCT）的产物", path);
+    if (target != DM_PATCH_TARGET) die("%s: 产物是给%s出的（TARGET %lu），本机要 %s 的产物（patch_nso.py 用 DM_TARGET=%s 重出）", path,
+                                       target ? "安卓" : "苹果", target, DM_PATCH_TARGET ? "安卓" : "苹果", DM_PATCH_TARGET ? "android" : "apple");
 }
 
 static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: 键页越界", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < 4; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
-    page[m->key_idx[KEY_KRES0]] = (uint64_t)g_keyres[0] * 8; page[m->key_idx[KEY_KRES1]] = (uint64_t)g_keyres[1] * 8;
-    page[m->key_idx[KEY_KASPECT]] = (uint64_t)g_keyaspect * 8; page[m->key_idx[KEY_KASPECTUI]] = (uint64_t)g_keyaspectui * 8;
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = slot_off(key_value(i));
     for (int k = 0; k < 8; k++) if (!page[m->key_idx[k]]) die("%s: 键页第 %d 项为 0（宿主键没建）——游戏会读到 TSD 0 号槽", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s 键页 mprotect", m->name);
 }

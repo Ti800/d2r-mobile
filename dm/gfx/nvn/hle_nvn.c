@@ -37,11 +37,11 @@
 #endif
 #include <pthread/qos.h>
 #include <sys/resource.h>
+#ifdef __APPLE__
 #include <mach/thread_policy.h>
+#endif
 #include <assert.h>
 #include <stdatomic.h>
-#include <mach-o/getsect.h>
-#include <mach-o/ldsyms.h>
 
 // ---------- 槽表、跳板、未实现桩 ----------
 // ---------- Slot table, thunks, unimplemented stubs ----------
@@ -66,13 +66,13 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 #define NVN(name, ret, ...)                                                                       \
     static ret h_##name(__VA_ARGS__);                                                             \
     static const NVNT_##name chk_##name __attribute__((unused)) = h_##name;                       \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    DM_SECT(swnvn) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 // 无原型的新版接口：不做签名检查
 // Newer interfaces without prototypes: no signature check
 #define NVN_NOPROTO(name, ret, ...)                                                               \
     static ret h_##name(__VA_ARGS__);                                                             \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    DM_SECT(swnvn) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 
 static int g_log;
@@ -83,8 +83,8 @@ static unsigned g_nsem;                          // 语义实现个数（nvn_ini
 static void nvn_init_slots(void) {
     static int done; if (done) return; done = 1;
     g_log = getenv("DM_NVN_LOG") != NULL;
-    unsigned long sz;
-    const nvn_impl *im = (const nvn_impl *)getsectiondata(&_mh_execute_header, "__DATA", "swnvn", &sz);
+    unsigned long sz; const nvn_impl *im;
+    DM_SECT_GET(swnvn, const nvn_impl, im, sz);
     unsigned nim = im ? (unsigned)(sz / sizeof *im) : 0, hit = 0;
     for (unsigned i = 0; i < NVN_NFUNC; i++) nvn_slot[i].fn = (void *)nvn_unimpl_entry;
     for (unsigned k = 0; k < nim; k++) {
@@ -969,9 +969,11 @@ static void tsummary(uint64_t frame) {
           static uint64_t pyn, pyns; uint64_t yn = 0, yns = 0; dm_main_yield_stats(&yn, &yns);
           LOG("[nvn] 翻译细项 至帧 %llu：每帧提交 周期 %.2f M（每条指令 %.2f 周期）、CPU %.3f ms 其中内核态 %.3f ms、墙钟 %.3f ms；平均主频 %.2f GHz（周期 / CPU 时间）；本线程 QoS %#x；分配器池 %d 个、累计等 GPU %llu 次；实时声明计算 %.2f ms；主线程让出 每帧 %.0f 次 / %.3f ms", frame,
               cyc / 1e6 / nf, cyc / (double)(ci - pi), cpu / 1e6 / nf, (double)(ck - pk) / 1e6 / nf, (double)(cw - pw) / 1e6 / nf, cpu > 0 ? cyc / cpu : 0, (unsigned)qc, an, (unsigned long long)aw, g_rt_comp_ms, (double)(yn - pyn) / nf, (double)(yns - pyns) / 1e6 / nf); pyn = yn; pyns = yns; }
+#ifdef __APPLE__
         if (frame % 300 == 0) { unsigned wn = 0; uint32_t wq = dm_guest_work_qos(&wn); thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT; int okx = thread_info(pthread_mach_thread_np(pthread_self()), THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc) == KERN_SUCCESS;
             thread_time_constraint_policy_data_t tp; mach_msg_type_number_t tc = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t def = 0; int rt_live = thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tp, &tc, &def) == KERN_SUCCESS && !def;   // def = 1：实时策略没在生效（没设上 / 被撤） | def = 1: the real-time policy is not in effect (never set / revoked)
             LOG("[nvn] 线程策略：主线程 实时 计算 %.2f ms / 周期 %.2f ms，实时策略%s，当前优先级 %d（基础 %d，调度类 %d）；工作线程 %u 条 QoS %#x；出图 QoS %#x", g_rt_comp_ms, g_rt_period_ms, rt_live ? "在生效" : "未生效", okx ? xi.pth_curpri : -1, okx ? xi.pth_priority : -1, okx ? xi.pth_policy : -1, wn, wq, mtl_present_qos()); }
+#endif
         py = cy; pk = ck; pw = cw; }
       pi = ci; pc = cc; pd = dr_; pf = frame; }
     uint64_t up, re, fa, pr; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr);
@@ -1025,10 +1027,17 @@ static void slow_emit(uint64_t f) {
 static void set_time_constraint_comp(uint64_t period_ns, uint64_t comp_ns) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     if (comp_ns < 1000000ull) comp_ns = 1000000ull; if (comp_ns > period_ns * 9 / 10) comp_ns = period_ns * 9 / 10;
+#ifdef __APPLE__
     thread_time_constraint_policy_data_t p = {
         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
         .constraint = (uint32_t)(period_ns * tb.denom / tb.numer), .preemptible = 1};
     kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+#else
+    // 安卓没有时间约束线程策略：同一份声明（帧期限 + 每帧工作量）交给前端走系统性能提示（APerformanceHint），未实现时视为失败
+    // Android has no time-constraint thread policy: the same declaration (frame deadline + per-frame workload) is handed to the front end for the system performance hint (APerformanceHint); treated as failure when not implemented
+    int front_perf_hint(uint64_t period_ns, uint64_t comp_ns) __attribute__((weak));
+    kern_return_t kr = front_perf_hint && !front_perf_hint(period_ns, comp_ns) ? KERN_SUCCESS : KERN_FAILURE;
+#endif
     if (kr == KERN_SUCCESS) { g_rt_comp_ms = comp_ns / 1e6; g_rt_period_ms = period_ns / 1e6; }
     LOG("[nvn] 出图线程时间约束策略（周期 %.3f ms、计算 %.3f ms）%s", period_ns / 1e6, comp_ns / 1e6, kr == KERN_SUCCESS ? "已设" : "设置失败");
 }

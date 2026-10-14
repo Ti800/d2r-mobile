@@ -4,6 +4,7 @@
 // Crash state: prints the faulting address, pc, lr (converted to module-relative offsets) and the registers; dispatches page fault hooks.
 // Only signal handling itself lives here: diagnostic features (probes / UI messages / sampling) are in diag.c, and this file does not depend on them (the graphics unit tests link only this file).
 #include "dm.h"
+#include "dm_uctx.h"
 #include <signal.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
@@ -133,15 +134,15 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
     if (sig == SIGSEGV || sig == SIGBUS) {
-        int is_write = (int)((uc->uc_mcontext->__es.__esr >> 6) & 1);   // ESR 的 WnR 位 | The WnR bit of ESR
+        int is_write = (int)((UC_ESR(uc) >> 6) & 1);   // ESR 的 WnR 位 | The WnR bit of ESR
         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) return;
     }
     fprintf(stderr, "[dm] CRASH sig=%d", sig);
-    off("addr", (uint64_t)si->si_addr); off("pc", uc->uc_mcontext->__ss.__pc); off("lr", uc->uc_mcontext->__ss.__lr);
-    fprintf(stderr, " sp=%#llx\n", uc->uc_mcontext->__ss.__sp);
-    for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? "\n" : " ");
+    off("addr", (uint64_t)si->si_addr); off("pc", UC_PC(uc)); off("lr", UC_LR(uc));
+    fprintf(stderr, " sp=%#llx\n", UC_SP(uc));
+    for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, UC_X(uc, i), i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
-    dm_backtrace(uc->uc_mcontext->__ss.__fp);
+    dm_backtrace(UC_FP(uc));
     if (g_dump_hook) g_dump_hook();
     _exit(128 + sig);
 }

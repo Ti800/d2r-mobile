@@ -1,6 +1,7 @@
 // 诊断：探针 DM_PROBE、UI 消息总线 DM_UIMSG、主线程采样 DM_SAMPLE。从 crash.c 拆出（crash.c 只管信号处理）。
 // Diagnostics: probes DM_PROBE, UI message bus DM_UIMSG, main-thread sampling DM_SAMPLE. Split out of crash.c (crash.c only handles signals).
 #include "dm.h"
+#include "dm_uctx.h"
 #include "dm_hud.h"
 #include "dm_cursor.h"
 #include "dm_hud_exp.h"
@@ -166,25 +167,25 @@ static void probe_dump_once(void) {
     LOG("探针转储 %s+%s 长 %s → %s", mod, o, n, f ? f : def);
 }
 static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 的 SIGTRAP 分支 | Registered by probe_install with the SIGTRAP branch of crash.c
-    uint64_t pc = uc->uc_mcontext->__ss.__pc;
+    uint64_t pc = UC_PC(uc);
     for (int i = 0; i < g_nprobe; i++) if (g_probe[i].at == pc) {
         probe_dump_once();
-        if (g_probe[i].fn) { g_probe[i].hits++; g_probe[i].fn(uc); uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1; }
+        if (g_probe[i].fn) { g_probe[i].hits++; g_probe[i].fn(uc); UC_PC(uc) = (uint64_t)g_probe[i].slot; return 1; }
         { extern uint64_t g_t0_ns; uint64_t now_ns(void); fprintf(stderr, "[dm] PROBE %s #%u [%.4fs]", g_probe[i].name, ++g_probe[i].hits, (now_ns() - g_t0_ns) / 1e9); }
-        for (int r = 0; r < 4; r++) { uint64_t v = uc->uc_mcontext->__ss.__x[r]; fprintf(stderr, " x%d=%#llx", r, v); probe_str(v); }
-        for (int r = 19; r < 24; r++) fprintf(stderr, " x%d=%#llx", r, uc->uc_mcontext->__ss.__x[r]);
-        { uint64_t x8 = uc->uc_mcontext->__ss.__x[8]; Dl_info di; fprintf(stderr, " x8=%#llx", x8);   // x8：间接调用目标常在这里（blr x8 前下探针） | x8: indirect call targets are often here (probe placed before blr x8)
+        for (int r = 0; r < 4; r++) { uint64_t v = UC_X(uc, r); fprintf(stderr, " x%d=%#llx", r, v); probe_str(v); }
+        for (int r = 19; r < 24; r++) fprintf(stderr, " x%d=%#llx", r, UC_X(uc, r));
+        { uint64_t x8 = UC_X(uc, 8); Dl_info di; fprintf(stderr, " x8=%#llx", x8);   // x8：间接调用目标常在这里（blr x8 前下探针） | x8: indirect call targets are often here (probe placed before blr x8)
           if (dladdr((void *)x8, &di) && di.dli_sname) fprintf(stderr, "（%s+%#lx）", di.dli_sname, (unsigned long)(x8 - (uint64_t)di.dli_saddr)); }
         if (g_probe[i].dump >= 0) {
             uint8_t b[16]; vm_size_t got = 0;
-            uint64_t at = uc->uc_mcontext->__ss.__x[0] + (g_probe[i].dump & 0xffffff);
+            uint64_t at = UC_X(uc, 0) + (g_probe[i].dump & 0xffffff);
             if (g_probe[i].dump & 0x1000000) { uint64_t p = 0; vm_size_t g = 0; if (!vm_read_overwrite(mach_task_self(), at, 8, (vm_address_t)&p, &g)) at = p; else at = 0; }   // @*偏移：先解引用再转储 | @*offset: dereference first, then dump
             if (at && !vm_read_overwrite(mach_task_self(), at, 16, (vm_address_t)b, &got) && got == 16) {
                 fprintf(stderr, " [%s%#lx]=", (g_probe[i].dump & 0x1000000) ? "*x0+" : "x0+", g_probe[i].dump & 0xffffff); for (int k = 0; k < 16; k++) fprintf(stderr, "%02x", b[k]); }
         }
         fputc('\n', stderr);
-        dm_backtrace(uc->uc_mcontext->__ss.__fp);
-        uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot;
+        dm_backtrace(UC_FP(uc));
+        UC_PC(uc) = (uint64_t)g_probe[i].slot;
         return 1;
     }
     return 0;
@@ -481,8 +482,8 @@ static void on_sample(int sig, siginfo_t *si, void *uc_) {
     unsigned i = atomic_load(&g_shead) % SRING;
     extern uint64_t now_ns(void);
     uint32_t thr_cur_handle(void);
-    g_sring[i].h = thr_cur_handle(); g_sring[i].t = now_ns(); g_sring[i].pc = uc->uc_mcontext->__ss.__pc; g_sring[i].lr = uc->uc_mcontext->__ss.__lr;
-    uint64_t fp = uc->uc_mcontext->__ss.__fp; int n = 0;
+    g_sring[i].h = thr_cur_handle(); g_sring[i].t = now_ns(); g_sring[i].pc = UC_PC(uc); g_sring[i].lr = UC_LR(uc);
+    uint64_t fp = UC_FP(uc); int n = 0;
     // 帧链用安全读：被打断的函数可能把 x29 当普通寄存器用（直接解引用曾段错误）
     // The frame chain uses safe reads: the interrupted function may be using x29 as an ordinary register (a direct dereference once segfaulted)
     for (; n < 16 && fp && !(fp & 7); n++) {
@@ -1521,7 +1522,7 @@ static int g_loadscreen_seen;
 int dm_loadscreen_up(void);
 void dm_longframe_note(const char *what) {
     static const char *path; static int init; static unsigned n;
-    if (!init) { init = 1; const char *e = getenv("DM_PERF_FILE"); path = e ? (strcmp(e, "0") ? e : NULL) : (TARGET_OS_IPHONE ? "perf.txt" : NULL); }
+    if (!init) { init = 1; const char *e = getenv("DM_PERF_FILE"); path = e ? (strcmp(e, "0") ? e : NULL) : (DM_PHONE ? "perf.txt" : NULL); }
     dm_hud_info h; dm_hud_get(&h); char ctx[160];
     snprintf(ctx, sizeof ctx, "读取画面 %s，面板 %s，区域 %d%s", g_loadscreen_seen ? (dm_loadscreen_up() ? "盖着" : "已撤") : "未见过", g_lf_panel[0] ? g_lf_panel : "无", h.area, h.valid ? "" : "（未读到玩家）");
     LOG("[长帧] %s；%s", what, ctx);
@@ -1532,7 +1533,7 @@ void dm_longframe_note(const char *what) {
 }
 void dm_perf_present(double iv) {   // 出图线程每帧调一次（滞后 8 帧的实际上屏间隔 ms；−1 = 被系统丢弃，0 = 无读数） | Called once per frame by the present thread (the actual present interval in ms, lagging by 8 frames; −1 = dropped by the system, 0 = no reading)
     static const char *path; static int init; static unsigned c16, c25, c33, disc; static double sum; static uint64_t t0, f0, cpu0, tstart;
-    if (!init) { init = 1; const char *e = getenv("DM_PERF_FILE"); path = e ? (strcmp(e, "0") ? e : NULL) : (TARGET_OS_IPHONE ? "perf.txt" : NULL); t0 = tstart = now_ns(); f0 = dm_nvn_frame_count(); cpu0 = dm_nvn_sub_cpu_ns(); }
+    if (!init) { init = 1; const char *e = getenv("DM_PERF_FILE"); path = e ? (strcmp(e, "0") ? e : NULL) : (DM_PHONE ? "perf.txt" : NULL); t0 = tstart = now_ns(); f0 = dm_nvn_frame_count(); cpu0 = dm_nvn_sub_cpu_ns(); }
     dm_3d_scale_feed(iv);   // 动态 3D 比例的控制器吃同一份上屏间隔（hle_oe.c） | The dynamic 3D scale controller consumes the same present intervals (hle_oe.c)
     if (!path) return;
     if (iv < 0) disc++; else if (iv > 0) { sum += iv; if (iv <= 20.8) c16++; else if (iv <= 29.2) c25++; else c33++; }
