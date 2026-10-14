@@ -1,0 +1,46 @@
+// 安卓前端（front.h 的安卓实现，对应 Mac 的 front_mac.m、iOS 的 front_ios.m）。
+// 两种形态：
+//   命令行（adb shell 直接跑 dmhost，开发验证用）：没有窗口，front_run 在当前线程直接跑客体，front_metal_layer 为 NULL（图形层走无窗口路径）。
+//   App（Java 外壳经 JNI 交来 ANativeWindow，见 jni_android.c）：客体在独立线程跑，front_metal_layer 返回 ANativeWindow*（图形层出图的目标面）。
+// Android front end (the Android implementation of front.h, counterpart of Mac's front_mac.m and iOS's front_ios.m).
+// Two forms:
+//   Command line (dmhost run directly from adb shell, for development checks): no window, front_run runs the guest directly on the current thread, front_metal_layer is NULL (the graphics layer takes the no-window path).
+//   App (the Java shell hands over an ANativeWindow through JNI, see jni_android.c): the guest runs on its own thread, front_metal_layer returns the ANativeWindow* (the surface the graphics layer presents to).
+#include "../host/dm.h"
+#include "../host/front.h"
+#include <math.h>
+#include <stdatomic.h>
+
+static void *_Atomic g_window;      // ANativeWindow*；命令行形态为 NULL | ANativeWindow*; NULL in the command-line form
+static _Atomic int g_screen_w, g_screen_h;
+void front_android_set_window(void *win, int w, int h) { atomic_store(&g_window, win); atomic_store(&g_screen_w, w); atomic_store(&g_screen_h, h); }
+
+void *front_metal_layer(void) { return atomic_load(&g_window); }
+
+void front_run(void (*guest)(void)) {
+    guest();   // 两种形态都在调用线程上跑：App 形态由 JNI 侧先起好客体线程再进 dm_main | Both forms run on the calling thread: in the App form the JNI side starts the guest thread first and then enters dm_main
+}
+
+// 游戏输出分辨率：DM_GAME_RES 钉住；有屏幕尺寸时按同高度放宽到屏幕比例（与 Mac 真全屏、iOS 同一规则，宽 ≤ 4096、8 对齐），否则原版 16:9
+// Game output resolution: pinned by DM_GAME_RES; with a known screen size, widen at the same height to the screen aspect (the same rule as Mac true full screen and iOS, width ≤ 4096, aligned to 8), otherwise the original 16:9
+uint64_t front_game_res(int docked) {
+    unsigned w, h; const char *e = getenv("DM_GAME_RES");
+    if (e && sscanf(e, "%ux%u", &w, &h) == 2) return docked ? (uint64_t)h << 32 | w : (uint64_t)(h * 4 / 5) << 32 | (w * 4 / 5 + 3) / 4 * 4;
+    int sw = atomic_load(&g_screen_w), sh = atomic_load(&g_screen_h);
+    unsigned bh = docked ? 900 : 720;
+    if (sw > 0 && sh > 0 && sw * 9 > sh * 16) {
+        unsigned bw = (unsigned)(llround((double)bh * sw / sh / 8) * 8); if (bw > 4096) bw = 4096;
+        return (uint64_t)bh << 32 | bw;
+    }
+    return docked ? 900ull << 32 | 1600 : 720ull << 32 | 1280;
+}
+
+// 文本输入框：App 形态由 Java 弹系统输入框（待接）；命令行没有窗口，按 front.h 约定返回 -1
+// Text input box: in the App form Java shows the system input dialog (to be wired up); the command line has no window and returns -1 per the front.h contract
+__attribute__((weak)) int front_android_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
+    (void)title; (void)sub; (void)guide; (void)initial; (void)max_chars; (void)out; (void)out_cap; return -1;
+}
+int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
+    if (!front_metal_layer()) return -1;
+    return front_android_text_input(title, sub, guide, initial, max_chars, out, out_cap);
+}
