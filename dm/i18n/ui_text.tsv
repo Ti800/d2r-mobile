@@ -347,3 +347,34 @@ dmAppKeysText	用键盘时，界面上的按键提示显示的就是键盘上的
 dmAppShareLog	分享日志…	Share Logs…	帮助菜单：把两份日志与版本信息打成压缩包，玩家选位置存下（不上传）
 dmAppShareInfo	版本信息	Version Info	分享日志压缩包里版本信息那份文件的标题行
 dmAppShareFail	日志打包失败	Could Not Pack the Logs	分享日志失败时提示框的标题
+dmAndroidName	D2R Mobile	D2R Mobile	安卓启动器应用名称 | Android launcher name
+dmAndroidPermission	需要「所有文件访问」权限，才能读取 下载/data 里的游戏资源。\n点屏幕打开设置，允许后返回。	Allow all files access to read your game resources in Download/data.\nTap to open Settings, allow access, then return.	安卓权限提示 | Android file access prompt
+dmAndroidStorage	应用资源目录暂不可用，请重新打开应用。	App storage is unavailable. Please reopen the app.	安卓启动失败 | Android startup failure
+dmAndroidStartFailed	游戏启动准备失败（%d），请检查游戏文件与启动日志。	Game startup preparation failed (%d). Check your game files and startup log.	安卓启动失败 | Android startup failure
+dmAndroidLibrary	原生运行库未能加载，请重新构建并安装应用。	The native library could not be loaded. Rebuild and install the app.	安卓运行库加载失败 | Android native library load failure
+dmAndroidMissingData	未找到游戏资源。请将自己的游戏 data 目录放入 Download/data。	Game resources were not found. Put your own game data directory in Download/data.	安卓资源检查 | Android resource checks
+dmAndroidMissingModules	缺少安卓改写产物。请按安卓构建说明准备并导入 main、sdk 及配套表。	Android rewritten modules are missing. Prepare and import main, sdk and their tables using the Android build instructions.	安卓资源检查 | Android resource checks
+dmAndroidMissingShaders	缺少匹配的 Vulkan 着色器包，请按安卓构建说明导入。	Matching Vulkan shader bundles are missing. Import them using the Android build instructions.	安卓资源检查 | Android resource checks
+dmAndroidMissingConfig	缺少 .build.config。请将游戏 data 目录中的该文件一并放入 Download/data。	The .build.config file is missing. Include it with your game data in Download/data.	安卓资源检查 | Android resource checks
+dmAndroidGraphicsFailed	图形初始化失败。请检查设备 Vulkan 支持与启动日志，关闭应用后重试。	Graphics initialization failed. Check Vulkan support and the startup log, then close and reopen the app.	安卓图形失败提示 | Android graphics failure
+dmAndroidHostStopped	游戏运行线程已退出。请查看启动日志，关闭应用后重试。	The game runtime stopped. Check the startup log, then close and reopen the app.	安卓运行停止提示 | Android runtime stopped
+dmAndroidQuantityRange	0 – %d	0 – %d	安卓数量输入范围 | Android quantity input range
+dmAndroidAttack	攻击	Attack	安卓悬浮触控标签 | Android floating control label
+dmAndroidPortal	回城	Portal	安卓悬浮触控标签 | Android floating control label
+dmAndroidMenu	菜单	Menu	安卓悬浮触控标签 | Android floating control label
+dmAndroidMap	地图	Map	安卓悬浮触控标签 | Android floating control label
+dmAndroidMove	移动	Move	安卓悬浮触控标签 | Android floating control label
+dmAndroidSwap	换组	Swap	安卓悬浮触控标签 | Android floating control label
+dmAndroidDifficulty	难度	Difficulty	安卓悬浮触控标签 | Android floating control label
+dmAndroidBack	返回	Back	安卓悬浮触控标签 | Android floating control label
+dmAndroidAction	操作	Action	安卓悬浮触控标签 | Android floating control label
+dmAndroidBind	绑定	Bind	安卓悬浮触控标签 | Android floating control label
+dmAndroidNext	下一页	Next	安卓悬浮触控标签 | Android floating control label
+dmAndroidSkill1	技能1	Skill 1	安卓悬浮触控标签 | Android floating control label
+dmAndroidSkill2	技能2	Skill 2	安卓悬浮触控标签 | Android floating control label
+dmAndroidSkill3	技能3	Skill 3	安卓悬浮触控标签 | Android floating control label
+dmAndroidSkill4	技能4	Skill 4	安卓悬浮触控标签 | Android floating control label
+dmAndroidPotion1	药水1	Potion 1	安卓悬浮触控标签 | Android floating control label
+dmAndroidPotion2	药水2	Potion 2	安卓悬浮触控标签 | Android floating control label
+dmAndroidPotion3	药水3	Potion 3	安卓悬浮触控标签 | Android floating control label
+dmAndroidPotion4	药水4	Potion 4	安卓悬浮触控标签 | Android floating control label

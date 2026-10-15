@@ -12,7 +12,8 @@
 # Required: -DDM_GEN_DIR=<directory> containing dm_vault_tab.h / dm_hud_exp.h / dm_bright_levels.inc generated from the game files (generated as by the matching rules in dm/host/Makefile, not committed).
 # Outputs: dmhost (command line, run from adb shell, for development checks); libdm.so (for the App, JNI to be wired up).
 cmake_minimum_required(VERSION 3.22)
-project(dm_android C ASM)
+project(dm_android C CXX ASM)
+add_subdirectory(../gfx/vulkan ${CMAKE_CURRENT_BINARY_DIR}/vulkan)
 
 set(DM ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(HOST ${DM}/host)
@@ -21,44 +22,18 @@ if(NOT DM_GEN_DIR OR NOT EXISTS ${DM_GEN_DIR}/dm_vault_tab.h)
 endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-# ---- 从 Makefile 取源文件 | Take the source files from the Makefile ----
-# 逐行读（CMake 的正则是回溯实现，整文件多行匹配会爆栈）：SRC=\ 起、到第一行不以 \ 结尾止
-# Read line by line (CMake's regex is a backtracking implementation, and a multi-line match over the whole file overflows the stack): from SRC=\ to the first line not ending in \
-file(STRINGS ${HOST}/Makefile MK_LINES)
-set(HOST_SRCS)
-set(in_src 0)
-set(LD_LINE "")
-foreach(l IN LISTS MK_LINES)
-  if(l MATCHES "^SRC=")
-    set(in_src 1)
-  elseif(in_src)
-    string(STRIP "${l}" t)
-    string(REGEX REPLACE "[ \t]*\\\\$" "" t "${t}")
-    if(t MATCHES "^[A-Za-z0-9_./-]+\\.(c|m|S)$")
-      get_filename_component(n ${t} NAME_WE)
-      if(NOT (t MATCHES "\\.(m|S)$" OR n MATCHES "_mac$" OR t STREQUAL "main.c"))
-        list(APPEND HOST_SRCS ${HOST}/${t})
-      endif()
-    endif()
-    if(NOT l MATCHES "\\\\$")
-      set(in_src 0)
-    endif()
-  endif()
-  if(l MATCHES "^LIBDEFLATE=")
-    set(LD_LINE "${l}")
-  endif()
-endforeach()
-file(GLOB HLE_SRCS ${HOST}/hle_*.c)                      # Makefile：$(sort $(wildcard hle_*.c))
-file(GLOB GFX_SRCS ${DM}/gfx/*.c ${DM}/gfx/nvn/*.c ${DM}/gfx/tex/*.c)   # Makefile GFX 里的 .c（.m / .S 另处理） | the .c files in the Makefile's GFX (.m / .S handled separately)
-string(REGEX MATCHALL "[A-Za-z0-9_./-]+\\.c" LD_LIST "${LD_LINE}")
-set(LIBDEFLATE_SRCS)
-foreach(s ${LD_LIST})
-  list(APPEND LIBDEFLATE_SRCS ${HOST}/${s})
-endforeach()
-list(LENGTH HOST_SRCS nh)
-if(nh LESS 40)
-  message(FATAL_ERROR "从 dm/host/Makefile 只解析出 ${nh} 个宿主源文件：Makefile 的 SRC 写法变了，改本文件的解析")
+# Python 保留 Makefile 续行边界，避免 CMake 列表的反斜杠转义吞掉源码行。
+# Python preserves Makefile continuations instead of CMake list escaping joining them.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${HOST}/Makefile ${CMAKE_CURRENT_SOURCE_DIR}/tools/host_sources.py)
+execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/host_sources.py
+  ${HOST}/Makefile ${CMAKE_CURRENT_BINARY_DIR}/host_sources.cmake
+  RESULT_VARIABLE parse_result)
+if(NOT parse_result EQUAL 0)
+  message(FATAL_ERROR "Cannot parse host sources for Android")
 endif()
+include(${CMAKE_CURRENT_BINARY_DIR}/host_sources.cmake)
+file(GLOB HLE_SRCS CONFIGURE_DEPENDS ${HOST}/hle_*.c)
+file(GLOB GFX_SRCS CONFIGURE_DEPENDS ${DM}/gfx/*.c ${DM}/gfx/nvn/*.c ${DM}/gfx/tex/*.c)
 
 # ---- 汇编：Mach-O → ELF | Assembly: Mach-O → ELF ----
 set(ASM_SRCS)
@@ -72,6 +47,8 @@ endforeach()
 
 set(ANDROID_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/front_android.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/touch_android.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/clonefile.c
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/digest.c
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/mach_thread.c
@@ -85,9 +62,21 @@ target_include_directories(dmcore PUBLIC ${HOST} ${DM}/gfx/nvn/include ${CMAKE_C
 # Same optimization level as the Makefile (-O1 -g); dm_android_compat.h force-included; -fno-strict-aliasing matches the host's habit of reading and writing guest memory under Apple clang's default behaviour
 set(DM_CFLAGS -O1 -g -Wall -Wno-unused-function -fno-strict-aliasing -include ${CMAKE_CURRENT_SOURCE_DIR}/compat/include/dm_android_compat.h)
 target_compile_options(dmcore PUBLIC $<$<COMPILE_LANGUAGE:C>:${DM_CFLAGS} -std=gnu17>)
-target_link_libraries(dmcore PUBLIC aaudio log m dl)
+target_link_libraries(dmcore PUBLIC dm_vulkan_engine aaudio android log m dl)
 
 # 命令行宿主：main.c 原样 | Command-line host: main.c as is
 add_executable(dmhost ${HOST}/main.c)
 target_link_libraries(dmhost PRIVATE -Wl,--whole-archive dmcore -Wl,--no-whole-archive)
 target_link_options(dmhost PRIVATE -Wl,--no-undefined -Wl,-z,nostart-stop-gc -Wl,--export-dynamic)   # 导出符号：崩溃回溯里 dladdr 能认出宿主函数 | export symbols: dladdr in crash backtraces can name host functions
+
+# App 用的共享库：main.c 以 -Dmain=dm_main 编（同 iOS），JNI 入口 jni_android.c
+# Shared library for the App: main.c built with -Dmain=dm_main (as on iOS), JNI entry jni_android.c
+# 独立目标只重命名 App 入口，避免影响同目录的命令行目标。
+# Keep the renamed entry in a separate target: source properties would also
+# rename main in the command-line dmhost target in this directory.
+add_library(dm_app_main OBJECT ${HOST}/main.c)
+target_link_libraries(dm_app_main PRIVATE dmcore)
+target_compile_definitions(dm_app_main PRIVATE main=dm_main)
+add_library(dm SHARED $<TARGET_OBJECTS:dm_app_main> ${CMAKE_CURRENT_SOURCE_DIR}/jni_android.c ${CMAKE_CURRENT_SOURCE_DIR}/text_input_jni.c ${CMAKE_CURRENT_SOURCE_DIR}/touch_android_jni.c)
+target_link_libraries(dm PRIVATE -Wl,--whole-archive dmcore -Wl,--no-whole-archive android)
+target_link_options(dm PRIVATE -Wl,--no-undefined -Wl,-z,nostart-stop-gc -Wl,-Bsymbolic)   # 汇编按页寻址宿主全局（adrp + :lo12:）：库内符号就地绑定，不许被抢占 | assembly addresses host globals by page (adrp + :lo12:): symbols bind locally inside the library and cannot be preempted

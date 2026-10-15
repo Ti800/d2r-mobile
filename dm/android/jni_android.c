@@ -1,0 +1,174 @@
+// App 形态的 JNI 入口（Java 侧 app/src/main/java/com/xiaoboluo/d2r/DmActivity.java）：对应 iOS 的 main.m 启动链 + front_ios.m 的生命周期 / 触屏转发。
+//   nativeStart：备好目录与环境变量（同 iOS boot_prepare：DM_ROMFS / DM_SAVE / DM_TEMP、cwd），stderr 接到日志文件 + logcat，起宿主线程跑 dm_main。
+//   nativeSurface：交来 / 收回 ANativeWindow（front_android.c）；nativeTouch：整组触点（front.h dm_touch_set）；nativeFocus：场景生命周期（同 iOS 1 / 2 / 3 + 后台挂起）。
+// 目录约定（都不进 APK，见 dm/android/README）：
+//   <外部私有目录>/dm/out/   改写产物（*.patched.bin 与各表，patch_nso.py DM_TARGET=android 出），开发时 adb push
+//   资源目录（缺省 /sdcard/Download/data）  玩家的 18 个 .data 档案 + .build.config；App 在内部目录建 romfs/data/ 逐个链接过去
+//   <内部目录>/save、temp            存档与临时文件
+// JNI entry of the App form (Java side app/src/main/java/com/xiaoboluo/d2r/DmActivity.java): counterpart of iOS's main.m startup chain + front_ios.m's lifecycle / touch forwarding.
+//   nativeStart: prepare directories and environment variables (as iOS boot_prepare: DM_ROMFS / DM_SAVE / DM_TEMP, cwd), connect stderr to a log file + logcat, start the host thread running dm_main.
+//   nativeSurface: hand over / take back the ANativeWindow (front_android.c); nativeTouch: the whole set of touch points (front.h dm_touch_set); nativeFocus: scene lifecycle (as iOS 1 / 2 / 3 + background suspend).
+// Directory conventions (none of these go into the APK, see dm/android/README):
+//   <external private dir>/dm/out/   rewriter products (*.patched.bin and tables, from patch_nso.py DM_TARGET=android), adb push during development
+//   resource dir (default /sdcard/Download/data)  the player's 18 .data archives + .build.config; the App creates romfs/data/ in the internal dir linking to each of them
+//   <internal dir>/save, temp        saves and temporary files
+#include "../host/dm.h"
+#include "../host/front.h"
+#include "../host/hle.h"
+#include <android/log.h>
+#include <android/native_window_jni.h>
+#include <dirent.h>
+#include <errno.h>
+#include <jni.h>
+#include "vulkan_present.h"
+#include "touch_android.h"
+#include <sys/stat.h>
+#include <unistd.h>
+
+void front_android_set_window(void *win, int w, int h);
+int dm_main(int argc, char **argv);
+void front_android_boot_failed(int code);
+
+static char g_files[1024], g_ext[1024], g_src[1024], g_runtime[1100];
+static FILE *g_logf;
+
+// stderr → 管道 → 本线程：逐行写日志文件（adb pull 取）并转 logcat（标签 dm）
+// stderr → pipe → this thread: write line by line to the log file (fetched with adb pull) and forward to logcat (tag dm)
+static void *log_pump(void *arg) {
+    int fd = (int)(intptr_t)arg; char buf[4096]; size_t have = 0; ssize_t k;
+    while ((k = read(fd, buf + have, sizeof buf - 1 - have)) > 0) {
+        have += (size_t)k; buf[have] = 0; char *s = buf, *nl;
+        while ((nl = strchr(s, '\n'))) { *nl = 0; __android_log_write(ANDROID_LOG_INFO, "dm", s); if (g_logf) { fputs(s, g_logf); fputc('\n', g_logf); fflush(g_logf); } s = nl + 1; }
+        have = strlen(s); memmove(buf, s, have);
+        if (have == sizeof buf - 1) { __android_log_write(ANDROID_LOG_INFO, "dm", buf); if (g_logf) { fputs(buf, g_logf); fflush(g_logf); } have = 0; }
+    }
+    return NULL;
+}
+static void log_init(void) {
+    static int initialized; if (initialized) return; initialized = 1;
+    char p[1200]; snprintf(p, sizeof p, "%s/boot.log", g_runtime); g_logf = fopen(p, "a");
+    int fds[2]; if (pipe(fds)) return;
+    dup2(fds[1], 2); close(fds[1]); setvbuf(stderr, NULL, _IOLBF, 0);
+    pthread_t th; if (!pthread_create(&th, NULL, log_pump, (void *)(intptr_t)fds[0])) pthread_detach(th);
+}
+
+static void mkdirs(const char *p) {
+    char b[1100]; snprintf(b, sizeof b, "%s", p);
+    for (char *s = b + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(b, 0700); *s = '/'; }
+    mkdir(b, 0700);
+}
+// 内部目录 romfs/data/ 下逐个链接到资源目录的文件（游戏按 rom:/data/… 读；链接让资源留在玩家放的位置，不复制 5 GB）
+// Under the internal dir romfs/data/, link each file of the resource dir (the game reads rom:/data/...; links keep the resources where the player put them instead of copying 5 GB)
+static int link_romfs(const char *romfs) {
+    char data[1100]; snprintf(data, sizeof data, "%s/data", romfs); mkdirs(data);
+    DIR *d = opendir(g_src); if (!d) { LOG("【红】资源目录打不开 %s：errno %d（没给「所有文件访问」权限？）", g_src, errno); return -1; }
+    struct dirent *e; int n = 0;
+    while ((e = readdir(d))) {
+        const char *nm = e->d_name; size_t l = strlen(nm);
+        if (!(l > 5 && !strcmp(nm + l - 5, ".data")) && strcmp(nm, ".build.config") && strcmp(nm, "build.config")) continue;
+        char from[1100], to[1100]; snprintf(from, sizeof from, "%s/%s", g_src, nm);
+        snprintf(to, sizeof to, "%s/%s", data, strcmp(nm, "build.config") ? nm : ".build.config");   // 电脑上常被存成无点名 | often saved without the leading dot on a computer
+        unlink(to); if (!symlink(from, to)) n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static void *host_thread(void *arg) {
+    (void)arg;
+    char out[1200]; snprintf(out, sizeof out, "%s/out", g_runtime);
+    // 图形初始化在宿主线程进行；着色器由玩家在包外提供，失败时停止启动。
+    // Initialize graphics on the host thread; shaders stay external, and failure stops startup.
+    char shaders[1200], error[512] = {0};
+    snprintf(shaders, sizeof shaders, "%s/shaders", g_runtime);
+    int graphics_rc = dm_android_vk_initialize(shaders, error, sizeof error);
+    if (graphics_rc) { LOG("boot: Vulkan initialization failed %d: %s", graphics_rc, error); front_android_boot_failed(-6); return NULL; }
+    char *argv[] = {"dmhost", out, "main", "sdk", NULL};
+    LOG("boot: dm_main %s", out);
+    int rc = dm_main(4, argv);
+    LOG("boot: dm_main 返回 %d", rc);
+    front_android_boot_failed(-7);
+    return NULL;
+}
+
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env, jclass cls, jstring files, jstring ext, jstring src, jstring lang) {
+    (void)cls;
+    static int started; if (started) return 0;
+    const char *f = (*env)->GetStringUTFChars(env, files, NULL), *x = (*env)->GetStringUTFChars(env, ext, NULL), *s = (*env)->GetStringUTFChars(env, src, NULL), *lg = (*env)->GetStringUTFChars(env, lang, NULL);
+    snprintf(g_files, sizeof g_files, "%s", f); snprintf(g_ext, sizeof g_ext, "%s", x); snprintf(g_src, sizeof g_src, "%s", s);
+    // 调试包可用 run-as 导入内部目录；有完整主程序时优先选内部目录。
+    // Debug builds can import via run-as; prefer internal storage when the main module exists.
+    char p[1200]; snprintf(g_runtime, sizeof g_runtime, "%s/dm", g_files);
+    snprintf(p, sizeof p, "%s/out/main.patched.bin", g_runtime);
+    if (access(p, R_OK)) snprintf(g_runtime, sizeof g_runtime, "%s/dm", g_ext);
+    mkdirs(g_runtime);
+    log_init();
+    LOG("boot: 内部目录 %s，外部目录 %s，资源 %s，系统语言 %s", g_files, g_ext, g_src, lg);
+    char romfs[1100], save[1100], temp[1100];
+    snprintf(romfs, sizeof romfs, "%s/romfs", g_files); snprintf(save, sizeof save, "%s/save", g_files); snprintf(temp, sizeof temp, "%s/temp", g_files);
+    mkdirs(save); mkdirs(temp);
+    int n = link_romfs(romfs);
+    LOG("boot: 资源链接 %d 个文件", n);
+    setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
+    if (!getenv("DM_LANG") && *lg) setenv("DM_LANG", lg, 0);   // 首次安装的语言按系统首选（同 iOS CFLocaleCopyPreferredLanguages，见 dm_i18n.c） | first-install language follows the system preference (as iOS CFLocaleCopyPreferredLanguages, see dm_i18n.c)
+    if (chdir(g_files)) LOG("【红】chdir %s 失败 errno %d", g_files, errno);
+    (*env)->ReleaseStringUTFChars(env, files, f); (*env)->ReleaseStringUTFChars(env, ext, x); (*env)->ReleaseStringUTFChars(env, src, s); (*env)->ReleaseStringUTFChars(env, lang, lg);
+    if (n <= 0) return -2;
+    char required[1300];
+    const char *modules[] = {"main.patched.bin", "main.fixups.tsv", "main.gates.tsv", "sdk.patched.bin", "sdk.fixups.tsv", "sdk.gates.tsv"};
+    for (unsigned i = 0; i < sizeof modules / sizeof modules[0]; i++) {
+        snprintf(required, sizeof required, "%s/out/%s", g_runtime, modules[i]);
+        if (access(required, R_OK)) { LOG("boot: missing %s", required); return -3; }
+    }
+    snprintf(required, sizeof required, "%s/data/.build.config", romfs);
+    if (access(required, R_OK)) { LOG("boot: missing build configuration"); return -5; }
+    snprintf(required, sizeof required, "%s/shaders", g_runtime);
+    DIR *shaders = opendir(required); int have_shader = 0;
+    if (shaders) { struct dirent *entry; while ((entry = readdir(shaders))) {
+        size_t len = strlen(entry->d_name);
+        if (len > 4 && !strcmp(entry->d_name + len - 4, ".xgs")) { have_shader = 1; break; }
+    } closedir(shaders); }
+    if (!have_shader) { LOG("boot: no shader bundles in %s", required); return -4; }
+    snprintf(required, sizeof required, "%s/overlay", g_runtime);
+    struct stat overlay_stat;
+    if (!stat(required, &overlay_stat) && S_ISDIR(overlay_stat.st_mode)) setenv("DM_ROMFS_OVERLAY", required, 1);
+    pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
+    pthread_t th; int rc = pthread_create(&th, &a, host_thread, NULL); pthread_attr_destroy(&a);
+    if (!rc) { started = 1; pthread_detach(th); }
+    return rc ? -1 : n;
+}
+
+static ANativeWindow *g_win;
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSurface(JNIEnv *env, jclass cls, jobject surface, jint w, jint h) {
+    (void)cls;
+    ANativeWindow *old = g_win;
+    g_win = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
+    dm_android_vk_set_window(g_win);
+    front_android_set_window(g_win, w, h);
+    if (old) ANativeWindow_release(old);
+    LOG("前端：画面 %s %dx%d", g_win ? "就绪" : "收回", w, h);
+}
+
+// 触点：Java 按手指槽号（最小空槽，抬起前不变）交整组归一化坐标，n = 0 = 全抬起
+// Touch points: Java hands over the whole set of normalized coordinates by finger slot number (lowest free slot, unchanged until lifted), n = 0 = all lifted
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeTouch(JNIEnv *env, jclass cls, jint n, jintArray ids, jfloatArray xs, jfloatArray ys) {
+    (void)cls;
+    dm_touch t[16]; if (n > 16) n = 16; if (n < 0) n = 0;
+    jint id[16]; jfloat x[16], y[16];
+    if (n) { (*env)->GetIntArrayRegion(env, ids, 0, n, id); (*env)->GetFloatArrayRegion(env, xs, 0, n, x); (*env)->GetFloatArrayRegion(env, ys, 0, n, y); }
+    for (int i = 0; i < n; i++) t[i] = (dm_touch){(uint32_t)id[i], x[i], y[i]};
+    dm_touch_set(t, n);
+}
+
+// 生命周期（同 iOS front_ios_focus_event）：0 失焦 → 焦点 2；1 进后台 → 焦点 3 + 音频暂停 + 图形挂起；2 回前台 → 图形恢复 + 音频恢复 + 焦点 2；3 激活 → 焦点 1
+// Lifecycle (as iOS front_ios_focus_event): 0 lose focus → focus 2; 1 enter background → focus 3 + audio pause + graphics suspend; 2 return to foreground → graphics resume + audio resume + focus 2; 3 active → focus 1
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeFocus(JNIEnv *env, jclass cls, jint ev) {
+    (void)env; (void)cls;
+    dm_android_touch_focus(ev == 2 || ev == 3);
+    switch (ev) {
+        case 0: dm_focus_set(2); break;
+        case 1: dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); break;
+        case 2: dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); break;
+        case 3: dm_focus_set(1); break;
+    }
+}

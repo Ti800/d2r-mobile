@@ -3,3 +3,12 @@
 .iosdd_mac/
 .iosdd_*/
 .DS_Store
+
+# 安卓构建产物与本机配置 | Android build outputs and local configuration
+dm/android/local.properties
+dm/android/.gradle/
+dm/android/build/
+dm/android/app/build/
+dm/android/.kotlin/
+dm/android/app/.cxx/
+dm/android/.cxx/

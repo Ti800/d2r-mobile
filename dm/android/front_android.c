@@ -8,6 +8,8 @@
 //   App (the Java shell hands over an ANativeWindow through JNI, see jni_android.c): the guest runs on its own thread, front_metal_layer returns the ANativeWindow* (the surface the graphics layer presents to).
 #include "../host/dm.h"
 #include "../host/front.h"
+#include "../host/dm_input.h"
+#include "touch_android.h"
 #include <math.h>
 #include <stdatomic.h>
 
@@ -18,6 +20,13 @@ void front_android_set_window(void *win, int w, int h) { atomic_store(&g_window,
 void *front_metal_layer(void) { return atomic_load(&g_window); }
 
 void front_run(void (*guest)(void)) {
+    // 观测门在装载后才可订阅；这里沿用 iOS 在 front_run 接入的时机。
+    // Observation gates exist only after loading; subscribe at front_run as iOS does.
+    if (front_metal_layer()) {
+        void uimsg_subscribe(void (*)(const char *, const char *, const char *));
+        uimsg_subscribe(dm_android_touch_uimsg);
+        dm_pad_hook = dm_android_touch_step;
+    }
     guest();   // 两种形态都在调用线程上跑：App 形态由 JNI 侧先起好客体线程再进 dm_main | Both forms run on the calling thread: in the App form the JNI side starts the guest thread first and then enters dm_main
 }
 
@@ -35,8 +44,8 @@ uint64_t front_game_res(int docked) {
     return docked ? 900ull << 32 | 1600 : 720ull << 32 | 1280;
 }
 
-// 文本输入框：App 形态由 Java 弹系统输入框（待接）；命令行没有窗口，按 front.h 约定返回 -1
-// Text input box: in the App form Java shows the system input dialog (to be wired up); the command line has no window and returns -1 per the front.h contract
+// 文本输入框：App 用 text_input_jni.c 的强实现弹系统输入框；命令行无窗口，返回 -1。
+// Text input: the App overrides this with text_input_jni.c; windowless command-line runs return -1.
 __attribute__((weak)) int front_android_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
     (void)title; (void)sub; (void)guide; (void)initial; (void)max_chars; (void)out; (void)out_cap; return -1;
 }

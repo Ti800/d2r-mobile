@@ -1,0 +1,44 @@
+// 安卓 App。原生库两种来法：
+//   缺省：externalNativeBuild 用 dm/android/CMakeLists.txt 现编（要 -PdmGenDir=<由游戏文件生成的宿主表头目录>，见该文件头）；
+//   -PdmPrebuiltJni=<目录>：直接打包已编好的 <目录>/arm64-v8a/libdm.so（构建机上 CMake 不可用时）。
+// Android App. Two ways to get the native library:
+//   default: externalNativeBuild builds it with dm/android/CMakeLists.txt (needs -PdmGenDir=<directory of host headers generated from the game files>, see that file's header);
+//   -PdmPrebuiltJni=<dir>: package the already built <dir>/arm64-v8a/libdm.so directly (when CMake is unavailable on the build machine).
+plugins { id 'com.android.application' }
+
+def prebuilt = project.findProperty('dmPrebuiltJni')
+
+// 启动文案取自统一中英表，生成目录只在 build 下，不入库。
+// Startup text comes from the shared table; generated resources stay under build.
+def startupStrings = layout.buildDirectory.dir('generated/androidStrings')
+def generateStartupStrings = tasks.register('generateStartupStrings', Exec) {
+    inputs.files('../tools/gen_strings.py', '../../i18n/ui_text.tsv', '../../ios/tools/dm_i18n.py')
+    outputs.dir(startupStrings)
+    commandLine(project.findProperty('dmPython') ?: 'python3', '../tools/gen_strings.py', '--output', startupStrings.get().asFile)
+}
+
+android {
+    namespace 'com.xiaoboluo.d2r'
+    compileSdk 36
+    ndkVersion '29.0.14206865'
+    defaultConfig {
+        applicationId 'com.xiaoboluo.d2r'
+        minSdk 31
+        targetSdk 36
+        versionCode 2
+        versionName '0.1.1-dev'
+        ndk { abiFilters 'arm64-v8a' }
+        if (!prebuilt) externalNativeBuild { cmake {
+            arguments "-DDM_GEN_DIR=${project.findProperty('dmGenDir') ?: ''}"
+            if (project.findProperty('dmPython')) arguments "-DPython3_EXECUTABLE=${project.property('dmPython')}"
+            targets 'dm'
+        } }
+    }
+    if (!prebuilt) externalNativeBuild { cmake { path '../CMakeLists.txt'; version '3.31.6' } }
+    if (prebuilt) sourceSets { main { jniLibs.srcDirs = [prebuilt] } }
+    sourceSets { main { res.srcDir(startupStrings.get().asFile) } }
+    packaging { jniLibs { useLegacyPackaging false; keepDebugSymbols += ['**/libdm.so'] } }
+    buildTypes { release { minifyEnabled false } }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+}
+tasks.named('preBuild').configure { dependsOn(generateStartupStrings) }
