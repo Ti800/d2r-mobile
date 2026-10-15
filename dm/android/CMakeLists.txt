@@ -3,14 +3,14 @@
 # 汇编（Mach-O 写法）经 tools/asm_elf.py 转 ELF 后编；compat/ 只在安卓构建的头文件路径里，苹果构建看不到。
 #
 # 必需：-DDM_GEN_DIR=<目录>，内含由游戏文件生成的 dm_vault_tab.h / dm_hud_exp.h / dm_bright_levels.inc（生成方法同 dm/host/Makefile 对应规则，不入库）。
-# 产物：dmhost（命令行，adb shell 跑，开发验证用）；libdm.so（App 用，待接 JNI）。
+# 产物：dmhost（命令行，adb shell 跑，开发验证用）；libdm.so（App 的 JNI 宿主）。
 #
 # Android host build (NDK, arm64-v8a). The source list is not copied by hand: it is taken from SRC / GFX / LIBDEFLATE in dm/host/Makefile (the same idea as iOS's ios/tools/gen_build.py),
 # excluding Mac-only files (*_mac.*), Objective-C (*.m, Android has its own implementations) and main.c (built separately: the command-line dmhost keeps the name main, the App's libdm.so is built with -Dmain=dm_main).
 # Assembly (Mach-O syntax) is converted to ELF by tools/asm_elf.py before assembling; compat/ is only on the Android build's header path, invisible to Apple builds.
 #
 # Required: -DDM_GEN_DIR=<directory> containing dm_vault_tab.h / dm_hud_exp.h / dm_bright_levels.inc generated from the game files (generated as by the matching rules in dm/host/Makefile, not committed).
-# Outputs: dmhost (command line, run from adb shell, for development checks); libdm.so (for the App, JNI to be wired up).
+# Outputs: dmhost (command line, run from adb shell, for development checks); libdm.so (the App's JNI host).
 cmake_minimum_required(VERSION 3.22)
 project(dm_android C CXX ASM)
 add_subdirectory(../gfx/vulkan ${CMAKE_CURRENT_BINARY_DIR}/vulkan)

@@ -2,6 +2,7 @@
 #include "../../host/dm.h"
 #include "../nvn/nvn_obj.h"
 #include "../nvn/nvn_mtl.h"
+#include "../nvn/nvn_pace.h"
 #include "../../host/front.h"
 #include "nvn_vk.h"
 #include "engine/xbg_game_internal.h"
@@ -12,6 +13,13 @@
 static int g_ready,g_in_sub,g_npool;
 static uint64_t g_present_n;
 static dm_vk_config g_config;
+// 公用宿主登记翻译耗时读数；Vulkan 尚未输出 Metal 专用的交替测量报表。
+// Shared host registers translation timing readers; Vulkan does not emit Metal's alternating-measurement report.
+uint64_t (*g_ub_sub_cpu_ns)(void), (*g_ub_sub_cyc)(void);
+// Vulkan 每次提交都全画，没有 Metal 的冻结跳画和外推开关需要锁存。
+// Vulkan replays every draw; there are no Metal freeze-elision or extrapolation switches to latch.
+uint64_t mtl_host_latch(void) { return 0; }
+void mtl_host_apply(uint64_t value) { (void)value; }
 static pthread_mutex_t g_pool_mu=PTHREAD_MUTEX_INITIALIZER;
 typedef struct {uint64_t lo,size;} pool_range;
 static pool_range g_pools[4096];
@@ -61,7 +69,10 @@ void mtl_present_flush(void){mtl_drain();}
 double mtl_presented_time(uint64_t n){(void)n;return 0;}
 uint64_t mtl_present_count(void){return g_present_n;}
 int mtl_has_window(void){return g_config.has_window?g_config.has_window(g_config.game.userdata):0;}
-int mtl_display_hz(void){return g_config.display_hz;}
+double front_display_refresh(char *name, size_t n);
+double mtl_display_refresh(void) { double hz = front_display_refresh(NULL, 0); return hz > 0 ? hz : g_config.display_hz; }
+int mtl_display_hz(void) { return (int)(mtl_display_refresh() + 0.5); }
+double dm_pace_hz(double screen_hz, double floor_hz) { return nvn_pace_hz(screen_hz, floor_hz); }
 __attribute__((weak)) int dm_fps_setting(void){return 60;}
 int mtl_fps_target(void){return dm_fps_setting()==30?30:60;}
 int mtl_link_active(void){return 0;}

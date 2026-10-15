@@ -17,6 +17,17 @@ static void *_Atomic g_window;      // ANativeWindow*；命令行形态为 NULL 
 static _Atomic int g_screen_w, g_screen_h;
 void front_android_set_window(void *win, int w, int h) { atomic_store(&g_window, win); atomic_store(&g_screen_w, w); atomic_store(&g_screen_h, h); }
 
+// UI 线程从当前 Display 读实际刷新率；0 表示未知，不冒充实测 60 Hz。
+// The UI thread reads the current Display refresh rate; 0 means unknown, not a measured 60 Hz.
+static _Atomic int g_refresh_millihz;
+void front_android_set_refresh(float hz) {
+    atomic_store(&g_refresh_millihz, isfinite(hz) && hz > 0 && hz < 1000 ? (int)lroundf(hz * 1000) : 0);
+}
+double front_display_refresh(char *name, size_t n) {
+    if (name && n) *name = 0;
+    return atomic_load(&g_refresh_millihz) / 1000.0;
+}
+
 void *front_metal_layer(void) { return atomic_load(&g_window); }
 
 void front_run(void (*guest)(void)) {

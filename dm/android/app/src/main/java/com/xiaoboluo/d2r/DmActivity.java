@@ -8,6 +8,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.net.Uri;
+import android.hardware.display.DisplayManager;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.Settings;
@@ -28,9 +29,10 @@ import java.io.File;
 import java.lang.ref.WeakReference;
 import java.util.Locale;
 
-public class DmActivity extends Activity implements SurfaceHolder.Callback {
+public class DmActivity extends Activity implements SurfaceHolder.Callback, DisplayManager.DisplayListener {
     static native int nativeStart(String filesDir, String extDir, String romfsSrc, String lang);
     static native void nativeSurface(Object surface, int w, int h);
+    static native void nativeRefresh(float hz);
     static native void nativeTouch(int n, int[] ids, float[] xs, float[] ys);
     static native void nativeFocus(int ev);
     static native void nativeTextResult(long id, boolean accepted, String text);
@@ -45,10 +47,13 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback {
     private boolean started;
     private boolean libraryLoaded;
     private boolean resumed;
+    private DisplayManager displays;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         current = new WeakReference<>(this);
+        displays = getSystemService(DisplayManager.class);
+        if (displays != null) displays.registerDisplayListener(this, null);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
         view = new SurfaceView(this);
@@ -105,6 +110,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback {
         File ext = getExternalFilesDir(null);
         if (ext == null) { showStartError(getString(R.string.dmandroidstorage)); return; }
         nativeSurface(view.getHolder().getSurface(), view.getWidth(), view.getHeight());
+        updateRefresh();
         String src = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "data").getAbsolutePath();
         int result = nativeStart(getFilesDir().getAbsolutePath(), ext.getAbsolutePath(), src, Locale.getDefault().toLanguageTag());
         if (result < 0) {
@@ -209,16 +215,23 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback {
         if (started) nativeTouch(0, new int[0], new float[0], new float[0]);
     }
 
-    @Override protected void onResume() { super.onResume(); resumed = true; immersive(); startHost(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) touchOverlay.setInputEnabled(true); } }
+    private void updateRefresh() {
+        if (libraryLoaded) nativeRefresh(view.getDisplay() == null ? 0 : view.getDisplay().getRefreshRate());
+    }
+    @Override public void onDisplayAdded(int id) { updateRefresh(); }
+    @Override public void onDisplayRemoved(int id) { updateRefresh(); }
+    @Override public void onDisplayChanged(int id) { updateRefresh(); }
+    @Override protected void onResume() { super.onResume(); resumed = true; immersive(); startHost(); updateRefresh(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) touchOverlay.setInputEnabled(true); } }
     @Override protected void onPause() { resumed = false; if (inputDialog != null) inputDialog.dismiss(); releaseTouches(); if (touchOverlay != null) touchOverlay.setInputEnabled(false); if (started) nativeFocus(0); super.onPause(); }
     @Override protected void onStart() { super.onStart(); if (started) nativeFocus(2); }
     @Override protected void onStop() { if (started) nativeFocus(1); super.onStop(); }
-    @Override protected void onDestroy() { if (inputDialog != null) inputDialog.dismiss(); if (current.get() == this) current.clear(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (displays != null) displays.unregisterDisplayListener(this); if (inputDialog != null) inputDialog.dismiss(); if (current.get() == this) current.clear(); super.onDestroy(); }
     @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersive(); else releaseTouches(); }
 
     @Override public void surfaceCreated(SurfaceHolder h) {}
     @Override public void surfaceChanged(SurfaceHolder h, int format, int w, int ht) {
         if (libraryLoaded) nativeSurface(h.getSurface(), w, ht);
+        updateRefresh();
         startHost();
     }
     @Override public void surfaceDestroyed(SurfaceHolder h) { releaseTouches(); if (libraryLoaded) nativeSurface(null, 0, 0); }
