@@ -971,7 +971,11 @@ void resolve_known_reports(){
     if(done)pending_reports.erase(pending_reports.begin(),pending_reports.begin()+done);
     // Fold known queries into the running sum up to the earliest count still needed by a pending report, then drop them.
     for(auto &e:epochs){uint64_t limit=e.second.known_upto;for(auto &r:pending_reports)if(r.epoch==e.first)limit=std::min<uint64_t>(limit,r.count);e.second.prefix(limit);e.second.trim();}
-    if(pending_reports.empty())for(auto it=epochs.begin();it!=epochs.end();)if(it->first!=counter_epoch)it=epochs.erase(it);else ++it;
+    // A report only ever names the epoch current when it was recorded, so an older epoch that no pending report names is
+    // dead (retire skips query refs to erased epochs). Waiting for no pending report at all never happens once frames
+    // overlap, and the map then grew by every counter reset (~13 per D2R frame).
+    for(auto it=epochs.begin();it!=epochs.end();){bool used=it->first==counter_epoch;for(auto &r:pending_reports)if(r.epoch==it->first){used=true;break;}
+        if(used)++it;else it=epochs.erase(it);}
 }
 void resolve_pending(){
     if(resolving_pending || (pending_writebacks.empty() && pending_reports.empty()))return;
