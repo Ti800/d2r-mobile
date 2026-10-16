@@ -79,8 +79,8 @@ static void mkdirs(const char *p) {
 }
 // 内部目录 romfs/data/ 下逐个链接到资源目录的文件（游戏按 rom:/data/… 读；链接让资源留在玩家放的位置，不复制 5 GB）
 // Under the internal dir romfs/data/, link each file of the resource dir (the game reads rom:/data/...; links keep the resources where the player put them instead of copying 5 GB)
-// 剔零档案的「.holes」区段表也要链过去：hle_fs.c 与 romfs_validate.c 在档案旁边（即 romfs/data/ 下）找它，缺了就把剔过零的档案当成没拷完
-// The ".holes" extent tables of zero-stripped archives are linked too: hle_fs.c and romfs_validate.c look for them next to the archive (in romfs/data/), and without them a zero-stripped archive reads as incompletely copied
+// 剔零档案的「.holes」区段表也要链过去：hle_fs.c 在档案旁边（即 romfs/data/ 下）找它；缺了就按物理偏移读剔过零的档案，第一个零段之后读到的全错位（解压失败、随后崩溃）
+// The ".holes" extent tables of zero-stripped archives are linked too: hle_fs.c looks for them next to the archive (in romfs/data/); without them a zero-stripped archive is read at physical offsets, and everything after its first stripped range comes from the wrong place (decompression failures, then a crash)
 static int link_romfs(const char *romfs) {
     char data[1100]; snprintf(data, sizeof data, "%s/data", romfs); mkdirs(data);
     DIR *d = opendir(g_src); if (!d) { LOG("【红】资源目录打不开 %s：errno %d（没给「所有文件访问」权限？）", g_src, errno); return -1; }
