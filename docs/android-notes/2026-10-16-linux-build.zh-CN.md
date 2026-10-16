@@ -50,7 +50,32 @@ DM_GEN_DIR=/绝对路径/宿主表头目录 dm/android/docker/build.sh
 2. **改写校验不覆盖 `DM_TARGET=android`。** `dm/verify/structck.py`（第 ⑥、⑧ 项）和 `equiv.py:84` 认的是苹果的槽序列（`mrs tpidrro_el0` + 键页），安卓产物是 `mrs tpidr_el0; ldur [x,#-8]`（`patch_nso.py:286`）。所以 `regress.sh` 无法校验安卓模块，目前只能靠上面的哈希互相对照。
 3. **引擎只要 Vulkan 1.1，清单和 README 却要 1.3。** 实例请求 1.1（`vulkan_present.cpp:139`），引擎只要求 1.1（`xbg_vulkan.cpp:154`，"SPIR-V 1.3"）；`AndroidManifest.xml:6` 声明的 `android.hardware.vulkan.version` 为 `0x403000`，即 1.3。此前在 Redmi K50 Ultra（骁龙 8+ Gen 1、Adreno 730、HyperOS 3、Android 15）上的探针报告为 Vulkan **1.1.128**、驱动 512.615、子组 64 路、无 `shaderFloat64`、无片元着色器互锁。这台手机是下一个测试目标。为 Adreno 830 翻译的着色器包可能声明了在那里会被 `validate_capabilities` 拒绝的能力。
 4. **App 在 USAP 下启动时间线零点错误。** `main.c` 从 `/proc/self/stat` 读进程创建时刻。安卓可能预先分叉 App 进程（USAP 池），此时该字段是预分叉时刻。在 Redmi 上它读出 **8,422 秒**，而 Java 的 `Process.getStartUptimeMillis()` 为 **3.3 秒**。所有 `[x.xxs]` 日志时间和启动剖析的 ⓪ 段都偏了这么多。修复见 PR [#1](https://github.com/biglawine/xbl-android/pull/1)（分支 `android/start-time-from-java`）。
+5. **App 不链接 `.holes` 区段表，上游给测试者的剔零资源包会出错。** `jni_android.c` 的 `link_romfs` 只链接 `*.data` 和 `build.config`。`hle_fs.c` 在 `romfs/data/` 下找 `<档案>.holes`，找不到就按物理偏移读那四个剔零档案。修复见 PR [#2](https://github.com/biglawine/xbl-android/pull/2)（分支 `android/link-holes-tables`），设备证据见下。
+
+## Redmi K50 Ultra 上机（15:15–15:35）
+
+Redmi K50 Ultra，骁龙 8+ Gen 1、Adreno 730，HyperOS 3 / Android 15（API 35），USAP 池已开。APK 由本分支构建（已并入 PR #1、#2），用本机调试钥匙签名。
+
+| 步骤 | 结果 |
+|---|---|
+| `adb install`（首次安装） | 成功。清单里的 `android.hardware.vulkan.version` 1.3 并不阻止往这台 Vulkan 1.1 设备侧载 |
+| 所有文件访问 | `appops set --uid com.xiaoboluo.d2r MANAGE_EXTERNAL_STORAGE allow` |
+| 游戏文件 | 上游剔零包（18 个档案、4 个 `.holes`、`build.config`）推到 `Download/data`，用时 2 分钟 |
+| 模块 | r44 安卓 `out/`（24 个文件，79 MB）用 `run-as` 拷入 `files/dm/out/` |
+| 无着色器启动 | 链接 23 个文件，停在 `boot: no shader bundles`（报错界面，符合设计） |
+
+为了在真着色器到来前检查宿主，有两次启动放了一个**空占位** `.xgs`，事后已删除。它只能骗过启动器的目录检查，第一次真正加载着色器时必然失败。
+- **带 PR #2：**
+  - Vulkan 引擎在 Adreno 730 上初始化成功：`NVN caps api=1.1.128`、交换链 2712×1220、`mirror-clamp-to-edge` 已启用。
+  - 模块用 bionic 键表槽装载（`bionic 键表偏移 0`），重定位完成，264 条强制接管全部命中。
+  - SDK 初始化与 `nnMain` 运行，客体堆 3,728 MB。
+  - RomFS、临时目录与事务式存档挂载成功，`hle_fs.c` 登记了全部四个 `.holes` 表。
+  - NVN 窗口 2000×900，停在游戏第一次请求着色器处：`Missing genuine shader bundle …/a1217a07d94c1184.xgs`。
+- **不带 PR #2**（同样数据，先删掉残留链接）：链接 19 个文件，三次 `tact：zlib 解码失败`，随后在 `main+0x1b692dc` 处 `CRASH sig=11`，此时还没请求任何着色器。
+- **启动时刻（PR #1）：** 按 `/proc/<pid>/stat`，本 App 自己的进程被记成启动前 21,668 秒（约 6 小时）创建，因为它是 USAP 池预先分叉的。
+
+手机上现为 PR #2 的构建，没有占位文件；存档里有这几次运行生成的缺省 `Settings`。
 
 ## 下一步
 
-在容器里构建 `android/start-time-from-java` 和本分支，再装到 Redmi K50 Ultra 上，按 `dm/android/README.md` 的设备验收清单逐项验证。这需要 `.xgs` 包（发现 1）。
+biglawine 正在为 Redmi K50 Ultra 生成 `.xgs` 包（发现 1）。拿到后放进 `files/dm/shaders/`，再按 `dm/android/README.md` 的设备验收清单逐项验证（出图、建角、进局、NPC、背包 / 技能、声音、后台 / 恢复、存档 / 读档），并测 Adreno 730 上的帧率。

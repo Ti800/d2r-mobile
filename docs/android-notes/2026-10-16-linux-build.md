@@ -50,7 +50,32 @@ Rewriter counts, so other hosts can compare runs from the same original ExeFS:
 2. **The rewrite verifier does not cover `DM_TARGET=android`.** `dm/verify/structck.py` (checks ⑥ and ⑧) and `equiv.py:84` expect the Apple slot sequence (`mrs tpidrro_el0` plus the key page). Android output uses `mrs tpidr_el0; ldur [x,#-8]` (`patch_nso.py:286`). So `regress.sh` cannot validate the Android modules; the hashes above are the only cross-check for now.
 3. **The engine needs Vulkan 1.1, but the manifest and README ask for 1.3.** The instance requests 1.1 (`vulkan_present.cpp:139`) and the engine requires only 1.1 (`xbg_vulkan.cpp:154`, "SPIR-V 1.3"). `AndroidManifest.xml:6` declares `android.hardware.vulkan.version` `0x403000`, which is 1.3. Earlier probe runs on a Redmi K50 Ultra (Snapdragon 8+ Gen 1, Adreno 730, HyperOS 3, Android 15) reported Vulkan **1.1.128**, driver 512.615, 64-lane subgroups, no `shaderFloat64` and no fragment shader interlock. That phone is the next test target. Bundles translated for Adreno 830 may declare capabilities that `validate_capabilities` rejects there.
 4. **Start-up timeline zero is wrong in the App under USAP.** `main.c` reads the process creation time from `/proc/self/stat`. Android can pre-fork app processes (USAP pool), and then that field is the pre-fork time. On the Redmi it read **8,422 s** against Java's `Process.getStartUptimeMillis()` **3.3 s**. Every `[x.xxs]` log time and the boot profile's ⓪ segment are offset by that amount. Fix: PR [#1](https://github.com/biglawine/xbl-android/pull/1) (branch `android/start-time-from-java`).
+5. **The App does not link `.holes` tables, so upstream's trimmed tester pack breaks.** `link_romfs` in `jni_android.c` links only `*.data` and `build.config`. `hle_fs.c` looks for `<archive>.holes` in `romfs/data/`, so it reads the four zero-stripped archives at physical offsets. Fix: PR [#2](https://github.com/biglawine/xbl-android/pull/2) (branch `android/link-holes-tables`), with the device evidence below.
+
+## Device bring-up on the Redmi K50 Ultra (15:15–15:35)
+
+Redmi K50 Ultra, Snapdragon 8+ Gen 1, Adreno 730, HyperOS 3 / Android 15 (API 35), USAP pool enabled. APK built from this branch (with PRs #1 and #2 merged in), signed with this host's debug key.
+
+| Step | Result |
+|---|---|
+| `adb install` (first install) | Success. The manifest's `android.hardware.vulkan.version` 1.3 does not block sideloading on this Vulkan 1.1 device |
+| All-files access | `appops set --uid com.xiaoboluo.d2r MANAGE_EXTERNAL_STORAGE allow` |
+| Game files | Upstream's trimmed pack (18 archives, 4 `.holes`, `build.config`) pushed to `Download/data` in 2 min |
+| Modules | r44 Android `out/` (24 files, 79 MB) copied into `files/dm/out/` with `run-as` |
+| Launch, no shaders | 23 files linked, then stops at `boot: no shader bundles` (error screen, as designed) |
+
+To check the host before real shaders arrive, two launches used a single **empty placeholder** `.xgs`, deleted afterwards. That only gets past the launcher's directory check; the first real shader load must fail.
+- **With PR #2:**
+  - The Vulkan engine initialised on the Adreno 730: `NVN caps api=1.1.128`, swapchain 2712×1220, `mirror-clamp-to-edge` enabled.
+  - Modules loaded with the bionic key-table slots (`bionic 键表偏移 0`), relocations ran, all 264 forced take-overs hit.
+  - SDK init and `nnMain` ran, with a 3,728 MB guest heap.
+  - RomFS, temp and transactional save mounted, and `hle_fs.c` registered all four `.holes` tables.
+  - The NVN window was 2000×900, and the run stopped at the game's first shader request: `Missing genuine shader bundle …/a1217a07d94c1184.xgs`.
+- **Without PR #2** (same data, stale links removed): 19 files linked, three `tact：zlib 解码失败`, then `CRASH sig=11` at `main+0x1b692dc`, before any shader request.
+- **Start time (PR #1):** this App's own process was dated 21,668 s (about 6 h) before its launch by `/proc/<pid>/stat`, because the USAP pool pre-forked it.
+
+The phone now has the PR #2 build, no placeholder, and a default `Settings` file in its saves from these runs.
 
 ## Next
 
-Build `android/start-time-from-java` and this branch in the container, then install on the Redmi K50 Ultra and follow the device acceptance list in `dm/android/README.md`. That needs `.xgs` bundles (finding 1).
+biglawine is generating `.xgs` bundles for the Redmi K50 Ultra (finding 1). With them: real shaders in `files/dm/shaders/`, then the device acceptance list in `dm/android/README.md` (rendering, character creation, entering a world, NPCs, inventory/skills, sound, background/resume, save/reload) and an FPS reading on Adreno 730.
