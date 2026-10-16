@@ -49,7 +49,7 @@ DM_GEN_DIR=/绝对路径/宿主表头目录 dm/android/docker/build.sh
 1. **本仓库无法生成 `.xgs` 着色器包。** 引擎从着色器目录读取 `<key>.xgs`（`xbg_game.cpp:1110-1125`），格式为 `xbg_shader_header`（magic `XGS1`、版本 1、阶段、绑定、输入、c1 字节、SPIR-V；`xbg_game.h:81-87`）。仓库里没有任何脚本、工具或文档会写出这种文件，`dm/android/README.md` 只写了"与游戏和 Vulkan 后端匹配的外部 `.xgs` 包"。新贡献者能编出 APK，却无法仅凭本仓库给设备备齐运行文件。请问团队：生成工具在哪里（鸿蒙那边的工具？），能否把它或格式说明提交到本仓库？
 2. **改写校验不覆盖 `DM_TARGET=android`。** `dm/verify/structck.py`（第 ⑥、⑧ 项）和 `equiv.py:84` 认的是苹果的槽序列（`mrs tpidrro_el0` + 键页），安卓产物是 `mrs tpidr_el0; ldur [x,#-8]`（`patch_nso.py:286`）。所以 `regress.sh` 无法校验安卓模块，目前只能靠上面的哈希互相对照。
 3. **引擎只要 Vulkan 1.1，清单和 README 却要 1.3。** 实例请求 1.1（`vulkan_present.cpp:139`），引擎只要求 1.1（`xbg_vulkan.cpp:154`，"SPIR-V 1.3"）；`AndroidManifest.xml:6` 声明的 `android.hardware.vulkan.version` 为 `0x403000`，即 1.3。此前在 Redmi K50 Ultra（骁龙 8+ Gen 1、Adreno 730、HyperOS 3、Android 15）上的探针报告为 Vulkan **1.1.128**、驱动 512.615、子组 64 路、无 `shaderFloat64`、无片元着色器互锁。这台手机是下一个测试目标。为 Adreno 830 翻译的着色器包可能声明了在那里会被 `validate_capabilities` 拒绝的能力。
-4. **App 在 USAP 下启动时间线零点错误。** `main.c` 从 `/proc/self/stat` 读进程创建时刻。安卓可能预先分叉 App 进程（USAP 池），此时该字段是预分叉时刻。在 Redmi 上它读出 **8,422 秒**，而 Java 的 `Process.getStartUptimeMillis()` 为 **3.3 秒**。所有 `[x.xxs]` 日志时间和启动剖析的 ⓪ 段都偏了这么多。修复在分支 `android/start-time-from-java`。
+4. **App 在 USAP 下启动时间线零点错误。** `main.c` 从 `/proc/self/stat` 读进程创建时刻。安卓可能预先分叉 App 进程（USAP 池），此时该字段是预分叉时刻。在 Redmi 上它读出 **8,422 秒**，而 Java 的 `Process.getStartUptimeMillis()` 为 **3.3 秒**。所有 `[x.xxs]` 日志时间和启动剖析的 ⓪ 段都偏了这么多。修复见 PR [#1](https://github.com/biglawine/xbl-android/pull/1)（分支 `android/start-time-from-java`）。
 
 ## 下一步
 
