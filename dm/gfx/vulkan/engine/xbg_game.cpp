@@ -714,6 +714,35 @@ VkFormat decoded_format(uint32_t pixels) {
     default:xbg_fatalf("Invalid decoded BC pixel format %u",pixels);
     }
 }
+// Read-only capability report, logged once at initialization: what this device actually supports, so a missing capability can be
+// named precisely (a Vulkan 1.1 driver lacks much of what 1.3 drivers report) instead of being read off the first fatal error.
+void capability_report(){
+    const VkPhysicalDeviceFeatures &f=cfg.enabled_core;const VkPhysicalDeviceLimits &l=properties.limits;
+    xbg_logf("NVN caps device=\"%s\" vendor=%#x id=%#x api=%u.%u.%u driver=%#x",properties.deviceName,properties.vendorID,properties.deviceID,
+        VK_API_VERSION_MAJOR(properties.apiVersion),VK_API_VERSION_MINOR(properties.apiVersion),VK_API_VERSION_PATCH(properties.apiVersion),properties.driverVersion);
+    xbg_logf("NVN caps features drawParameters=%u storageReadWithoutFormat=%u storageWriteWithoutFormat=%u storageExtendedFormats=%u gatherExtended=%u "
+        "tessellation=%u geometry=%u occlusionQueryPrecise=%u depthBounds=%u depthClamp=%u fillModeNonSolid=%u bc=%u astcLdr=%u etc2=%u "
+        "anisotropy=%u logicOp=%u dualSrcBlend=%u independentBlend=%u clipDistance=%u cullDistance=%u float64=%u int64=%u int16=%u",
+        unsigned(cfg.enabled_shader_draw_parameters),f.shaderStorageImageReadWithoutFormat,f.shaderStorageImageWriteWithoutFormat,f.shaderStorageImageExtendedFormats,
+        f.shaderImageGatherExtended,f.tessellationShader,f.geometryShader,f.occlusionQueryPrecise,f.depthBounds,f.depthClamp,f.fillModeNonSolid,
+        f.textureCompressionBC,f.textureCompressionASTC_LDR,f.textureCompressionETC2,f.samplerAnisotropy,f.logicOp,f.dualSrcBlend,f.independentBlend,
+        f.shaderClipDistance,f.shaderCullDistance,f.shaderFloat64,f.shaderInt64,f.shaderInt16);
+    xbg_logf("NVN caps subgroup size=%u stages=%#x ops=%#x quadAllStages=%u",subgroup.subgroupSize,subgroup.supportedStages,subgroup.supportedOperations,subgroup.quadOperationsInAllStages);
+    xbg_logf("NVN caps limits ubRange=%u sbRange=%u ubDyn=%u sbDyn=%u ubAlign=%llu sbAlign=%llu texelAlign=%llu stageSamplers=%u stageSampled=%u "
+        "stageStorageImages=%u stageUB=%u stageSB=%u boundSets=%u colorAttachments=%u sharedMemory=%u workgroupInvocations=%u viewports=%u maxAnisotropy=%g",
+        l.maxUniformBufferRange,l.maxStorageBufferRange,l.maxDescriptorSetUniformBuffersDynamic,l.maxDescriptorSetStorageBuffersDynamic,
+        (unsigned long long)l.minUniformBufferOffsetAlignment,(unsigned long long)l.minStorageBufferOffsetAlignment,(unsigned long long)l.minTexelBufferOffsetAlignment,
+        l.maxPerStageDescriptorSamplers,l.maxPerStageDescriptorSampledImages,l.maxPerStageDescriptorStorageImages,l.maxPerStageDescriptorUniformBuffers,
+        l.maxPerStageDescriptorStorageBuffers,l.maxBoundDescriptorSets,l.maxColorAttachments,l.maxComputeSharedMemorySize,l.maxComputeWorkGroupInvocations,
+        l.maxViewports,double(l.maxSamplerAnisotropy));
+    // Every core format up to ASTC 12x12 sRGB (BC, ETC2 and ASTC included) as vkformat:optimalTilingFeatures/bufferFeatures
+    // (VkFormatFeatureFlagBits); formats with neither are left out.
+    std::string line;unsigned n=0;
+    for(int v=1;v<=int(VK_FORMAT_ASTC_12x12_SRGB_BLOCK);v++){const VkFormatProperties &p=format_properties(VkFormat(v));if(!p.optimalTilingFeatures && !p.bufferFeatures)continue;
+        char item[40];snprintf(item,sizeof(item)," %d:%#x/%#x",v,p.optimalTilingFeatures,p.bufferFeatures);line+=item;
+        if(++n%10==0){xbg_logf("NVN caps formats%s",line.c_str());line.clear();}}
+    if(!line.empty())xbg_logf("NVN caps formats%s",line.c_str());
+}
 struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false;
@@ -1419,7 +1448,7 @@ VkSampler sampler_slow(const samp_par &p,Image &im,VkFormat viewed,bool integer_
     VkSamplerCreateInfo s{};int result=xbg_sampler_from_nvn(&input,&limits,&s);
     if(result)xbg_fatalf("NVN sampler %s result=%d min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g aniso=%g compare=%u/%u border=%g,%g,%g,%g texture=%llu format=%#x vk=%u mirrorEnabled=%u",xbg_sampler_error(result),result,p.minf,p.magf,p.ws,p.wt,p.wr,p.lod_min,p.lod_max,p.lod_bias,p.aniso,p.cmp_mode,p.cmp_func,p.border[0],p.border[1],p.border[2],p.border[3],(unsigned long long)im.source.serial,im.source.d.format,unsigned(viewed),sampler_mirror_clamp_enabled);
     const VkFormatProperties &fp=format_properties(viewed);
-    if((s.minFilter==VK_FILTER_LINEAR || s.magFilter==VK_FILTER_LINEAR) && !(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))xbg_fatalf("NVN sampler linear filtering unsupported min=%u mag=%u format=%#x vk=%u",p.minf,p.magf,im.source.d.format,unsigned(viewed));
+    if((s.minFilter==VK_FILTER_LINEAR || s.magFilter==VK_FILTER_LINEAR) && !(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))xbg_fatalf("NVN sampler linear filtering unsupported min=%u mag=%u compare=%u/%u format=%#x vk=%u optimalFeatures=%#x texture=%llu",p.minf,p.magf,p.cmp_mode,p.cmp_func,im.source.d.format,unsigned(viewed),fp.optimalTilingFeatures,(unsigned long long)im.source.serial);
     need(s.pNext==nullptr,"Unexpected sampler extension chain");
     auto bits=[](float f){uint32_t u;memcpy(&u,&f,4);return u;};
     std::array<uint32_t,16> key{s.flags,uint32_t(s.magFilter),uint32_t(s.minFilter),uint32_t(s.mipmapMode),uint32_t(s.addressModeU),uint32_t(s.addressModeV),uint32_t(s.addressModeW),bits(s.mipLodBias),s.anisotropyEnable,bits(s.maxAnisotropy),s.compareEnable,uint32_t(s.compareOp),bits(s.minLod),bits(s.maxLod),uint32_t(s.borderColor),s.unnormalizedCoordinates};
@@ -2376,6 +2405,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}
       format_feature_flags2=properties.apiVersion>=VK_API_VERSION_1_3;for(auto &e:ext)if(!strcmp(e.extensionName,VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME))format_feature_flags2=true;
       xbg_logf("NVN format-feature-flags2=%d (formatless storage checks %s)",int(format_feature_flags2),format_feature_flags2?"per format":"by the pre-1.3 format list");
+      capability_report();
       for(size_t at=0;at<list.size();at+=900)xbg_logf("NVN caps extensions[%zu] %s",at/900,list.substr(at,900).c_str());
       xbg_logf("NVN caps api=%u.%u.%u driver=%u maxUBdyn=%u maxPerStageUB=%u minUBAlign=%llu maxBoundSets=%u",VK_API_VERSION_MAJOR(properties.apiVersion),VK_API_VERSION_MINOR(properties.apiVersion),VK_API_VERSION_PATCH(properties.apiVersion),properties.driverVersion,properties.limits.maxDescriptorSetUniformBuffersDynamic,properties.limits.maxPerStageDescriptorUniformBuffers,(unsigned long long)properties.limits.minUniformBufferOffsetAlignment,properties.limits.maxBoundDescriptorSets);}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-ab-toggle").c_str(),"rb");ab_period=0;if(m){if(fscanf(m,"%d",&ab_period)!=1)ab_period=0;fclose(m);}xbg_logf("NVN PERF ab_period=%d",ab_period);}
