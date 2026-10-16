@@ -141,6 +141,13 @@ void dm_android_touch_step(uint64_t guest_now, uint64_t *buttons, int32_t *lx, i
     }
     if (!focused) { pthread_mutex_unlock(&lock); return; }
     sync_host();
+    /* 本次取手柄前排队的触点整批在这里套用：按下与抬起落在同一批（点得比游戏两次取手柄的间隔还短、或游戏卡住没取输入）时，状态机算出的键在批末已经松开，
+       游戏一次也看不到——iOS 由前端异步调 dm_input_set，按下沿进 hle_hid.c 的 g_press_latch 锁存，这里同样：批内任何时刻按着过的键这次一并给出，下一次照实际值。
+       The touches queued before this controller read are applied here as one batch: when press and release land in the same batch (a tap shorter than the
+       interval between two reads, or the game stalling its input reads), the state machine's key is already up at the end of the batch and the game never
+       sees it. On iOS the front end calls dm_input_set asynchronously and the press edge is latched in hle_hid.c g_press_latch; likewise here, keys held at
+       any point in the batch are delivered with this read, and the next read reports the actual state. */
+    uint64_t pressed = 0;
     while (head != tail) {
         touch_event e = queue[head++ % 256];
         dm_tc_finger *f = &tc.finger[e.slot];
@@ -175,6 +182,7 @@ void dm_android_touch_step(uint64_t guest_now, uint64_t *buttons, int32_t *lx, i
             } else dm_tc_cancel_finger(&tc,e.slot);
             if (ui_drag) { dm_ui_drag_end(); ui_drag = 0; }
         }
+        pressed |= tc.buttons;
         requests();
     }
     double now = now_ns()/1e9;
@@ -201,7 +209,7 @@ void dm_android_touch_step(uint64_t guest_now, uint64_t *buttons, int32_t *lx, i
     if (tc.pointer_valid) dm_cursor_set_screen(tc.pointer_x,tc.pointer_y,width,height); else dm_cursor_clear();
     int active = 0; for (int i=0;i<DM_TC_MAX_TOUCH;++i) active |= tc.finger[i].active;
     dm_ui_hand_idle(!active && !tc.pulse_button && !dm_tc_pulse_pending(&tc) && !dm_cursor_pending() && !dm_ui_touch_active());
-    *buttons |= tc.buttons;
+    *buttons |= tc.buttons | pressed;
     if (!*lx && !*ly) { *lx = tc.lx; *ly = tc.ly; }
     if (!*rx && !*ry) { *rx = tc.rx; *ry = tc.ry; }
     pthread_mutex_unlock(&lock);
