@@ -35,7 +35,7 @@ Recommended remotes: `origin` for this repository, read-only `upstream` for jhai
 
 ## Measured status (2026-10-16, China Standard Time)
 
-Development build `0.1.7-dev / code8` was installed at 08:56 on vivo X200 Ultra (V2454A, Android 16/API36, Adreno 830). APK SHA256: `381514cce18027320cb6b0a5a72a83beb2cfefcbedb9bc3a9d0fb7f089cf62d0`. Corresponding source commit: `90adb6905d07520dcd5d456115f20f7102210fa3`. This is a development baseline, not a finished release.
+Development build `0.1.7-dev / code8` was installed at 08:56 on vivo X200 Ultra (V2454A, Android 16/API36, Adreno 830). APK SHA256: `381514cce18027320cb6b0a5a72a83beb2cfefcbedb9bc3a9d0fb7f089cf62d0`. Corresponding source commit: `c7db2646eb9ff74678cd47dc3c6f87834b3852ca`. This is a development baseline, not a finished release.
 
 | Area | Actual result |
 | --- | --- |
