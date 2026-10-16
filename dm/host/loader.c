@@ -38,9 +38,11 @@ static void create_keys(void) {
     // Parameter slot keys are always created (not decided by whether the build output uses them: an iOS app has no params.tsv, so deciding by file would miss creating them and the key page would be written as 0 → the game reads TSD slot 0)
     if (pthread_key_create(&g_keyres[0], NULL) || pthread_key_create(&g_keyres[1], NULL) ||
         pthread_key_create(&g_keyaspect, NULL) || pthread_key_create(&g_keyaspectui, NULL)) die("创建参数位键失败");
+    // 键号先转 unsigned 再放宽：bionic 的 pthread_key_t 是 int（有效键带最高位，如 0x80000020），直接转 unsigned long 会符号扩展成 0xffffffff80000020；苹果是 unsigned long 小整数，打印不变
+    // Keys go through unsigned before widening: bionic's pthread_key_t is int (valid keys carry the top bit, e.g. 0x80000020), and a direct unsigned long cast sign-extends to 0xffffffff80000020; on Apple it is a small unsigned long, printed unchanged
     LOG("键号 K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu KRES0=%lu KRES1=%lu KASPECT=%lu KASPECTUI=%lu",
-        (unsigned long)g_key18, (unsigned long)g_keytls, (unsigned long)g_keytlr, (unsigned long)g_keygate,
-        (unsigned long)g_keyres[0], (unsigned long)g_keyres[1], (unsigned long)g_keyaspect, (unsigned long)g_keyaspectui);
+        (unsigned long)(unsigned)g_key18, (unsigned long)(unsigned)g_keytls, (unsigned long)(unsigned)g_keytlr, (unsigned long)(unsigned)g_keygate,
+        (unsigned long)(unsigned)g_keyres[0], (unsigned long)(unsigned)g_keyres[1], (unsigned long)(unsigned)g_keyaspect, (unsigned long)(unsigned)g_keyaspectui);
     tsd_probe();
 }
 
@@ -237,7 +239,7 @@ static void register_gates(module_t *m, const char *dir) {
             if (sscanf(line, "%lx %15s %d %lx", &ret, kind, &arg, &orig) == 4) { gate_register((uint64_t)m->base + ret, kind, arg, orig); ng++; }
         fclose(f);
     }
-    LOG("%s: gates %d patch_off %#llx keys %lu/%lu/%lu/%lu", m->name, ng, m->patch_off, g_key18, g_keytls, g_keytlr, g_keygate);
+    LOG("%s: gates %d patch_off %#llx keys %lu/%lu/%lu/%lu", m->name, ng, m->patch_off, (unsigned long)(unsigned)g_key18, (unsigned long)(unsigned)g_keytls, (unsigned long)(unsigned)g_keytlr, (unsigned long)(unsigned)g_keygate);   // 同上：bionic 的 pthread_key_t 是 int | as above: bionic pthread_key_t is int
 }
 
 static void relocate(module_t *m) {
