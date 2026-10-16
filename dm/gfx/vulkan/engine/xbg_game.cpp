@@ -347,10 +347,12 @@ std::vector<PendingReport> pending_reports;
 // Command-buffer SignalEvent (4 per frame in D2R) completes when the GPU reaches it. Completing all work at the signal stalls
 // the CPU on the GPU at every signal; marker file gfx-defer-events = '1' instead submits the work so far without waiting and
 // publishes the value when that submission's slot retires (as the Metal backend writes it from a completion handler).
+// '2' does not submit at the signal: the value waits in the slot being recorded and is published when that slot retires,
+// so a frame stays one submission and the 2-slot ring does not wrap inside it.
 // The game reads event values only through nvnEventGetValue, which resolves first (xbg_game_event_read).
 struct PendingEvent {uint64_t addr;uint32_t mode,v;const void *slot;};
-std::vector<PendingEvent> pending_events;
-bool defer_events=false;uint64_t events_deferred=0,event_reads=0;
+std::vector<PendingEvent> pending_events,recording_events;   // recording_events: mode 2, slot not yet submitted
+int defer_events=0;uint64_t events_deferred=0,event_reads=0;
 struct PendingWriteback {uint64_t addr,bytes;Buffer buffer;const void *slot;};
 std::vector<PendingWriteback> pending_writebacks;
 void cpu_access(uint64_t address,uint64_t bytes,unsigned why=0);   // resolve pending GPU results overlapping a CPU access
@@ -554,6 +556,7 @@ void submit_slots(bool wait){
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=1;si.pCommandBuffers=&s.cmd;
         {CPU_SCOPE(Submit);VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}++submit_by[sync_site];
         s.recording=false;s.pending=true;s.covers=submitted;slot_index^=1;++perf.submits;snapshot_reset();++slot_serial;
+        pending_events.insert(pending_events.end(),recording_events.begin(),recording_events.end());recording_events.clear();
     }
     if(wait){retire_slot(slots[slot_index]);retire_slot(slots[slot_index^1]);}
 }
@@ -2407,7 +2410,9 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_CALL:execute(reinterpret_cast<const uint8_t*>(payload<uint64_t>(p,n)),depth+1,budget);break;
         case OP_SIGNAL_EVENT:{need(n>=16,"Truncated event");uint64_t addr;uint32_t mode,v;memcpy(&addr,p,8);memcpy(&mode,p+8,4);memcpy(&v,p+12,4);need(addr,"Null event address");SiteScope site(SITE_EVENT);
             if(defer_events){   // hand the work so far to the GPU without waiting; publish when that submission retires
-                Slot &cur=slots[slot_index];if(cur.recording && cur.ops)submit_slots(false);
+                Slot &cur=slots[slot_index];
+                if(defer_events==2 && cur.recording && cur.ops){recording_events.push_back({addr,mode,v,&cur});++events_deferred;break;}
+                if(cur.recording && cur.ops)submit_slots(false);
                 Slot &last=slots[slot_index^1];   // most recent submission (just made, or the previous one)
                 if(last.pending){pending_events.push_back({addr,mode,v,&last});++events_deferred;}else apply_event(addr,mode,v);
                 break;}
@@ -2517,7 +2522,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');occlusion_batch_marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-query-batch";refresh_occlusion_batch();}
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');early_submit_marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-early-submit";refresh_early_submit();}
     xbg_logf("NVN occlusion batch enabled=%d",int(occlusion_batch_enabled));
-     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=false;if(m){defer_events=fgetc(m)=='1';fclose(m);}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));}
+     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));}
     for(auto &sl:slots)sl=Slot{};slot_index=0;pass_prof_enabled=false;pass_prof_next=300;pass_prof_frame=UINT64_MAX;pass_prof_draws=0;pass_prof_queries=pass_prof_slots=pass_prof_skipped_slots=0;perf=Perf{};for(auto &c:perf_timing_before)c=XbgCpuTiming::Counter{};static_arena.cached=false;support_static.clear();format_property_cache.clear();
     VkPhysicalDeviceShaderDrawParametersFeatures draw_parameters{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};features.pNext=&draw_parameters;vkGetPhysicalDeviceFeatures2(cfg.physical,&features);if(cfg.enabled_shader_draw_parameters && !draw_parameters.shaderDrawParameters){if(error&&bytes)snprintf(error,bytes,"shaderDrawParameters unsupported");return -1;}
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;VkResult r=vkCreateCommandPool(cfg.device,&cp,nullptr,&command_pool);if(r!=VK_SUCCESS){if(error&&bytes)snprintf(error,bytes,"vkCreateCommandPool=%d",r);return r;}
@@ -2545,7 +2550,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
 // nvnEventGetValue on a deferred event: finish the GPU work the signal covers, then the value is published (apply_ready_events).
 extern "C" void xbg_game_event_read(const void *addr){
     std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized || failed)return;
-    for(auto &e:pending_events)if(e.addr==uint64_t(reinterpret_cast<uintptr_t>(addr))){++event_reads;complete_all();return;}
+    for(auto *list:{&pending_events,&recording_events})for(auto &e:*list)if(e.addr==uint64_t(reinterpret_cast<uintptr_t>(addr))){++event_reads;complete_all();return;}
 }
 extern "C" int xbg_game_set_sampler_mirror_clamp_to_edge(VkBool32 enabled){
     if(enabled!=VK_FALSE && enabled!=VK_TRUE)return -1;
@@ -2614,7 +2619,7 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
 static void xbg_legacy_pool_add_now(void *p,size_t n){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&n,"Invalid NVN pool");pools[uintptr_t(p)]=n;auto epoch=provenance.pool(uint64_t(p),true);provenance_log("POOL_ADD mem=%p bytes=%zu epoch=%llu",p,n,epoch);}
 static void xbg_legacy_pool_del_now(void *p){std::lock_guard<std::recursive_mutex> lock(mutex);provenance_log("POOL_DEL mem=%p epoch=%llu",p,provenance.epoch(uint64_t(p)));provenance.pool(uint64_t(p),false);pools.erase(uintptr_t(p));}
