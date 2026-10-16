@@ -401,3 +401,27 @@ dmAndroidPotion1	药水1	Potion 1	安卓悬浮触控标签 | Android floating co
 dmAndroidPotion2	药水2	Potion 2	安卓悬浮触控标签 | Android floating control label
 dmAndroidPotion3	药水3	Potion 3	安卓悬浮触控标签 | Android floating control label
 dmAndroidPotion4	药水4	Potion 4	安卓悬浮触控标签 | Android floating control label
+dmAndroidWidgetTitle	英雄	Heroes	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetRefresh	刷新	Refresh	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetName2x2	最近英雄	Latest Hero	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetName4x2	英雄列表	Hero List	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetDescription	查看已保存的英雄进度	View saved hero progress	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetEmpty	还没有英雄	No heroes yet	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetEmptyHint	点开游戏创建英雄	Open the game to create a hero	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetError	无法读取存档摘要	Save summary unavailable	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetErrorHint	成功保存后请刷新	Refresh after a successful save	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetStats	%1$d级 · %2$s	Lv %1$d · %2$s	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetExp	经验 %1$s	Exp %1$s	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetGold	金币 %1$s	Gold %1$s	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetExpUnknown	经验暂不可读	Experience unavailable	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetGoldUnknown	金币暂不可读	Gold unavailable	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetFooter	%1$d位英雄	%1$d heroes	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetPartial	%1$d位英雄 · 部分存档不可读	%1$d heroes · some saves unreadable	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetClassAmazon	亚马逊	Amazon	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetClassSorceress	法师	Sorceress	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetClassNecromancer	死灵法师	Necromancer	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetClassPaladin	圣骑士	Paladin	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetClassBarbarian	野蛮人	Barbarian	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetClassDruid	德鲁伊	Druid	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetClassAssassin	刺客	Assassin	安卓英雄桌面组件 | Android hero home-screen widget
+dmAndroidWidgetClassWarlock	术士	Warlock	安卓英雄桌面组件 | Android hero home-screen widget

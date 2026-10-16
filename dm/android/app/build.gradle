@@ -17,6 +17,15 @@ def generateStartupStrings = tasks.register('generateStartupStrings', Exec) {
     commandLine(project.findProperty('dmPython') ?: 'python3', '../tools/gen_strings.py', '--output', startupStrings.get().asFile)
 }
 
+// 复用仓库现有 iOS 图标，生成安卓资源，不重复提交图片。
+// Reuse the existing iOS icon as a generated Android resource without duplicating the image.
+def launcherIcon = layout.buildDirectory.dir('generated/launcherIcon')
+def generateLauncherIcon = tasks.register('generateLauncherIcon', Copy) {
+    from('../../ios/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png')
+    into(launcherIcon.map { it.dir('mipmap-nodpi') })
+    rename { 'ic_launcher.png' }
+}
+
 android {
     namespace 'com.xiaoboluo.d2r'
     compileSdk 36
@@ -25,8 +34,8 @@ android {
         applicationId 'com.xiaoboluo.d2r'
         minSdk 31
         targetSdk 36
-        versionCode 2
-        versionName '0.1.1-dev'
+        versionCode 8
+        versionName '0.1.7-dev'
         ndk { abiFilters 'arm64-v8a' }
         if (!prebuilt) externalNativeBuild { cmake {
             arguments "-DDM_GEN_DIR=${project.findProperty('dmGenDir') ?: ''}"
@@ -36,9 +45,9 @@ android {
     }
     if (!prebuilt) externalNativeBuild { cmake { path '../CMakeLists.txt'; version '3.31.6' } }
     if (prebuilt) sourceSets { main { jniLibs.srcDirs = [prebuilt] } }
-    sourceSets { main { res.srcDir(startupStrings.get().asFile) } }
+    sourceSets { main { res.srcDir(startupStrings.get().asFile); res.srcDir(launcherIcon.get().asFile) } }
     packaging { jniLibs { useLegacyPackaging false; keepDebugSymbols += ['**/libdm.so'] } }
     buildTypes { release { minifyEnabled false } }
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
 }
-tasks.named('preBuild').configure { dependsOn(generateStartupStrings) }
+tasks.named('preBuild').configure { dependsOn(generateStartupStrings, generateLauncherIcon) }

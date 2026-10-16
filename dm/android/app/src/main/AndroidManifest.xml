@@ -6,6 +6,8 @@
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true" />
     <application
         android:label="@string/dmandroidname"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:hasFragileUserData="true"
         android:appCategory="game"
         android:isGame="true"
@@ -23,5 +25,21 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <receiver android:name=".widget.HeroWidget2x2Provider"
+            android:exported="false" android:label="@string/dmandroidwidgetname2x2">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_2x2_info" />
+            <meta-data android:name="vivo_widget" android:value="true" />
+            <meta-data android:name="vivoWidgetVersion" android:value="1" />
+            <meta-data android:name="vivo.widget.description" android:resource="@string/dmandroidwidgetdescription" />
+        </receiver>
+        <receiver android:name=".widget.HeroWidget4x2Provider"
+            android:exported="false" android:label="@string/dmandroidwidgetname4x2">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_4x2_info" />
+            <meta-data android:name="vivo_widget" android:value="true" />
+            <meta-data android:name="vivoWidgetVersion" android:value="1" />
+            <meta-data android:name="vivo.widget.description" android:resource="@string/dmandroidwidgetdescription" />
+        </receiver>
     </application>
 </manifest>

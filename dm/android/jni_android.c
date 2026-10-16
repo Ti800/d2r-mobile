@@ -22,6 +22,7 @@
 #include <jni.h>
 #include "vulkan_present.h"
 #include "touch_android.h"
+#include "lifecycle_dispatch.h"
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -32,6 +33,24 @@ void front_android_boot_failed(int code);
 
 static char g_files[1024], g_ext[1024], g_src[1024], g_runtime[1100];
 static FILE *g_logf;
+
+// 挂起只能在原生pthread栈上执行；UI只登记最新状态，不能等正在等待Surface的呈现调用。
+// Suspend only on a native pthread stack; UI posts latest state without waiting for a present that needs a Surface.
+static dm_lifecycle_dispatch g_lifecycle;
+static pthread_once_t g_lifecycle_once = PTHREAD_ONCE_INIT;
+static int g_lifecycle_error;
+static void lifecycle_graphics(int on) {
+    __android_log_print(ANDROID_LOG_INFO, "dm-lifecycle", "graphics suspend=%d begin", on);
+    dm_gfx_suspend(on);
+    __android_log_print(ANDROID_LOG_INFO, "dm-lifecycle", "graphics suspend=%d complete", on);
+}
+static void lifecycle_init(void) {
+    dm_lifecycle_ops ops = {dm_focus_set, dm_audio_suspend, lifecycle_graphics};
+    g_lifecycle_error = dm_lifecycle_start(&g_lifecycle, ops);
+    if (!g_lifecycle_error) pthread_setname_np(g_lifecycle.thread, "dm-lifecycle");
+    if (g_lifecycle_error) __android_log_print(ANDROID_LOG_ERROR, "dm-lifecycle", "worker start failed rc=%d", g_lifecycle_error);
+}
+static int lifecycle_ready(void) { pthread_once(&g_lifecycle_once, lifecycle_init); return !g_lifecycle_error; }
 
 // stderr → 管道 → 本线程：逐行写日志文件（adb pull 取）并转 logcat（标签 dm）
 // stderr → pipe → this thread: write line by line to the log file (fetched with adb pull) and forward to logcat (tag dm)
@@ -136,6 +155,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     snprintf(required, sizeof required, "%s/overlay", g_runtime);
     struct stat overlay_stat;
     if (!stat(required, &overlay_stat) && S_ISDIR(overlay_stat.st_mode)) setenv("DM_ROMFS_OVERLAY", required, 1);
+    if (!lifecycle_ready()) return -8;
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
     pthread_t th; int rc = pthread_create(&th, &a, host_thread, NULL); pthread_attr_destroy(&a);
     if (!rc) { started = 1; pthread_detach(th); }
@@ -168,15 +188,13 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeTouch(JNIEnv *env
     dm_touch_set(t, n);
 }
 
-// 生命周期（同 iOS front_ios_focus_event）：0 失焦 → 焦点 2；1 进后台 → 焦点 3 + 音频暂停 + 图形挂起；2 回前台 → 图形恢复 + 音频恢复 + 焦点 2；3 激活 → 焦点 1
-// Lifecycle (as iOS front_ios_focus_event): 0 lose focus → focus 2; 1 enter background → focus 3 + audio pause + graphics suspend; 2 return to foreground → graphics resume + audio resume + focus 2; 3 active → focus 1
+// UI只入队：0失焦，1后台，2前台，3激活；激活也声明前台，合并2/3时不会漏恢复。
+// UI posts only: 0 unfocused, 1 background, 2 foreground, 3 active; active also declares foreground so merging 2/3 cannot lose resume.
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeFocus(JNIEnv *env, jclass cls, jint ev) {
     (void)env; (void)cls;
     dm_android_touch_focus(ev == 2 || ev == 3);
-    switch (ev) {
-        case 0: dm_focus_set(2); break;
-        case 1: dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); break;
-        case 2: dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); break;
-        case 3: dm_focus_set(1); break;
+    if (lifecycle_ready()) {
+        dm_lifecycle_post(&g_lifecycle, ev);
+        __android_log_print(ANDROID_LOG_INFO, "dm-lifecycle", "UI posted event=%d", ev);
     }
 }
