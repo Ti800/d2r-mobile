@@ -79,13 +79,15 @@ static void mkdirs(const char *p) {
 }
 // 内部目录 romfs/data/ 下逐个链接到资源目录的文件（游戏按 rom:/data/… 读；链接让资源留在玩家放的位置，不复制 5 GB）
 // Under the internal dir romfs/data/, link each file of the resource dir (the game reads rom:/data/...; links keep the resources where the player put them instead of copying 5 GB)
+// 剔零档案的「.holes」区段表也要链过去：hle_fs.c 与 romfs_validate.c 在档案旁边（即 romfs/data/ 下）找它，缺了就把剔过零的档案当成没拷完
+// The ".holes" extent tables of zero-stripped archives are linked too: hle_fs.c and romfs_validate.c look for them next to the archive (in romfs/data/), and without them a zero-stripped archive reads as incompletely copied
 static int link_romfs(const char *romfs) {
     char data[1100]; snprintf(data, sizeof data, "%s/data", romfs); mkdirs(data);
     DIR *d = opendir(g_src); if (!d) { LOG("【红】资源目录打不开 %s：errno %d（没给「所有文件访问」权限？）", g_src, errno); return -1; }
     struct dirent *e; int n = 0;
     while ((e = readdir(d))) {
         const char *nm = e->d_name; size_t l = strlen(nm);
-        if (!(l > 5 && !strcmp(nm + l - 5, ".data")) && strcmp(nm, ".build.config") && strcmp(nm, "build.config")) continue;
+        if (!(l > 5 && !strcmp(nm + l - 5, ".data")) && !(l > 11 && !strcmp(nm + l - 11, ".data.holes")) && strcmp(nm, ".build.config") && strcmp(nm, "build.config")) continue;
         char from[1100], to[1100]; snprintf(from, sizeof from, "%s/%s", g_src, nm);
         snprintf(to, sizeof to, "%s/%s", data, strcmp(nm, "build.config") ? nm : ".build.config");   // 电脑上常被存成无点名 | often saved without the leading dot on a computer
         unlink(to); if (!symlink(from, to)) n++;
