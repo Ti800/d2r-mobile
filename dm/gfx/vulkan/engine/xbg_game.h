@@ -40,6 +40,8 @@ int xbg_game_initialize(const xbg_game_config *config,char *error,size_t error_b
  * or VkPhysicalDeviceVulkan12Features.samplerMirrorClampToEdge enabled (1.2+).
  * Supported-but-not-enabled is false. Default false; existing config ABI intact. */
 int xbg_game_set_sampler_mirror_clamp_to_edge(VkBool32 enabled);
+/* Resolve a deferred command-buffer SignalEvent on this address before the CPU reads it (nvnEventGetValue). */
+void xbg_game_event_read(const void *addr);
 /* Optional one-frame diagnostics, disabled by default. Call after initialize,
  * before nnMain. directory must already exist and be private/writable. Captures
  * the 1-based present frame, at most 16 draw/clear events and 64 MiB total raw
