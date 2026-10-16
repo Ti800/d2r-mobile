@@ -43,6 +43,17 @@ The APK is `dm/android/app/build/outputs/apk/debug/app-debug.apk`. Native linkin
 uses `--no-undefined`. `-PdmPrebuiltJni=...` is a packaging-only fallback; it is not
 evidence that current native sources compile.
 
+On Linux or WSL, `dm/android/docker/` runs the same build in a container with these
+versions pinned, so no Windows-side Python, NDK or CMake is needed:
+
+```sh
+docker build -t dm-android-build:1 dm/android/docker
+DM_GEN_DIR=/absolute/path/to/private/generated/headers dm/android/docker/build.sh
+```
+
+The script runs as your user and keeps the debug signing key in `~/.android-dm`; see
+its header for the mounts.
+
 ## Private runtime files
 
 The APK and Git repository contain no game program, shaders, game art, or saves.

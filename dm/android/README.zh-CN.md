@@ -28,6 +28,15 @@ gradle -p dm/android :app:assembleDebug :app:lintDebug \
 
 APK 位于 `dm/android/app/build/outputs/apk/debug/app-debug.apk`，原生链接启用 `--no-undefined`。`-PdmPrebuiltJni=...` 只供使用已有库打包，不是当前原生源码编译通过的证据。
 
+在 Linux 或 WSL 上，可用 `dm/android/docker/` 在容器里跑同一构建，上述版本均已钉死，不需要在 Windows 侧装 Python、NDK 或 CMake：
+
+```sh
+docker build -t dm-android-build:1 dm/android/docker
+DM_GEN_DIR=/绝对路径/私有生成表头目录 dm/android/docker/build.sh
+```
+
+脚本以当前用户身份运行，调试签名钥匙保存在 `~/.android-dm`；挂载说明见脚本开头。
+
 ## 仓外运行材料
 
 APK 和 Git 仓库均不含游戏程序、着色器、游戏美术或存档。当前开发启动器需要独立导入材料，尚无通用导入界面。
