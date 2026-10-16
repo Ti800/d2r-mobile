@@ -14,6 +14,9 @@ import android.os.Environment;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
+import android.text.SpanWatcher;
+import android.text.Spannable;
+import android.text.Spanned;
 import android.text.TextWatcher;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.SurfaceHolder;
@@ -187,16 +190,41 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 input.setError(composing ? getString(R.string.dmnamepickime) : error == 1 ? getString(R.string.dmnametooshort) : error == 2 ? getString(R.string.dmnameedge) : null);
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(!composing && error == 0);
             };
+            Runnable settle = () -> {
+                Editable text = input.getText();
+                if (BaseInputConnection.getComposingSpanStart(text) < 0) {
+                    String normalized = TextInputRules.normalize(text.toString(), maxChars, nameRule, numericMax);
+                    if (!normalized.contentEquals(text)) { input.setText(normalized); input.setSelection(input.length()); return; }
+                }
+                check.run();
+            };
+            // 输入法结束组字（点候选、按完成）时常常只去掉组字标记、文字不变：TextWatcher 收不到，「确定」一直灰、提示停在「先选完字」。
+            // 组字状态一变就和文字变化一样处理（规整 + 重判）：SpanWatcher 挂在文字上，Editable.Factory 让每次 setText 换上的新文字也挂着它。
+            // When the IME finishes composing (picking a candidate, Done) it often only removes the composing span and keeps the text: TextWatcher is not
+            // called, so OK stays disabled with "finish choosing characters". A change of composing state is handled like a text change (normalize + check):
+            // a SpanWatcher sits on the text, and an Editable.Factory attaches it to the new text after every setText.
+            SpanWatcher composingWatch = new SpanWatcher() {
+                boolean composing = BaseInputConnection.getComposingSpanStart(input.getText()) >= 0;
+                private void changed(Spannable text) {
+                    boolean now = BaseInputConnection.getComposingSpanStart(text) >= 0;
+                    if (now != composing) { composing = now; input.post(settle); }
+                }
+                public void onSpanAdded(Spannable text, Object what, int start, int end) { changed(text); }
+                public void onSpanRemoved(Spannable text, Object what, int start, int end) { changed(text); }
+                public void onSpanChanged(Spannable text, Object what, int ostart, int oend, int nstart, int nend) { changed(text); }
+            };
+            input.setEditableFactory(new Editable.Factory() {
+                @Override public Editable newEditable(CharSequence source) {
+                    Editable e = super.newEditable(source);
+                    e.setSpan(composingWatch, 0, e.length(), Spanned.SPAN_INCLUSIVE_INCLUSIVE);
+                    return e;
+                }
+            });
+            input.getText().setSpan(composingWatch, 0, input.length(), Spanned.SPAN_INCLUSIVE_INCLUSIVE);
             input.addTextChangedListener(new TextWatcher() {
                 public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
                 public void onTextChanged(CharSequence s, int start, int before, int count) {}
-                public void afterTextChanged(Editable text) {
-                    if (BaseInputConnection.getComposingSpanStart(text) < 0) {
-                        String normalized = TextInputRules.normalize(text.toString(), maxChars, nameRule, numericMax);
-                        if (!normalized.contentEquals(text)) { input.setText(normalized); input.setSelection(input.length()); return; }
-                    }
-                    check.run();
-                }
+                public void afterTextChanged(Editable text) { settle.run(); }
             });
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
                 finished[0] = true;
