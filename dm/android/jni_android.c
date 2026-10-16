@@ -111,6 +111,21 @@ static void *host_thread(void *arg) {
     return NULL;
 }
 
+// 测试用：files/dm/env 每行 KEY=VALUE（# 开头为注释），在下面的缺省值之前设进环境，让 run-as 能改 DM_* 开关（iOS / Mac 用启动环境变量做同样的事）；没有这个文件就什么都不做
+// For testing: each KEY=VALUE line of files/dm/env (# starts a comment) is set before the defaults below, so run-as can change DM_* switches (iOS / Mac do the same with launch environment variables); without the file nothing happens
+static void load_env_file(const char *dir) {
+    char path[1300]; snprintf(path, sizeof path, "%s/env", dir);
+    FILE *fp = fopen(path, "r"); if (!fp) return;
+    char line[512];
+    while (fgets(line, sizeof line, fp)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *eq = strchr(line, '=');
+        if (!line[0] || line[0] == '#' || !eq || eq == line) continue;
+        *eq = 0; setenv(line, eq + 1, 1); LOG("boot: 环境 %s=%s（来自 %s）", line, eq + 1, path);
+    }
+    fclose(fp);
+}
+
 JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env, jclass cls, jstring files, jstring ext, jstring src, jstring lang) {
     (void)cls;
     static int started; if (started) return 0;
@@ -123,6 +138,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     if (access(p, R_OK)) snprintf(g_runtime, sizeof g_runtime, "%s/dm", g_ext);
     mkdirs(g_runtime);
     log_init();
+    load_env_file(g_runtime);
     LOG("boot: 内部目录 %s，外部目录 %s，资源 %s，系统语言 %s", g_files, g_ext, g_src, lg);
     char romfs[1100], save[1100], temp[1100];
     snprintf(romfs, sizeof romfs, "%s/romfs", g_files); snprintf(save, sizeof save, "%s/save", g_files); snprintf(temp, sizeof temp, "%s/temp", g_files);
