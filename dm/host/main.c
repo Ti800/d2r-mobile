@@ -91,8 +91,12 @@ static void flags_init(void) {
 
 // 启动时间线零点 = 进程创建时刻（sysctl KERN_PROC_PID 的 p_starttime，墙钟）换算到 now_ns 单调时基；Mac / iOS 同口径
 // Zero point of the boot timeline = process creation time (p_starttime from sysctl KERN_PROC_PID, wall clock) converted to the now_ns monotonic time base; same definition on Mac / iOS
+uint64_t g_proc_start_ns;
 static uint64_t proc_start_mono_ns(void) {
 #ifndef __APPLE__
+    // 安卓 App 用 Java 交来的启动时刻：App 进程可能是系统预先分叉备用的（USAP 池），/proc/self/stat 记的是那次分叉，可早于本次启动数小时
+    // The Android App uses the start time handed over from Java: the App process may have been forked ahead of time by the system (USAP pool), and /proc/self/stat records that fork, which can be hours before this launch
+    if (g_proc_start_ns) return g_proc_start_ns;
     // Linux：/proc/self/stat 第 22 字段 = 进程创建时刻（开机以来的时钟滴答），与 CLOCK_BOOTTIME 同一基准
     // Linux: field 22 of /proc/self/stat = process creation time (clock ticks since boot), on the same basis as CLOCK_BOOTTIME
     uint64_t mono = now_ns(); char buf[1024] = ""; FILE *f = fopen("/proc/self/stat", "r");
