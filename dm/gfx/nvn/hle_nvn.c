@@ -438,7 +438,10 @@ NVN(nvnEventInitialize, NVNboolean, NVNevent *e, const NVNeventBuilder *b) {
     *(ev_t *)e = (ev_t){MAGIC('E', 'V', 'N', 'T'), (volatile uint32_t *)(s->pool->mem + s->off)}; return 1;
 }
 NVN(nvnEventFinalize, void, NVNevent *e) { ((ev_t *)e)->magic = 0; }
-NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { return *((const ev_t *)e)->val; }
+// 后端若延后发布命令缓冲里的 SignalEvent（安卓 Vulkan，gfx-defer-events），读值前先让它落地；Metal 后端没有这个钩子
+// If the backend defers publishing command-buffer SignalEvents (Android Vulkan, gfx-defer-events), let it land before the read; the Metal backend has no such hook
+__attribute__((weak)) void mtl_event_read(const volatile uint32_t *val);
+NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { if (mtl_event_read) mtl_event_read(((const ev_t *)e)->val); return *((const ev_t *)e)->val; }
 static void ev_signal(const ev_t *e, int mode, uint32_t v) { if (mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v; else *e->val = v; }
 NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); }
 

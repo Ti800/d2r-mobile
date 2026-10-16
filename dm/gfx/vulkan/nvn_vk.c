@@ -49,6 +49,8 @@ void mtl_exec(const uint8_t *p){append_handle((uintptr_t)p);}
 void mtl_exec_rest(const uint64_t *h,int n){(void)h;(void)n;}
 void mtl_sub_index(const uint64_t *h,int n){(void)h;(void)n;}
 void mtl_sub_copy(uint64_t src,uint64_t dst,uint64_t n){uint64_t p[]={src,dst,n};direct(OP_COPY_B2B,p,sizeof(p));}
+// nvnEventGetValue 之前：延后发布的事件先落到内存（xbg_game.cpp gfx-defer-events） | before nvnEventGetValue: a deferred event is published first (xbg_game.cpp gfx-defer-events)
+void mtl_event_read(const volatile uint32_t *val){xbg_game_event_read((const void*)val);}
 void mtl_sub_event(volatile uint32_t *val,uint32_t mode,uint32_t v){struct{uint64_t a;uint32_t m,v;}p={(uintptr_t)val,mode,v};direct(OP_SIGNAL_EVENT,&p,sizeof(p));}
 void mtl_sub_counter(uint64_t addr,uint32_t type){uint64_t p[]={type,addr};direct(OP_REPORT_COUNTER,p,sizeof(p));g_cnt_report[type&31]++;}
 uint64_t mtl_sub_commit(void){if(!g_in_sub)die("NVN commit without begin");xbg_submit((int)g_nhandles,g_handles);uint64_t f=xbg_legacy_last_fence();while(g_direct){direct_record *r=g_direct;g_direct=r->next;xbg_legacy_pool_del(r->data);free(r);}g_in_sub=0;g_nhandles=0;return f;}
