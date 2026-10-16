@@ -630,10 +630,15 @@ namespace wtrack {
 constexpr size_t min_bytes=1u<<20;constexpr unsigned max_regions=8,versions=2;bool enabled=true;
 struct Region{std::atomic<uintptr_t> begin{0},end{0};std::atomic<uint8_t> *dirty=nullptr;};
 Region regions[max_regions];std::atomic<unsigned> nregions{0};struct sigaction previous{};bool installed=false;
-void handler(int sig,siginfo_t *si,void *uc){
-    uintptr_t a=uintptr_t(si->si_addr);unsigned n=nregions.load(std::memory_order_acquire);
+// Re-enable writes to the tracked pages in [a,a+len) and mark them dirty. Signal-safe: atomics and mprotect only.
+bool unprotect(uintptr_t a,size_t len){bool any=false;unsigned n=nregions.load(std::memory_order_acquire);
     for(unsigned i=0;i<n;i++){uintptr_t b=regions[i].begin.load(std::memory_order_relaxed),e=regions[i].end.load(std::memory_order_relaxed);
-        if(a>=b && a<e){size_t pg=(a-b)>>12;if(mprotect(reinterpret_cast<void*>(b+(pg<<12)),4096,PROT_READ|PROT_WRITE)==0){regions[i].dirty[pg].store(1,std::memory_order_release);return;}break;}}
+        uintptr_t lo=std::max(a,b),hi=std::min(a+len,e);if(lo>=hi)continue;size_t p0=(lo-b)>>12,p1=(hi-1-b)>>12;
+        if(mprotect(reinterpret_cast<void*>(b+(p0<<12)),(p1-p0+1)<<12,PROT_READ|PROT_WRITE))continue;
+        for(size_t pg=p0;pg<=p1;pg++)regions[i].dirty[pg].store(1,std::memory_order_release);any=true;}
+    return any;}
+void handler(int sig,siginfo_t *si,void *uc){
+    if(unprotect(uintptr_t(si->si_addr),1))return;
     if(previous.sa_flags&SA_SIGINFO){if(previous.sa_sigaction){previous.sa_sigaction(sig,si,uc);return;}}
     else if(previous.sa_handler!=SIG_DFL && previous.sa_handler!=SIG_IGN && previous.sa_handler){previous.sa_handler(sig);return;}
     signal(sig,SIG_DFL); // return and re-fault into the default crash path
@@ -643,7 +648,8 @@ struct Tracked{uint64_t address=0;size_t bytes=0;uintptr_t pbegin=0;size_t npage
 std::map<std::pair<uint64_t,size_t>,std::unique_ptr<Tracked>> tracked;bool exhausted=false;
 uint64_t copied_bytes=0,dirty_pages=0,mismatches=0,fallbacks=0;
 bool activate(Tracked &t){
-    if(!installed){struct sigaction sa{};sa.sa_sigaction=handler;sa.sa_flags=SA_SIGINFO|SA_ONSTACK|SA_NODEFER;sigemptyset(&sa.sa_mask);if(sigaction(SIGSEGV,&sa,&previous)){enabled=false;return false;}installed=true;}
+    if(!installed){   // a host that routes faults to xbg_wtrack_fault marks this installed (xbg_wtrack_use_host_hooks)
+        struct sigaction sa{};sa.sa_sigaction=handler;sa.sa_flags=SA_SIGINFO|SA_ONSTACK|SA_NODEFER;sigemptyset(&sa.sa_mask);if(sigaction(SIGSEGV,&sa,&previous)){enabled=false;return false;}installed=true;}
     unsigned n=nregions.load();if(n>=max_regions)return false;
     t.pbegin=uintptr_t(t.address)&~uintptr_t(4095);uintptr_t pend=(uintptr_t(t.address)+t.bytes+4095)&~uintptr_t(4095);
     for(unsigned i=0;i<n;i++){uintptr_t b=regions[i].begin.load(),e=regions[i].end.load();if(t.pbegin<e && pend>b)return false;} // overlapping regions unsupported
@@ -689,6 +695,12 @@ bool snapshot(uint64_t address,size_t bytes,Buffer &out){
     pick->last_use=slot_serial;out=Buffer{};out.buffer=pick->buffer;out.memory=pick->memory;out.offset=0;out.size=bytes;out.mapped=pick->mapped;out.coherent=pick->coherent;return true;
 }
 }
+// Host fault hooks for write tracking. A host with one SIGSEGV handler of its own (dm crash.c) calls
+// xbg_wtrack_use_host_hooks() once and routes faults here instead of letting the engine install a handler;
+// xbg_wtrack_prepare is for host writes into guest memory that do not fault (a syscall gets EFAULT).
+extern "C" void xbg_wtrack_use_host_hooks(void){wtrack::installed=true;}
+extern "C" int xbg_wtrack_fault(void *addr){return wtrack::unprotect(uintptr_t(addr),1);}
+extern "C" void xbg_wtrack_prepare(void *addr,size_t len){if(len)wtrack::unprotect(uintptr_t(addr),len);}
 Buffer snapshot(uint64_t address,size_t bytes,VkDeviceSize align=4){CPU_SCOPE(Snapshot);
     auto key=std::make_pair(address,uint64_t(bytes));auto it=snapshots.find(key);
     if(it!=snapshots.end()){++perf.snapshot_hits;return it->second;}
@@ -2407,7 +2419,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     VkPipelineCacheCreateInfo cache{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};std::vector<uint8_t> cache_data=load_pipeline_cache();cache.initialDataSize=cache_data.size();cache.pInitialData=cache_data.empty()?nullptr:cache_data.data();r=vkCreatePipelineCache(cfg.device,&cache,nullptr,&pipeline_cache);if(r!=VK_SUCCESS){vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;if(error&&bytes)snprintf(error,bytes,"vkCreatePipelineCache=%d",r);return r;}
     xbg_module_id_hook=warm::module_id;{std::string lp=warm::list_path();FILE *nw=fopen((lp.substr(0,lp.find_last_of('/'))+"/gfx-no-warm").c_str(),"rb");warm::enabled=!nw;if(nw)fclose(nw);}warm::start();
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
-    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d",int(wtrack::enabled));}
+    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wtrack").c_str(),"rb");if(w){wtrack::enabled=fgetc(w)=='1';fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d (marker gfx-wtrack)",int(wtrack::enabled));}
      /* Android: no guest memory remapping probe. */
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}

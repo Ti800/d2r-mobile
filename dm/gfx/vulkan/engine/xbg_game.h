@@ -42,6 +42,11 @@ int xbg_game_initialize(const xbg_game_config *config,char *error,size_t error_b
 int xbg_game_set_sampler_mirror_clamp_to_edge(VkBool32 enabled);
 /* Resolve a deferred command-buffer SignalEvent on this address before the CPU reads it (nvnEventGetValue). */
 void xbg_game_event_read(const void *addr);
+/* Write-tracked storage snapshots with a host-owned SIGSEGV handler: call use_host_hooks once, then route
+ * faults (returns 1 if the address was a tracked page) and host writes into guest memory here. */
+void xbg_wtrack_use_host_hooks(void);
+int xbg_wtrack_fault(void *addr);
+void xbg_wtrack_prepare(void *addr,size_t len);
 /* Optional one-frame diagnostics, disabled by default. Call after initialize,
  * before nnMain. directory must already exist and be private/writable. Captures
  * the 1-based present frame, at most 16 draw/clear events and 64 MiB total raw
