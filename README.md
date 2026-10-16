@@ -1,3 +1,11 @@
+# XBL Android team development repository
+
+We maintain the Android port here as a development build. **Start with the [Android collaboration guide, measured status, and remaining work](docs/ANDROID_COLLABORATION.md)**, then the [build guide](dm/android/README.md). [xbl-harmony](https://github.com/biglawine/xbl-harmony) is maintained separately; validated changes from both platforms are contributed to [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) through PRs.
+
+The upstream project introduction is preserved below. Its iOS/macOS performance and completion statements do not describe Android acceptance status.
+
+---
+
 # D2R Mobile
 
 **An open-source iOS / macOS compatibility layer for Diablo II: Resurrected with the Reign of the Warlock expansion.** It brings the Nintendo Switch release you bought, expansion included, to iPhone, iPad and Mac in full: the original game code runs natively, every control is rebuilt for touch, the frame rate holds at 60 fps, and you are in a game one second after the main menu. There is now a native macOS version as well (first version): on an Apple silicon Mac it starts on double-click and works with keyboard, mouse and gamepad. Apple TV 4K (3rd generation, A15) has a community port (developer preview) that has reached the character-selection screen only on its author's device; see the device table below.

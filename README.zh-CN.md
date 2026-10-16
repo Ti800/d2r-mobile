@@ -1,3 +1,11 @@
+# XBL Android 团队开发仓库
+
+本仓由我们维护安卓移植，当前仍是开发版本。**先读 [安卓协作入口、实测状态和待办](docs/ANDROID_COLLABORATION.zh-CN.md)**，再读 [构建说明](dm/android/README.zh-CN.md)。鸿蒙由 [xbl-harmony](https://github.com/biglawine/xbl-harmony) 独立维护；两端经验证的改动向 [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) 提 PR。
+
+以下保留上游项目介绍；其中 iOS/macOS 的性能和完成度描述不代表当前安卓验收结果。
+
+---
+
 # D2R Mobile
 
 **开源的《暗黑破坏神 II：狱火重生》术士君临 iOS / macOS 兼容层。** 把你自己购买的 Nintendo Switch 版游戏（含「术士君临」资料片）完整带到 iPhone、iPad 和 Mac 上：原版内核原生执行，整套操作为触屏重做，稳定 60 帧，一秒进局。现在也有原生的 macOS 版（第一版）：Apple 芯片的 Mac 上双击启动，键盘、鼠标、手柄都能用。Apple TV 4K（第三代 A15）有社区移植（开发者预览），只在作者的实机上到过职业选择画面，详见下面的设备表。

@@ -1,3 +1,6 @@
+> 历史检查（2026-10-15）；最新集成和真机结果见 [安卓协作状态](../../../docs/ANDROID_COLLABORATION.zh-CN.md)。
+> Historical check (2026-10-15); see the [current Android status](../../../docs/ANDROID_COLLABORATION.md) for integration and device results.
+
 # 安卓真实 Vulkan 后端候选（2026-10-15）
 
 本轮为可编译/链接的生产路径候选，尚未接入整 App，也未真机出图。不能据此报告游戏 FPS、已运行或画面正确。
@@ -26,7 +29,7 @@ CMake可 `add_subdirectory(../gfx/vulkan ...)` 后将 `dm_vulkan_engine` 链入 
 
 命令（不访问设备/游戏资源）：
 
-`python dm/gfx/vulkan/check_build.py --ndk C:/Users/CIPS/xbl-android/android-sdk/ndk/29.0.14206865 --output C:/Users/CIPS/xbl-android/work/vulkan-validation`
+`python dm/gfx/vulkan/check_build.py --ndk <ANDROID_SDK>/ndk/29.0.14206865 --output <PRIVATE_WORK>/vulkan-validation`
 
 NDK29 clang21 arm64 Android API29：15 engine对象、adapter、present、两个现有格式/解排布依赖均编译成功；使用明确的三项宿主测试替身（log_/die/nvn_new_serial）完成 `--no-undefined` 图形链路共享库链接。完整命令/输出/源码hash在仓外 `work/vulkan-validation/validation.json`，不是整App验证。最后present生命周期修订已单对象重编并重链接。
 
