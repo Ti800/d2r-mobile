@@ -166,6 +166,8 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // Vulkan 适配器先沿用同步提交；上游新增翻译线程需独立验证对象生命周期。
     // Keep synchronous submission until the new upstream translation thread's object lifetimes are verified with Vulkan.
     setenv("DM_NVN_SYNC", "1", 0);
+    // PR14 conservative numeric-only rewrite; gfx-quad-derivatives=0 restores original modules.
+    setenv("DM_GFX_QUAD_DERIVATIVES","1",0);
     if (!getenv("DM_LANG") && *lg) setenv("DM_LANG", lg, 0);   // 首次安装的语言按系统首选（同 iOS CFLocaleCopyPreferredLanguages，见 dm_i18n.c） | first-install language follows the system preference (as iOS CFLocaleCopyPreferredLanguages, see dm_i18n.c)
     if (chdir(g_files)) LOG("【红】chdir %s 失败 errno %d", g_files, errno);
     (*env)->ReleaseStringUTFChars(env, files, f); (*env)->ReleaseStringUTFChars(env, ext, x); (*env)->ReleaseStringUTFChars(env, src, s); (*env)->ReleaseStringUTFChars(env, lang, lg);
