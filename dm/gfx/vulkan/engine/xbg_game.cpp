@@ -390,7 +390,7 @@ int ab_period=0;bool ab_on=true;
 bool ab_frame_on=true;
 bool ab_enabled(){if(ab_period<=0)return true;ab_on=((std::chrono::steady_clock::now().time_since_epoch().count()/1000000000ll/ab_period)&1)==0;return ab_on;}
 struct Slot {
-    VkCommandBuffer cmd{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0; // covers: guest fence value complete once this slot retires
+    VkCommandBuffer cmd{};VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0; // covers: guest fence value complete once this slot retires
     std::vector<VkQueryPool> occlusion_pools,timestamp_pools;uint32_t occlusion_used=0,timestamp_used=0;
     Retire retire;Arena stream,readback;std::vector<VkDescriptorPool> pools;size_t pool_next=0;
     std::map<std::vector<uint64_t>,VkFramebuffer> framebuffers;
@@ -420,7 +420,20 @@ uint64_t write_seq=1,barrier_seq=0; // image writes vs. last full barrier (rende
 // since the last barrier, or a layout change ends the open pass first.
 struct Image;
 void bind_cache_reset();
-struct OpenPass {VkRenderPass pass{};VkFramebuffer framebuffer{};VkCommandBuffer cmd{};std::vector<Image*> images;} open_pass;
+// Attachment images of a pass (8 color + depth): fixed capacity, so building a Pass per draw does not allocate.
+struct ImageList{Image *v[9];uint32_t n=0;void push_back(Image *i){if(n<9)v[n++]=i;}Image **begin(){return v;}Image **end(){return v+n;}Image *const *begin()const{return v;}Image *const *end()const{return v+n;}
+    size_t size()const{return n;}bool empty()const{return !n;}Image *operator[](size_t i)const{return v[i];}};
+struct OpenPass {VkRenderPass pass{};VkFramebuffer framebuffer{};VkCommandBuffer cmd{};ImageList images;} open_pass;
+// Framebuffers of cached render passes, kept across frames (creating and destroying one per pass per frame was ~5% of the
+// render thread on Adreno 730). Each attachment Image lists the keys of the framebuffers that use its views; the first of
+// them to be destroyed (all GPU work that used it is complete by then) takes the framebuffer along. gfx-no-persistent-fb
+// keeps the former per-slot cache.
+std::map<std::vector<uint64_t>,VkFramebuffer> persistent_framebuffers;bool persistent_fb_enabled=true;uint64_t fb_hits=0,fb_creates=0;
+void forget_framebuffers(Image &im,std::vector<VkFramebuffer> *deferred=nullptr);
+// Per-slot command pools reset whole (vkResetCommandPool) instead of resetting the command buffer: the buffer reset was
+// 3.6% of the render thread on Adreno 730. gfx-no-slot-pools keeps the shared pool. Readback arenas in host-cached memory
+// (gfx-readback-cached = '1'): GPU results read back by the CPU (storage writebacks) come from uncached memory otherwise.
+bool slot_pools_enabled=true,readback_cached=false;
 // 显式gfx-pass-profile：每600次呈现采完整一帧的所有slot；整帧上限1024查询/32slot。
 // Opt-in gfx-pass-profile: sample all slots of one frame every 600 presents,
 // bounded to 1024 timestamp queries and 32 slots per selected frame.
@@ -509,10 +522,12 @@ Slot &recording_slot(){
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
         s.stream.trim();s.readback.keep_chunks=1;s.readback.trim();
-        if(!s.cmd){VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};a.commandPool=command_pool;a.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;a.commandBufferCount=1;VK(vkAllocateCommandBuffers(cfg.device,&a,&s.cmd));}
+        if(!s.cmd){if(slot_pools_enabled){VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;VK(vkCreateCommandPool(cfg.device,&cp,nullptr,&s.pool));}
+            VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};a.commandPool=s.pool?s.pool:command_pool;a.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;a.commandBufferCount=1;VK(vkAllocateCommandBuffers(cfg.device,&a,&s.cmd));}
+        s.readback.cached=readback_cached;
         if(!s.fence){VkFenceCreateInfo f{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};VK(vkCreateFence(cfg.device,&f,nullptr,&s.fence));}
         if(!s.timestamps && timestamp_bits){VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=2;VK(vkCreateQueryPool(cfg.device,&q,nullptr,&s.timestamps));}
-        bind_cache_reset();VK(vkResetCommandBuffer(s.cmd,0));VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;VK(vkBeginCommandBuffer(s.cmd,&b));
+        bind_cache_reset();if(s.pool)VK(vkResetCommandPool(cfg.device,s.pool,0));else VK(vkResetCommandBuffer(s.cmd,0));VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;VK(vkBeginCommandBuffer(s.cmd,&b));
         if(s.timestamps){vkCmdResetQueryPool(s.cmd,s.timestamps,0,2);vkCmdWriteTimestamp(s.cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,s.timestamps,0);}
         s.recording=true;s.ops=0;
         const uint64_t frame=stats.presents.load()+1;
@@ -604,7 +619,7 @@ void perf_frame(){
      xbg_logf("%s",line);for(int i=0;i<SITE_COUNT;i++)block_ns[i]=block_calls[i]=submit_by[i]=0;legacy_wait_ns=0;}
     {char line[1024];int at=snprintf(line,sizeof(line),"NVN PERF pass_ends");
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(pass_end_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,pass_end_by[i]/f);
-     at+=snprintf(line+at,sizeof(line)-at," barriers");
+     at+=snprintf(line+at,sizeof(line)-at," fb_hits=%.1f fb_creates=%.2f fb_live=%zu barriers",fb_hits/f,fb_creates/f,persistent_framebuffers.size());fb_hits=fb_creates=0;
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(barrier_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,barrier_by[i]/f);
      xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;}
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
@@ -820,8 +835,8 @@ struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;VkImageCreateInfo create{}; // create: as created (no pNext), for upgrade_mutable
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;
-    std::map<std::array<uint32_t,8>,VkImageView> views;
-    ~Image(){for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
+    std::map<std::array<uint32_t,8>,VkImageView> views;std::vector<std::vector<uint64_t>> fb_keys; // fb_keys: persistent framebuffers using these views
+    ~Image(){forget_framebuffers(*this);for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
     void transition(VkCommandBuffer cmd,VkImageLayout next){
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.oldLayout=layout;b.newLayout=next;b.image=image;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
         b.subresourceRange={aspects,0,levels,0,layers};b.srcAccessMask=layout==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_MEMORY_READ_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1064,6 +1079,11 @@ void append_depth_planes(std::vector<uint8_t> &data,std::vector<VkBufferImageCop
     if(f.stencil_bytes){auto r=region;r.bufferOffset=stencil_begin;r.imageSubresource.aspectMask=VK_IMAGE_ASPECT_STENCIL_BIT;copies.push_back(r);}
 }
 
+void forget_framebuffers(Image &im,std::vector<VkFramebuffer> *deferred){
+    for(auto &k:im.fb_keys){auto f=persistent_framebuffers.find(k);if(f==persistent_framebuffers.end())continue;   // already gone with another image
+        if(deferred)deferred->push_back(f->second);else vkDestroyFramebuffer(cfg.device,f->second,nullptr);persistent_framebuffers.erase(f);}
+    im.fb_keys.clear();
+}
 Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
     need(t && t->serial && t->magic==MAGIC('T','E','X',0),"Invalid NVN texture");
     auto it=images.find(t->serial);
@@ -1583,7 +1603,8 @@ void upgrade_mutable(Image &im){
         vkCmdCopyImage(c.command,im.image,VK_IMAGE_LAYOUT_GENERAL,image,VK_IMAGE_LAYOUT_GENERAL,uint32_t(regions.size()),regions.data());}
     c.finish();
     VkImage old_image=im.image;VkDeviceMemory old_memory=im.memory;std::vector<VkImageView> old_views;for(auto &v:im.views)old_views.push_back(v.second);im.views.clear();
-    retire_handle([old_image,old_memory,old_views]{for(auto v:old_views)vkDestroyImageView(cfg.device,v,nullptr);vkDestroyImage(cfg.device,old_image,nullptr);vkFreeMemory(cfg.device,old_memory,nullptr);});
+    std::vector<VkFramebuffer> old_fbs;forget_framebuffers(im,&old_fbs);
+    retire_handle([old_image,old_memory,old_views,old_fbs]{for(auto f:old_fbs)vkDestroyFramebuffer(cfg.device,f,nullptr);for(auto v:old_views)vkDestroyImageView(cfg.device,v,nullptr);vkDestroyImage(cfg.device,old_image,nullptr);vkFreeMemory(cfg.device,old_memory,nullptr);});
     im.image=image;im.memory=memory;im.create=ci;im.mutable_format=true;im.layout=VK_IMAGE_LAYOUT_GENERAL;
     ++memo_epoch;img_cache.clear();++mutable_upgrades;
     xbg_logf("NVN mutable upgrade serial=%llu fmt=%d %ux%ux%u levels=%u layers=%u copied=%d total=%llu",(unsigned long long)im.source.serial,int(im.fmt),im.width,im.height,im.depth,im.levels,im.layers,int(copied),(unsigned long long)mutable_upgrades);
@@ -1857,7 +1878,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
 // per frame slot (they reference image views of possibly released images).
 struct Pass {
     const PipelineDefinition *definition=nullptr;
-    VkRenderPass pass{};VkFramebuffer framebuffer{};uint32_t width{},height{},color_slots{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;std::vector<Image*> images;
+    VkRenderPass pass{};VkFramebuffer framebuffer{};uint32_t width{},height{},color_slots{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;ImageList images;
 };
 // 保留零值计数用于与旧版本日志比较；任意 guest draw 不再丢弃附件内容。
 // Keep zero counters for baseline logs; arbitrary guest draws retain attachment contents.
@@ -1894,7 +1915,8 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     if(result && soft)return false;
     if(result)xbg_fatalf("NVN framebuffer %s result=%d attachment=%d",xbg_framebuffer_error(result),result,bad==UINT32_MAX?-1:int(bad));
     p.width=plan.width;p.height=plan.height;p.samples=VkSampleCountFlagBits(plan.samples);
-    std::vector<VkAttachmentDescription> descriptions;std::vector<VkImageView> views;std::vector<VkAttachmentReference> colors(state.rt.n,{VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_GENERAL});VkAttachmentReference depth{VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_GENERAL};
+    static std::vector<VkAttachmentDescription> descriptions;descriptions.clear();static std::vector<VkImageView> views;views.clear();   // not re-entrant: graphics thread
+    static std::vector<VkAttachmentReference> colors;colors.assign(size_t(state.rt.n),{VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_GENERAL});VkAttachmentReference depth{VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_GENERAL};
     for(unsigned slot=0;slot<9;slot++)if(targets[slot]){
         Image &im=get_image(targets[slot],false);const view_t *view=selected[slot];
         need((slot==8)==(im.aspects!=VK_IMAGE_ASPECT_COLOR_BIT),"Color/depth attachment role mismatches texture aspects");
@@ -1906,16 +1928,21 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     VkSubpassDependency dep[2]{};dep[0]={VK_SUBPASS_EXTERNAL,0,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,0};dep[1]={0,VK_SUBPASS_EXTERNAL,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT,0};
     VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};rp.attachmentCount=descriptions.size();rp.pAttachments=descriptions.data();rp.subpassCount=1;rp.pSubpasses=&sub;rp.dependencyCount=2;rp.pDependencies=dep;
     {XbgPipelineKey key;bool valid=xbg_renderpass_key(key,rp);
-        if(valid && key.valid){std::vector<uint32_t> words(key.words,key.words+key.count);auto it=render_pass_cache.find(words);
-            if(it==render_pass_cache.end()){RenderPassEntry e;VK(vkCreateRenderPass(cfg.device,&rp,nullptr,&e.pass));e.definition.assign(key,true);it=render_pass_cache.emplace(std::move(words),std::move(e)).first;}
+        if(valid && key.valid){static std::vector<uint32_t> words;words.assign(key.words,key.words+key.count);auto it=render_pass_cache.find(words);
+            if(it==render_pass_cache.end()){RenderPassEntry e;VK(vkCreateRenderPass(cfg.device,&rp,nullptr,&e.pass));e.definition.assign(key,true);it=render_pass_cache.emplace(words,std::move(e)).first;}
             p.pass=it->second.pass;p.definition=&it->second.definition;
         }
         else{VK(vkCreateRenderPass(cfg.device,&rp,nullptr,&p.pass));VkRenderPass rpass=p.pass;retire_handle([rpass]{vkDestroyRenderPass(cfg.device,rpass,nullptr);});static PipelineDefinition invalid;p.definition=&invalid;}
     }
-    Slot &slot=recording_slot();std::vector<uint64_t> fb_key{uint64_t(p.pass),p.width,p.height};for(auto v:views)fb_key.push_back(uint64_t(v));
-    auto cached=slot.framebuffers.find(fb_key);
-    if(cached!=slot.framebuffers.end())p.framebuffer=cached->second;
-    else{VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};fb.renderPass=p.pass;fb.attachmentCount=views.size();fb.pAttachments=views.data();fb.width=p.width;fb.height=p.height;fb.layers=1;VK(vkCreateFramebuffer(cfg.device,&fb,nullptr,&p.framebuffer));slot.framebuffers.emplace(std::move(fb_key),p.framebuffer);}
+    Slot &slot=recording_slot();static std::vector<uint64_t> fb_key;fb_key.assign({uint64_t(p.pass),p.width,p.height});for(auto v:views)fb_key.push_back(uint64_t(v));
+    // Cached render passes live until shutdown, so their framebuffers can outlive the frame; they go with the first of their
+    // images (forget_framebuffers). A pass outside the cache is retired with this slot, and so are its framebuffers.
+    bool persistent=persistent_fb_enabled && p.definition && p.definition->valid;
+    auto &cache=persistent?persistent_framebuffers:slot.framebuffers;
+    auto cached=cache.find(fb_key);
+    if(cached!=cache.end()){p.framebuffer=cached->second;++fb_hits;}
+    else{VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};fb.renderPass=p.pass;fb.attachmentCount=views.size();fb.pAttachments=views.data();fb.width=p.width;fb.height=p.height;fb.layers=1;VK(vkCreateFramebuffer(cfg.device,&fb,nullptr,&p.framebuffer));cache.emplace(fb_key,p.framebuffer);++fb_creates;
+        if(persistent)for(auto *im:p.images)im->fb_keys.push_back(fb_key);}
     return true;
 }
 VkRect2D scissor(const Pass &p){VkRect2D r{};need(xbg_clear_rectangle(p.width,p.height,state.scissor.offset.x,state.scissor.offset.y,state.scissor.extent.width,state.scissor.extent.height,&r)==0,"Invalid scissor extent");return r;}
@@ -2466,7 +2493,7 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
 }
 PerfCounts perf_counts(){return {pipeline_objects.size(),layout_cache.size(),sampler_cache.size(),render_pass_cache.size(),images.size(),host_segments.size(),host_bytes};}
 void destroy_slots(){
-    for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);s=Slot{};}
+    for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);if(s.pool)vkDestroyCommandPool(cfg.device,s.pool,nullptr);s=Slot{};}
     slot_index=0;snapshot_reset();
 }
 } // namespace
@@ -2520,7 +2547,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     VkPipelineCacheCreateInfo cache{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};std::vector<uint8_t> cache_data=load_pipeline_cache();cache.initialDataSize=cache_data.size();cache.pInitialData=cache_data.empty()?nullptr:cache_data.data();r=vkCreatePipelineCache(cfg.device,&cache,nullptr,&pipeline_cache);if(r!=VK_SUCCESS){vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;if(error&&bytes)snprintf(error,bytes,"vkCreatePipelineCache=%d",r);return r;}
     xbg_module_id_hook=warm::module_id;{std::string lp=warm::list_path();FILE *nw=fopen((lp.substr(0,lp.find_last_of('/'))+"/gfx-no-warm").c_str(),"rb");warm::enabled=!nw;if(nw)fclose(nw);}warm::start();
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
-    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wtrack").c_str(),"rb");if(w){wtrack::enabled=fgetc(w)=='1';fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d (marker gfx-wtrack)",int(wtrack::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-images").c_str(),"rb");no_mutable_images=true;if(w){no_mutable_images=fgetc(w)!='1';fclose(w);}xbg_logf("NVN mutable-format images=%d (marker gfx-mutable-images)",int(!no_mutable_images));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-test").c_str(),"rb");mutable_test=0;if(w){if(fscanf(w,"%u",&mutable_test)!=1)mutable_test=0;fclose(w);}if(mutable_test)xbg_logf("NVN mutable upgrade test every %u images (marker gfx-mutable-test)",mutable_test);}
+    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{auto marker=[&](const char *name){FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");int c=-1;if(w){c=fgetc(w);fclose(w);}return c;};persistent_fb_enabled=marker("/gfx-no-persistent-fb")<0;slot_pools_enabled=marker("/gfx-no-slot-pools")<0;readback_cached=marker("/gfx-readback-cached")=='1';xbg_logf("NVN persistent framebuffers=%d slot command pools=%d cached readback=%d (markers gfx-no-persistent-fb, gfx-no-slot-pools, gfx-readback-cached)",int(persistent_fb_enabled),int(slot_pools_enabled),int(readback_cached));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wtrack").c_str(),"rb");if(w){wtrack::enabled=fgetc(w)=='1';fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d (marker gfx-wtrack)",int(wtrack::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-images").c_str(),"rb");no_mutable_images=true;if(w){no_mutable_images=fgetc(w)!='1';fclose(w);}xbg_logf("NVN mutable-format images=%d (marker gfx-mutable-images)",int(!no_mutable_images));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-test").c_str(),"rb");mutable_test=0;if(w){if(fscanf(w,"%u",&mutable_test)!=1)mutable_test=0;fclose(w);}if(mutable_test)xbg_logf("NVN mutable upgrade test every %u images (marker gfx-mutable-test)",mutable_test);}
      /* Android: no guest memory remapping probe. */
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}
@@ -2609,7 +2636,7 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
 static void xbg_legacy_pool_add_now(void *p,size_t n){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&n,"Invalid NVN pool");pools[uintptr_t(p)]=n;cmd_range_lo=0;cmd_range_bytes=0;auto epoch=provenance.pool(uint64_t(p),true);provenance_log("POOL_ADD mem=%p bytes=%zu epoch=%llu",p,n,epoch);}
 static void xbg_legacy_pool_del_now(void *p){std::lock_guard<std::recursive_mutex> lock(mutex);provenance_log("POOL_DEL mem=%p epoch=%llu",p,provenance.epoch(uint64_t(p)));provenance.pool(uint64_t(p),false);pools.erase(uintptr_t(p));cmd_range_lo=0;cmd_range_bytes=0;}
