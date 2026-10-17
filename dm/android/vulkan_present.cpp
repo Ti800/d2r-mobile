@@ -32,8 +32,8 @@ bool surface_properties_changed(){
 }
 std::vector<VkImage> images;VkCommandPool command_pool;VkCommandBuffer command;
 VkSemaphore acquired;std::vector<VkSemaphore> finished;VkFence fence;bool ready=false,swap_dirty=false;std::string shader_path;
-// 可选（标记文件 gfx-present-overlap 为 '1'）：最多两次呈现 blit 在途，不在每帧后清空队列，游戏可在 GPU 收尾本帧时翻译下一帧。
-// Opt-in (marker file gfx-present-overlap = '1'): keep up to two present blits in flight instead of draining the queue
+// 缺省开启（标记文件 gfx-present-overlap 为 '0' 时关）：最多两次呈现 blit 在途，不在每帧后清空队列，游戏可在 GPU 收尾本帧时翻译下一帧。
+// On by default (marker file gfx-present-overlap = '0' turns it off): keep up to two present blits in flight instead of draining the queue
 // after every frame, so the game translates the next frame while the GPU finishes this one. Each in-flight frame has
 // its own pool, acquire semaphore and fence; slot 0 is the original set. Later engine barriers on the source image are
 // ALL_COMMANDS and its release retires with a later submission, which covers this blit in queue order.
@@ -242,7 +242,7 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;cp.queueFamilyIndex=family;if((r=vkCreateCommandPool(device,&cp,nullptr,&command_pool)))return fail("Present command pool",r);
     VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};ca.commandPool=command_pool;ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;if((r=vkAllocateCommandBuffers(device,&ca,&command)))return fail("Present command",r);
     VkSemaphoreCreateInfo sc{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};if((r=vkCreateSemaphore(device,&sc,nullptr,&acquired)))return fail("Acquire semaphore",r);VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};if((r=vkCreateFence(device,&fc,nullptr,&fence)))return fail("Present fence",r);
-    {std::string dir=path;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-overlap").c_str(),"rb");if(m){overlap=fgetc(m)=='1';fclose(m);}
+    {std::string dir=path;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-overlap").c_str(),"rb");overlap=true;if(m){overlap=fgetc(m)!='0';fclose(m);}
      auto open_marker=[&](const char *name){return fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");};
      pin_mask=fastest_cores();if(FILE *p=open_marker("/gfx-pin-cpu")){if(fscanf(p,"%x",&pin_mask)!=1)pin_mask=0;fclose(p);}
      if(FILE *n=open_marker("/gfx-no-pin")){pin_mask=0;fclose(n);}
