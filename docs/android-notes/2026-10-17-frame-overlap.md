@@ -98,6 +98,6 @@ Splitting a frame into more submissions lets the GPU start earlier but costs GPU
 
 ## Next
 
-- **Run P2 outside camp**, including combat, and on the vivo X200 Ultra (Adreno 830). Then decide whether both markers should become the default.
+- **Run P2 outside camp**, including combat, and on the vivo X200 Ultra (Adreno 830). Then decide whether both markers should become the default. *Update 18 Oct:* both are now the Android default ([round 2](2026-10-17-perf-round2.md), finding 19); a marker holding `0` turns either off.
 - **Remaining CPU per frame in P2:** descriptor about 10 ms, draw about 9, snapshot about 7 (about 15,200 per frame), other about 7, pass about 6.
 - **What deferral changes:** an event value now appears up to one frame later. The game can't tell, because a CPU read of a pending event completes it first.
