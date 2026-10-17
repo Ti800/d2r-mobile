@@ -4,6 +4,7 @@
 #include "dm_sect.h"
 #include <dlfcn.h>
 #include <time.h>
+#include <stdatomic.h>
 
 typedef struct { const char *name; void *fn; } hle_ent;
 
