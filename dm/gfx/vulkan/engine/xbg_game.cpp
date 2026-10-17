@@ -729,7 +729,7 @@ void handler(int sig,siginfo_t *si,void *uc){
     signal(sig,SIG_DFL); // return and re-fault into the default crash path
 }
 struct Version{VkBuffer buffer{};VkDeviceMemory memory{};uint8_t *mapped=nullptr;bool coherent=true;uint64_t last_use=0;std::vector<uint8_t> stale;};
-struct Tracked{uint64_t address=0;size_t bytes=0;uintptr_t pbegin=0;size_t npages=0;unsigned region=0;Version v[versions];uint64_t uses=0;};
+struct Tracked{uint64_t address=0;size_t bytes=0;uintptr_t pbegin=0;size_t npages=0;unsigned region=0;Version v[versions];uint64_t uses=0;size_t verify_next=0;};
 std::map<std::pair<uint64_t,size_t>,std::unique_ptr<Tracked>> tracked;bool exhausted=false;
 uint64_t copied_bytes=0,dirty_pages=0,mismatches=0,fallbacks=0;
 bool activate(Tracked &t){
@@ -773,7 +773,10 @@ bool snapshot(uint64_t address,size_t bytes,Buffer &out){
     if(!pick)for(auto &v:t.v)if(v.last_use+2<=slot_serial && (!pick || v.last_use>pick->last_use))pick=&v;
     if(!pick){++fallbacks;return false;}
     for(size_t pg=0;pg<t.npages;pg++)if(pick->stale[pg]){copy_page(t,*pick,pg);pick->stale[pg]=0;}
-    if(++t.uses%240==0){size_t bad=0;for(size_t pg=0;pg<t.npages;pg++){uint64_t lo=std::max<uint64_t>(t.address,t.pbegin+(pg<<12)),hi=std::min<uint64_t>(t.address+t.bytes,t.pbegin+((pg+1)<<12));
+    // Spot check for writes the fault path missed: 16 pages per use, cycling through the range (a full pass of a 19.6 MB
+    // buffer every ~300 uses, about the old rate). Reading the copy back is slow (arena memory on Adreno 730 reads at
+    // ~1.1 GB/s), so the former check of the whole range every 240 uses read 19.6 MB in one frame, ~18 ms at that speed.
+    ++t.uses;{size_t bad=0;for(unsigned k=0;k<16 && k<t.npages;k++){size_t pg=t.verify_next++%t.npages;uint64_t lo=std::max<uint64_t>(t.address,t.pbegin+(pg<<12)),hi=std::min<uint64_t>(t.address+t.bytes,t.pbegin+((pg+1)<<12));
             if(hi>lo && memcmp(pick->mapped+(lo-t.address),reinterpret_cast<const void*>(uintptr_t(lo)),size_t(hi-lo))){++bad;copy_page(t,*pick,pg);}}
         if(bad){mismatches+=bad;xbg_logf("NVN wtrack MISMATCH addr=%#llx pages=%zu (untracked writes; resynced)",(unsigned long long)t.address,bad);}}
     if(!pick->coherent){VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};mr.memory=pick->memory;mr.size=VK_WHOLE_SIZE;VK(vkFlushMappedMemoryRanges(cfg.device,1,&mr));}
