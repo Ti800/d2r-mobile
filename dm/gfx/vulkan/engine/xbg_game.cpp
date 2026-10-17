@@ -142,7 +142,12 @@ thread_local XbgCpuTiming *timing_current=nullptr;
 uint64_t timing_first=0,timing_last=0,timing_start_ns=0;
 xbg_game_stats timing_before{};
 bool timing_active=false;
-bool no_mutable_images=false; // experiment (marker gfx-no-mutable = '1'): create color images without MUTABLE_FORMAT, which on Adreno can keep UBWC
+// Color images are created without MUTABLE_FORMAT, which on Adreno keeps UBWC compression for render targets (Redmi K50 Ultra
+// camp: GPU 42 -> 36 ms, 21.2 -> 23.8 fps). A view in a different format upgrades the image in place (upgrade_mutable), as
+// nvn_mtl.m tex_upgrade_pfv does for Metal's lossless compression. Marker gfx-mutable-images = '1' creates every color
+// image mutable, as before.
+bool no_mutable_images=true;uint64_t mutable_upgrades=0;unsigned mutable_test=0; // mutable_test (marker gfx-mutable-test = N): force the upgrade on every Nth color image when first sampled (test)
+struct Image;void upgrade_mutable(Image &im);
 bool perf_timing=true; // always-on wall-time breakdown for NVN PERF (exclusive deltas)
 XbgCpuTiming::Counter perf_timing_before[XbgCpuTiming::Count];
 bool descriptor_detail=false;
@@ -741,7 +746,7 @@ VkFormat decoded_format(uint32_t pixels) {
 }
 struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;
+    VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;VkImageCreateInfo create{}; // create: as created (no pNext), for upgrade_mutable
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;
     std::map<std::array<uint32_t,8>,VkImageView> views;
     ~Image(){for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
@@ -767,7 +772,9 @@ struct Image {
         need(base<levels && n && n<=levels-base && layer<layers && ls && ls<=layers-layer,"Invalid texture view range");
         if(attachment){need(ls==1,"Layered rendering not implemented");n=1;}
         VkFormat vf=view_format(v);
-        if(vf!=fmt){static std::set<std::pair<int,int>> seen;if(seen.insert({int(fmt),int(vf)}).second)xbg_logf("NVN viewfmt image=%d view=%d nvn=%#x->%#x attachment=%d storage=%d mutable=%d%s",int(fmt),int(vf),source.d.format,v?v->format:0,int(attachment),int(storage),int(mutable_format),mutable_format?"":" 【红】view format differs on an image created without MUTABLE_FORMAT (gfx-no-mutable)");}
+        if(vf!=fmt){static std::set<std::pair<int,int>> seen;if(seen.insert({int(fmt),int(vf)}).second)xbg_logf("NVN viewfmt image=%d view=%d nvn=%#x->%#x attachment=%d storage=%d mutable=%d",int(fmt),int(vf),source.d.format,v?v->format:0,int(attachment),int(storage),int(mutable_format));
+            if(!mutable_format)upgrade_mutable(*this);}
+        else if(mutable_test && !mutable_format && !attachment && !storage && aspects==VK_IMAGE_ASPECT_COLOR_BIT && source.serial%mutable_test==0)upgrade_mutable(*this);
         int target=v&&v->set_target?v->target:source.d.target;
         VkImageViewType type=target==2?VK_IMAGE_VIEW_TYPE_3D:target==0?VK_IMAGE_VIEW_TYPE_1D:target==3?VK_IMAGE_VIEW_TYPE_1D_ARRAY:target==4||target==6?VK_IMAGE_VIEW_TYPE_2D_ARRAY:VK_IMAGE_VIEW_TYPE_2D;
         need(!attachment || source.d.target!=2,"Rendering directly to volume slices requires 2D compatible views");
@@ -1010,7 +1017,7 @@ Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
         p->usage=usage;if(p->aspects==VK_IMAGE_ASPECT_COLOR_BIT && !no_mutable_images)ci.flags|=VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;p->mutable_format=(ci.flags&VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)!=0;
         if(t->d.target==8 || t->d.target==9)ci.flags|=VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
         VkImageFormatProperties supported;VK(vkGetPhysicalDeviceImageFormatProperties(cfg.physical,ci.format,ci.imageType,ci.tiling,ci.usage,ci.flags,&supported));need(supported.sampleCounts&p->samples,"Texture sample count unsupported for actual format/usage");need(p->samples==VK_SAMPLE_COUNT_1_BIT || p->levels==1,"Multisample textures cannot have mipmaps");
-        VK(vkCreateImage(cfg.device,&ci,nullptr,&p->image));VkMemoryRequirements r;vkGetImageMemoryRequirements(cfg.device,p->image,&r);
+        VK(vkCreateImage(cfg.device,&ci,nullptr,&p->image));p->create=ci;VkMemoryRequirements r;vkGetImageMemoryRequirements(cfg.device,p->image,&r);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=r.size;ai.memoryTypeIndex=memory_type(r.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);VK(vkAllocateMemory(cfg.device,&ai,nullptr,&p->memory));VK(vkBindImageMemory(cfg.device,p->image,p->memory,0));
         it=images.emplace(t->serial,std::move(p)).first;image_index_dirty=true;++memo_bump[4];provenance_image("CREATE",t,*it->second);
     }
@@ -1483,6 +1490,29 @@ struct ImgKey{uint64_t h,sh,tp,to,sp,so,kind;bool operator==(const ImgKey &o)con
 struct ImgKeyHash{size_t operator()(const ImgKey &k)const{uint64_t x=k.h*0x9E3779B97F4A7C15ull^k.sh*0xC2B2AE3D27D4EB4Full^k.tp^(k.to<<17)^(k.sp<<7)^k.so^(k.kind<<40);x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
 struct ImgEntry{const tex_t *tex;Image *im;VkImageView view;VkSampler sampler;const RegisteredTexture *record;uint64_t revision;};
 std::unordered_map<ImgKey,ImgEntry,ImgKeyHash> img_cache;bool img_cache_enabled=true;uint64_t img_cache_hits=0,img_cache_misses=0;
+// Recreate an image created without MUTABLE_FORMAT with it, copy every level and layer, and retire the old image and its
+// views (queue order keeps earlier recorded uses on the old one). Cached descriptor sets and the image cache hold the old
+// views: memo_epoch and img_cache drop them. Field counts on Metal: 0 of 17473 textures needed this (nvn_mtl.m).
+void upgrade_mutable(Image &im){
+    VkImageCreateInfo ci=im.create;ci.flags|=VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    VkImage image{};VK(vkCreateImage(cfg.device,&ci,nullptr,&image));VkMemoryRequirements r;vkGetImageMemoryRequirements(cfg.device,image,&r);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=r.size;ai.memoryTypeIndex=memory_type(r.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkDeviceMemory memory{};VK(vkAllocateMemory(cfg.device,&ai,nullptr,&memory));VK(vkBindImageMemory(cfg.device,image,memory,0));
+    Commands c;   // non-draw: ends an open pass, full barriers before and after
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;b.newLayout=VK_IMAGE_LAYOUT_GENERAL;b.image=image;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+    b.subresourceRange={im.aspects,0,im.levels,0,im.layers};b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);
+    bool copied=im.layout!=VK_IMAGE_LAYOUT_UNDEFINED;   // nothing defined to copy yet
+    if(copied){im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);std::vector<VkImageCopy> regions;
+        for(uint32_t l=0;l<im.levels;l++){VkImageCopy rc{};rc.srcSubresource={im.aspects,l,0,im.layers};rc.dstSubresource=rc.srcSubresource;rc.extent={std::max(1u,im.width>>l),std::max(1u,im.height>>l),std::max(1u,im.depth>>l)};regions.push_back(rc);}
+        vkCmdCopyImage(c.command,im.image,VK_IMAGE_LAYOUT_GENERAL,image,VK_IMAGE_LAYOUT_GENERAL,uint32_t(regions.size()),regions.data());}
+    c.finish();
+    VkImage old_image=im.image;VkDeviceMemory old_memory=im.memory;std::vector<VkImageView> old_views;for(auto &v:im.views)old_views.push_back(v.second);im.views.clear();
+    retire_handle([old_image,old_memory,old_views]{for(auto v:old_views)vkDestroyImageView(cfg.device,v,nullptr);vkDestroyImage(cfg.device,old_image,nullptr);vkFreeMemory(cfg.device,old_memory,nullptr);});
+    im.image=image;im.memory=memory;im.create=ci;im.mutable_format=true;im.layout=VK_IMAGE_LAYOUT_GENERAL;
+    ++memo_epoch;img_cache.clear();++mutable_upgrades;
+    xbg_logf("NVN mutable upgrade serial=%llu fmt=%d %ux%ux%u levels=%u layers=%u copied=%d total=%llu",(unsigned long long)im.source.serial,int(im.fmt),im.width,im.height,im.depth,im.levels,im.layers,int(copied),(unsigned long long)mutable_upgrades);
+}
 struct DescMemo{const LayoutEntry *entry;VkDescriptorSet set;VkPipelineLayout pipeline_layout;std::vector<uint32_t> dynamic_offsets;std::vector<MemoImage> images;struct Dyn{uint64_t order;VkBuffer buffer;uint32_t offset;bool uniform;uint8_t src=0,ns=0,bank=0;};std::vector<Dyn> dyn;bool persistent=false;std::vector<std::pair<uint64_t,const void*>> tex_ids;struct Stor{uint64_t base,bytes;VkBuffer buffer;VkDeviceSize offset;};std::vector<Stor> stor;};
 struct DynUbo{uint64_t order,address;size_t copy;};
 // Cross-frame memo (Claude C147): the memo lives per frame slot and survives submits. An entry is persistent when its set
@@ -2408,7 +2438,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     VkPipelineCacheCreateInfo cache{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};std::vector<uint8_t> cache_data=load_pipeline_cache();cache.initialDataSize=cache_data.size();cache.pInitialData=cache_data.empty()?nullptr:cache_data.data();r=vkCreatePipelineCache(cfg.device,&cache,nullptr,&pipeline_cache);if(r!=VK_SUCCESS){vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;if(error&&bytes)snprintf(error,bytes,"vkCreatePipelineCache=%d",r);return r;}
     xbg_module_id_hook=warm::module_id;{std::string lp=warm::list_path();FILE *nw=fopen((lp.substr(0,lp.find_last_of('/'))+"/gfx-no-warm").c_str(),"rb");warm::enabled=!nw;if(nw)fclose(nw);}warm::start();
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
-    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d",int(wtrack::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-mutable").c_str(),"rb");no_mutable_images=false;if(w){no_mutable_images=fgetc(w)=='1';fclose(w);}xbg_logf("NVN mutable-format images=%d (marker gfx-no-mutable)",int(!no_mutable_images));}
+    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d",int(wtrack::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-images").c_str(),"rb");no_mutable_images=true;if(w){no_mutable_images=fgetc(w)!='1';fclose(w);}xbg_logf("NVN mutable-format images=%d (marker gfx-mutable-images)",int(!no_mutable_images));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-test").c_str(),"rb");mutable_test=0;if(w){if(fscanf(w,"%u",&mutable_test)!=1)mutable_test=0;fclose(w);}if(mutable_test)xbg_logf("NVN mutable upgrade test every %u images (marker gfx-mutable-test)",mutable_test);}
      /* Android: no guest memory remapping probe. */
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}
