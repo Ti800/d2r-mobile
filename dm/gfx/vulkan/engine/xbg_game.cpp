@@ -410,6 +410,8 @@ void forget_framebuffers(Image &im,std::vector<VkFramebuffer> *deferred=nullptr)
 // 3.6% of the render thread on Adreno 730. gfx-no-slot-pools keeps the shared pool. Readback arenas in host-cached memory
 // (gfx-readback-cached = '1'): GPU results read back by the CPU (storage writebacks) come from uncached memory otherwise.
 bool slot_pools_enabled=true,readback_cached=false;
+// Diagnostic (NVN PERF texel): distinct uniform texel ranges per frame and how many the previous frame also used.
+std::unordered_set<uint64_t> texel_frame_keys,texel_prev_keys;uint64_t texel_binds=0,texel_distinct=0,texel_reused=0;
 // 显式gfx-pass-profile：每600次呈现采完整一帧的所有slot；整帧上限1024查询/32slot。
 // Opt-in gfx-pass-profile: sample all slots of one frame every 600 presents,
 // bounded to 1024 timestamp queries and 32 slots per selected frame.
@@ -563,6 +565,7 @@ void save_pipeline_cache(){
     warm::flush();xbg_logf("NVN pipeline cache save bytes=%zu new=%zu ok=%d",n,pipelines_unsaved,int(ok));if(ok)pipelines_unsaved=0;
 }
 void perf_frame(){
+    {texel_distinct+=texel_frame_keys.size();for(auto k:texel_frame_keys)if(texel_prev_keys.count(k))++texel_reused;texel_prev_keys.swap(texel_frame_keys);texel_frame_keys.clear();}
     if(perf_frame_timed)++perf_timed_frames;perf_frame_timed=perf_sample && stats.presents.load()%perf_sample==0;   // the next frame
     {bool was=ab_frame_on;ab_frame_on=ab_enabled();if(was!=ab_frame_on && ab_period>0){perf=Perf{};perf.window_start=timing_clock();set_cache_hits=set_cache_misses=0;return;}}
     if(pipelines_unsaved && stats.presents.load()>=pipeline_save_frame+300){pipeline_save_frame=stats.presents.load();save_pipeline_cache();}
@@ -595,7 +598,7 @@ void perf_frame(){
      xbg_logf("%s",line);for(int i=0;i<SITE_COUNT;i++)block_ns[i]=block_calls[i]=submit_by[i]=0;legacy_wait_ns=0;}
     {char line[1024];int at=snprintf(line,sizeof(line),"NVN PERF pass_ends");
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(pass_end_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,pass_end_by[i]/f);
-     at+=snprintf(line+at,sizeof(line)-at," fb_hits=%.1f fb_creates=%.2f fb_live=%zu barriers",fb_hits/f,fb_creates/f,persistent_framebuffers.size());fb_hits=fb_creates=0;
+     at+=snprintf(line+at,sizeof(line)-at," fb_hits=%.1f fb_creates=%.2f fb_live=%zu texel_binds=%.1f distinct=%.1f reused=%.1f barriers",fb_hits/f,fb_creates/f,persistent_framebuffers.size(),texel_binds/f,texel_distinct/f,texel_reused/f);fb_hits=fb_creates=0;texel_binds=texel_distinct=texel_reused=0;
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(barrier_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,barrier_by[i]/f);
      xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;}
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
@@ -1764,7 +1767,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                 if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){need(texture.d.target==10 && texture.mem && texture.L.size,"Invalid buffer texture");
                     Buffer *buf=nullptr;uint64_t base=uint64_t(texture.mem),bytes=texture.L.size;
                     if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){Buffer view;if(pending_view(base,bytes,1,view)){buf=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_open_pass();VkBufferCopy region{view.offset,buf->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,buf->buffer,1,&region);full_barrier(cmd);}else{cpu_access(base,bytes,8);buf=out.keep(readback_buffer(bytes,texture.mem,bytes));}out.storage.push_back({{base,bytes},buf});out.written.push_back({{base,bytes},buf});}
-                    else{snap_site=4;buf=out.keep(snapshot(base,bytes,properties.limits.minTexelBufferOffsetAlignment));snap_site=0;}
+                    else{snap_site=4;buf=out.keep(snapshot(base,bytes,properties.limits.minTexelBufferOffsetAlignment));snap_site=0;texel_frame_keys.insert((base<<12)^bytes);++texel_binds;}
                     VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=buf->buffer;v.offset=buf->offset;v.format=format(texture.d.format);v.range=bytes;VkBufferView bv;{auto &cache=recording_slot().texel_views;std::array<uint64_t,4> key{uint64_t(v.buffer),v.offset,v.range,uint64_t(v.format)};auto f=cache.find(key);if(f!=cache.end())bv=f->second;else{VK(vkCreateBufferView(cfg.device,&v,nullptr,&bv));cache.emplace(key,bv);}}texel_views.push_back(bv);write.pTexelBufferView=&texel_views.back();}
                 else{if(aspect(texture.d.format)!=VK_IMAGE_ASPECT_COLOR_BIT){auto prior=images.find(texture.serial);if(prior==images.end() || (!prior->second->uploaded && !prior->second->gpu_written))xbg_logf("NVN initial depth descriptor shader=%s stage=%u slot=%u id=%d serial=%llu format=%#x",shader.key.c_str(),ns,slot,id,(unsigned long long)texture.serial,texture.d.format);}
                     VkDescriptorImageInfo ii{};
