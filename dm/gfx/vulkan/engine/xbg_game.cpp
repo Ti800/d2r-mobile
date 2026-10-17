@@ -49,6 +49,9 @@ extern "C" {
 #include <condition_variable>
 #include <set>
 
+// Flags of the NVN memory pool that holds a guest range (dm/gfx/nvn/hle_nvn.c), or -1. Weak: hosts without it keep every
+// storage writeback.
+extern "C" __attribute__((weak)) int nvn_pool_flags(const void *addr,size_t len);
 namespace {
 xbg_game_config cfg{};
 std::recursive_mutex mutex;
@@ -371,6 +374,16 @@ std::vector<PendingEvent> pending_events,recording_events;   // 模式2当前槽
 int defer_events=0;uint64_t events_deferred=0,event_reads=0;
 struct PendingWriteback {uint64_t addr,bytes;Buffer buffer;const void *slot;};
 std::vector<PendingWriteback> pending_writebacks;
+// Storage writebacks superseded by a newer GPU result (gfx-wb-skip). In the D2R camp five compute outputs, 1.37 MB a frame
+// (1.25 MB of it a buffer that changes by a few KB), were written back at every retire although nothing read them from guest
+// memory: the next frame's dispatches and draws take them from the pending GPU copy (pending_view), and by the time a slot
+// retires the next frame has recorded a newer writeback of the same ranges. Reading them back took ~1 ms a frame on Adreno
+// 730, whose host-visible memory reads at 1.3 GB/s. A writeback is dropped when a newer pending writeback covers its range,
+// the range lies in a pool the game's CPU never reads (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) and no image aliases it (image
+// uploads read guest memory directly). Engine reads still get the newest result: the newer pending writeback until its slot
+// retires, guest memory after. Off unless the host asks (DM_GFX_WB_SKIP, which the Android app sets to 1); marker
+// gfx-wb-skip = 1 / 0; A/B target wbskip.
+bool wb_skip=false;uint64_t wb_skipped=0,wb_skipped_bytes=0;
 void cpu_access(uint64_t address,uint64_t bytes,unsigned why=0);   // resolve pending GPU results overlapping a CPU access
 void resolve_pending();
 void resolve_slot_writebacks(const void *slot);
@@ -690,6 +703,7 @@ void perf_frame(){
     xbg_logf("NVN PERF early_submit enabled=%d submits_per_frame=%.2f blocked_writeback_per_frame=%.2f",int(early_submit_enabled),early_submit_window/f,early_blocked_window/f);
     early_submit_window=early_blocked_window=0;refresh_early_submit();
     occlusion_queries_started=0;refresh_occlusion_batch(); // 仅窗口边界读取诊断开关 / Read the A/B marker only at window boundaries.
+    if(wb_skip){xbg_logf("NVN PERF wbskip ab=%d skipped=%.1f (%.2fMB)",int(ab_frame_on),wb_skipped/f,wb_skipped_bytes/1048576.0/f);wb_skipped=wb_skipped_bytes=0;}
     perf=Perf{};perf.window_start=now;perf_timed_frames=0;
 }
 void occlusion_query(VkQueryPool &pool,uint32_t &index){
@@ -1100,11 +1114,22 @@ void invalidate_cpu_range(uint64_t address,uint64_t bytes){CPU_SCOPE(CpuWrite);
 }
 
 bool resolving_pending=false;
+// gfx-wb-skip (see wb_skip): a later pending writeback covers this one's range, which only the GPU reads.
+bool writeback_superseded(size_t i){
+    if(!wb_skip || !nvn_pool_flags || ab_off("wbskip"))return false;
+    const PendingWriteback &w=pending_writebacks[i];bool newer=false;
+    for(size_t k=i+1;k<pending_writebacks.size() && !newer;k++){const PendingWriteback &n=pending_writebacks[k];newer=n.addr<=w.addr && n.addr+n.bytes>=w.addr+w.bytes;}
+    if(!newer)return false;
+    int flags=nvn_pool_flags(reinterpret_cast<const void*>(uintptr_t(w.addr)),size_t(w.bytes));if(flags<0 || !(flags&NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS))return false;
+    bool image=false;for_images_overlapping(w.addr,w.bytes,[&](Image &){image=true;});return !image;
+}
 // Writebacks of a slot whose fence has signalled can be applied without waiting.
 void resolve_slot_writebacks(const void *slot){
     if(pending_writebacks.empty())return;resolving_pending=true;
     std::vector<PendingWriteback> keep;
-    for(auto &w:pending_writebacks){if(w.slot!=slot){keep.push_back(w);continue;}writeback_bytes+=w.bytes;w.buffer.invalidate();invalidate_cpu_range(w.addr,w.bytes);memcpy(reinterpret_cast<void*>(w.addr),w.buffer.mapped,w.bytes);}
+    for(size_t i=0;i<pending_writebacks.size();i++){auto &w=pending_writebacks[i];if(w.slot!=slot){keep.push_back(w);continue;}
+        if(writeback_superseded(i)){++wb_skipped;wb_skipped_bytes+=w.bytes;continue;}
+        writeback_bytes+=w.bytes;w.buffer.invalidate();invalidate_cpu_range(w.addr,w.bytes);memcpy(reinterpret_cast<void*>(w.addr),w.buffer.mapped,w.bytes);}
     pending_writebacks.swap(keep);resolving_pending=false;
 }
 void write_report(const PendingReport &r){
@@ -2853,6 +2878,8 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wtrack").c_str(),"rb");if(w){wtrack::enabled=fgetc(w)=='1';fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d",int(wtrack::enabled));{auto marker=[&](const char *name){FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");int c=-1;if(w){c=fgetc(w);fclose(w);}return c;};persistent_fb_enabled=marker("/gfx-no-persistent-fb")<0;slot_pools_enabled=marker("/gfx-no-slot-pools")<0;readback_cached=marker("/gfx-readback-cached")=='1';texel_memo_enabled=marker("/gfx-texel-memo")=='1';no_mutable_images=marker("/gfx-mutable-images")!='1';{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-test").c_str(),"rb");mutable_test=0;if(w){if(fscanf(w,"%u",&mutable_test)!=1)mutable_test=0;fclose(w);}}xbg_logf("NVN persistent framebuffers=%d slot command pools=%d cached readback=%d",int(persistent_fb_enabled),int(slot_pools_enabled),int(readback_cached));}}
      /* Android: no guest memory remapping probe. */
+     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wb-skip").c_str(),"rb");wb_skip=false;if(m){wb_skip=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_WB_SKIP"))wb_skip=atoi(e)!=0;
+      xbg_logf("NVN superseded storage writebacks skipped=%d pool_flags=%d (marker gfx-wb-skip)",int(wb_skip),int(nvn_pool_flags!=nullptr));}
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}
       format_feature_flags2=properties.apiVersion>=VK_API_VERSION_1_3;for(auto &e:ext)if(!strcmp(e.extensionName,VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME))format_feature_flags2=true;
