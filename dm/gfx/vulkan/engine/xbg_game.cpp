@@ -413,9 +413,12 @@ bool slot_pools_enabled=true,readback_cached=false;
 // Resident uniform texel copies (texel_acquire, before descriptors()).
 struct TexelKey{uint64_t base,bytes;uint32_t format;bool operator==(const TexelKey &o)const{return base==o.base&&bytes==o.bytes&&format==o.format;}};
 struct TexelKeyHash{size_t operator()(const TexelKey &k)const{uint64_t x=k.base*0x9E3779B97F4A7C15ull^k.bytes*0xC2B2AE3D27D4EB4Full^k.format;x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
-struct TexelResident{Buffer buffer;VkBufferView view{};uint64_t hash=0,used=0,gen=0;};
+struct TexelResident{Buffer buffer;VkBufferView view{};uint64_t hash=0,used=0,gen=0,checked=0,check_epoch=0;};   // checked: verified in this submission
 std::unordered_map<TexelKey,TexelResident,TexelKeyHash> texel_resident[2];Arena texel_arena[2];uint64_t texel_hole_bytes[2]={};
 bool texel_memo_enabled=false;uint64_t texel_gen=0,texel_refreshes=0,texel_fallbacks=0,texel_evictions=0,texel_hits=0;
+// A copy verified earlier in this submission stays valid until an in-stream CPU write overlaps it (snapshot_invalidate
+// bumps texel_write_epoch), so a ~1 MB range bound by 558 draws is hashed once per frame, not per draw.
+uint64_t texel_write_epoch=1,texel_lo=UINT64_MAX,texel_hi=0;void texel_touch(uint64_t address,uint64_t bytes);
 void texel_evict(unsigned si,bool all);
 // Diagnostic (NVN PERF texel): distinct uniform texel ranges per frame and how many the previous frame also used.
 std::unordered_set<uint64_t> texel_frame_keys,texel_prev_keys;uint64_t texel_binds=0,texel_distinct=0,texel_reused=0;
@@ -643,8 +646,9 @@ Buffer readback_buffer(size_t n,const void *data=nullptr,size_t copy=0){
 std::map<std::pair<uint64_t,uint64_t>,Buffer> snapshots,uniform_snapshots;
 uint64_t snapshot_maxlen=0;
 void desc_memo_reset();
-void snapshot_reset(){snapshots.clear();uniform_snapshots.clear();snapshot_maxlen=0;desc_memo_reset();}
+void snapshot_reset(){snapshots.clear();uniform_snapshots.clear();snapshot_maxlen=0;desc_memo_reset();++texel_write_epoch;}   // the guest may write memory between submissions: texel copies are re-verified
 void snapshot_invalidate(uint64_t address,uint64_t bytes){
+    if(address<texel_hi && address+bytes>texel_lo)texel_touch(address,bytes);
     uint64_t lo=address>snapshot_maxlen?address-snapshot_maxlen:0;
     for(auto *m:{&snapshots,&uniform_snapshots})for(auto it=m->lower_bound({lo,0});it!=m->end() && it->first.first<address+bytes;){uint64_t b=it->first.first,e=b+it->first.second;if(address<e && address+bytes>b)it=m->erase(it);else ++it;}
 }
@@ -1609,19 +1613,25 @@ Buffer &driver_block(unsigned ns,unsigned bank){uint64_t gen=bank?tex_gen[ns]:bu
 // recreated copy is never mistaken for the one its set holds. Opt-in: gfx-texel-memo = '1'.
 TexelResident *texel_acquire(uint64_t base,uint64_t bytes,VkFormat fmt){
     unsigned si=slot_index;auto &map=texel_resident[si];TexelKey key{base,bytes,uint32_t(fmt)};
+    auto it=map.find(key);
+    if(it!=map.end() && it->second.checked==slot_serial && it->second.check_epoch==texel_write_epoch){it->second.used=slot_serial;return &it->second;}
     cpu_access(base,bytes,8);   // pending GPU results land in guest memory first, as for snapshot()
     uint64_t h=hash_memory(reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));
-    auto it=map.find(key);
     if(it==map.end()){
         if(map.size()>=8192){++texel_fallbacks;return nullptr;}
         TexelResident r;r.buffer=texel_arena[si].alloc(size_t(bytes));
         VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=r.buffer.buffer;v.offset=r.buffer.offset;v.format=fmt;v.range=bytes;VK(vkCreateBufferView(cfg.device,&v,nullptr,&r.view));
         memcpy(r.buffer.mapped,reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));r.buffer.flush();r.hash=h;r.used=slot_serial;r.gen=++texel_gen;++texel_refreshes;
+        r.checked=slot_serial;r.check_epoch=texel_write_epoch;texel_lo=std::min(texel_lo,base);texel_hi=std::max(texel_hi,base+bytes);
         return &map.emplace(key,r).first->second;}
     TexelResident &r=it->second;
     if(r.hash!=h){if(r.used==slot_serial){++texel_fallbacks;return nullptr;}   // this frame already reads the earlier content
         memcpy(r.buffer.mapped,reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));r.buffer.flush();r.hash=h;++texel_refreshes;}
-    r.used=slot_serial;return &r;
+    r.used=slot_serial;r.checked=slot_serial;r.check_epoch=texel_write_epoch;return &r;
+}
+void texel_touch(uint64_t address,uint64_t bytes){
+    auto &map=texel_resident[slot_index];if(map.size()>64){++texel_write_epoch;return;}   // many copies: invalidate coarsely
+    for(auto &e:map)if(address<e.first.base+e.first.bytes && address+bytes>e.first.base){++texel_write_epoch;return;}
 }
 // While a slot starts recording (its previous submission retired): drop copies unused for ~128 submissions; when the holes they
 // leave in the slot's arena pass 8 MB, start the slot's store over (memo entries then fail their generation check).
