@@ -6,8 +6,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 
+static _Atomic unsigned long long dm_mach_abs_calls;   // 诊断：调用次数 | diagnostic: call count
+unsigned long long dm_mach_abs_take(void) { return atomic_exchange(&dm_mach_abs_calls, 0); }
 uint64_t mach_absolute_time(void) {
+    atomic_fetch_add_explicit(&dm_mach_abs_calls, 1, memory_order_relaxed);
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 // 本线程累计 {指令数, 周期数}：苹果 libSystem 私有接口。安卓应用进程不许用硬件性能计数器（perf_event_paranoid），如实返回不可用、读数 0
