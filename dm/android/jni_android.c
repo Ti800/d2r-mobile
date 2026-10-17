@@ -152,6 +152,10 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     int n = link_romfs(romfs);
     LOG("boot: 资源链接 %d 个文件", n);
     setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
+    // 被更新的 GPU 结果覆盖、又只有 GPU 读的存储写回不做（引擎的 gfx-wb-skip；标记文件仍优先）：营地每帧省 1.37 MB、约 1 ms 的回读。
+    // Storage writebacks that a newer GPU result supersedes and only the GPU reads are dropped (the engine's gfx-wb-skip; a
+    // marker file still wins): 1.37 MB and about 1 ms of readback per camp frame.
+    setenv("DM_GFX_WB_SKIP", "1", 0);
     // Vulkan 适配器先沿用同步提交；上游新增翻译线程需独立验证对象生命周期。
     // Keep synchronous submission until the new upstream translation thread's object lifetimes are verified with Vulkan.
     setenv("DM_NVN_SYNC", "1", 0);
