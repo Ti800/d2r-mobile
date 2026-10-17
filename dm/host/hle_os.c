@@ -42,9 +42,7 @@ void *objmap_del(const void *k) {
 uint64_t now_ns(void) {
     static mach_timebase_info_data_t tb;
     if (!tb.denom) mach_timebase_info(&tb);
-    uint64_t t = mach_absolute_time() * tb.numer / tb.denom;
-    { static _Atomic uint64_t n, t0; if (!((atomic_fetch_add_explicit(&n, 1, memory_order_relaxed) + 1) & ((1u << 20) - 1))) { uint64_t was = atomic_exchange(&t0, t); if (was) LOG("[perf] now_ns %.0f 次/秒 | calls per second", (double)(1u << 20) * 1e9 / (double)(t - was)); } }   // 诊断 | diagnostic
-    return t;
+    return mach_absolute_time() * tb.numer / tb.denom;
 }
 // 客体时钟：客体能读到的系统计数器（mrs cntpct 门、svc GetSystemTick）都经这里。缺省 = now_ns()。
 // 冻结（只供测试驱动 DM_TICK_HOLD 用）：冻结期间客体时钟不走 ⇒ 游戏不会到期下一拍；解冻后扣掉冻结时长，客体时钟连续不跳

@@ -4,7 +4,6 @@
 #include "dm_sect.h"
 #include <dlfcn.h>
 #include <time.h>
-#include <stdatomic.h>
 
 typedef struct { const char *name; void *fn; } hle_ent;
 
@@ -86,8 +85,6 @@ uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs) {
         const gate_t *g = &g_gate[i];
         if (g->ret == ret_addr) switch (g->kind) {
             case G_CNTPCT: case G_CNTVCT: {
-                { static _Atomic uint64_t n, t0; uint64_t k = atomic_fetch_add(&n, 1) + 1;   // 诊断：客体每秒读计数器几次 | diagnostic: guest counter reads per second
-                  if (!(k & ((1u << 20) - 1))) { uint64_t now = now_ns(), was = atomic_exchange(&t0, now); if (was) LOG("[perf] 客体读计数器 %.0f 次/秒 | guest counter reads per second", (double)(1u << 20) * 1e9 / (double)(now - was)); } }
                 uint64_t t = guest_ns() * 12 / 625;    // 19.2 MHz 系统计数器；原指令 mrs xN, cntpct_el0，arg = N | 19.2 MHz system counter; original instruction mrs xN, cntpct_el0, arg = N
                 regs[g->arg] = t;
                 return t;
