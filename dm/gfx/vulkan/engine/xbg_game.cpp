@@ -1,6 +1,5 @@
 #include <pthread.h>
 #include "xbg_game_internal.h"
-extern "C" __attribute__((weak)) unsigned long long dm_mach_abs_take(void);   // Android compat diagnostic (mach_absolute_time calls)
 #include "xbg_cpu_timing.h"
 #include "xbg_descriptor_timing.h"
 #include "xbg_draw_timing.h"
@@ -161,8 +160,7 @@ void provenance_draw(){
     provenance_log("DRAW ordinal=%u frame=%llu submit=%llu",provenance.draws,(unsigned long long)provenance.target,(unsigned long long)stats.submissions.load());
 }
 
-std::atomic<uint64_t> timing_clock_calls{0};   // diagnostic
-uint64_t timing_clock(){timing_clock_calls.fetch_add(1,std::memory_order_relaxed);return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
+uint64_t timing_clock(){return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
 XbgCpuTiming timing(timing_clock);
 thread_local XbgCpuTiming *timing_current=nullptr;
 uint64_t timing_first=0,timing_last=0,timing_start_ns=0;
@@ -175,10 +173,11 @@ bool timing_active=false;
 bool no_mutable_images=true;uint64_t mutable_upgrades=0;unsigned mutable_test=0; // mutable_test (marker gfx-mutable-test = N): force the upgrade on every Nth color image when first sampled (test)
 struct Image;void upgrade_mutable(Image &im);
 bool perf_timing=true; // always-on wall-time breakdown for NVN PERF (exclusive deltas)
-// Every scope reads the clock twice (~95k reads per D2R camp frame; ~105 ns each through the vDSO on Adreno 730
-// phones, ~19% of the render thread). Time one frame in perf_sample (marker gfx-perf-sample = N; 1 = every frame,
-// 0 = off); parts and descriptor lines are averaged over the timed frames.
-unsigned perf_sample=8;bool perf_frame_timed=true;uint64_t perf_timed_frames=0;
+// Every scope reads the clock twice (~85k reads per D2R camp frame; ~105 ns each through the vDSO on Adreno 730
+// phones, ~19% of the render thread when every frame was timed, still ~4% at one frame in 8). Time one frame in
+// perf_sample (marker gfx-perf-sample = N; 1 = every frame, 0 = off): 32 leaves about two timed frames per 60-frame
+// window. Parts and descriptor lines are averaged over the timed frames.
+unsigned perf_sample=32;bool perf_frame_timed=true;uint64_t perf_timed_frames=0;
 XbgCpuTiming::Counter perf_timing_before[XbgCpuTiming::Count];
 bool descriptor_detail=false;
 XbgDescriptorTiming descriptor_timing;
@@ -652,7 +651,7 @@ void perf_frame(){
      xbg_logf("%s",line);for(int i=0;i<SITE_COUNT;i++)block_ns[i]=block_calls[i]=submit_by[i]=0;legacy_wait_ns=0;}
     {char line[1024];int at=snprintf(line,sizeof(line),"NVN PERF pass_ends");
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(pass_end_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,pass_end_by[i]/f);
-     at+=snprintf(line+at,sizeof(line)-at," fb_hits=%.1f fb_creates=%.2f fb_live=%zu texel_binds=%.1f distinct=%.1f reused=%.1f resident=%zu/%zu hits=%.1f refresh=%.1f fallback=%.2f evict=%.2f occlusion=%.1f reports=%.1f samples=%.0f ops=%.1f/%.1f/%.1f pending=%zu pipe_fast=%.1f pass_fast=%.1f clk=%.0f/%.0f barriers",fb_hits/f,fb_creates/f,persistent_framebuffers.size(),texel_binds/f,texel_distinct/f,texel_reused/f,texel_resident[0].size(),texel_resident[1].size(),texel_hits/f,texel_refreshes/f,texel_fallbacks/f,texel_evictions/f,occlusion_queries/f,samples_reports/f,samples_reported/f,counter_ops[0]/f,counter_ops[1]/f,counter_ops[2]/f,pending_reports.size(),pipeline_fast_hits/f,pass_fast_hits/f,timing_clock_calls.exchange(0)/f,dm_mach_abs_take?double(dm_mach_abs_take())/f:-1.0);pipeline_fast_hits=0;pass_fast_hits=0;fb_hits=fb_creates=0;occlusion_queries=samples_reports=samples_reported=0;for(auto &c:counter_ops)c=0;texel_binds=texel_distinct=texel_reused=0;texel_hits=texel_refreshes=texel_fallbacks=texel_evictions=0;
+     at+=snprintf(line+at,sizeof(line)-at," fb_hits=%.1f fb_creates=%.2f fb_live=%zu texel_binds=%.1f distinct=%.1f reused=%.1f resident=%zu/%zu hits=%.1f refresh=%.1f fallback=%.2f evict=%.2f occlusion=%.1f reports=%.1f samples=%.0f ops=%.1f/%.1f/%.1f pending=%zu pipe_fast=%.1f pass_fast=%.1f barriers",fb_hits/f,fb_creates/f,persistent_framebuffers.size(),texel_binds/f,texel_distinct/f,texel_reused/f,texel_resident[0].size(),texel_resident[1].size(),texel_hits/f,texel_refreshes/f,texel_fallbacks/f,texel_evictions/f,occlusion_queries/f,samples_reports/f,samples_reported/f,counter_ops[0]/f,counter_ops[1]/f,counter_ops[2]/f,pending_reports.size(),pipeline_fast_hits/f,pass_fast_hits/f);pipeline_fast_hits=0;pass_fast_hits=0;fb_hits=fb_creates=0;occlusion_queries=samples_reports=samples_reported=0;for(auto &c:counter_ops)c=0;texel_binds=texel_distinct=texel_reused=0;texel_hits=texel_refreshes=texel_fallbacks=texel_evictions=0;
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(barrier_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,barrier_by[i]/f);
      xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;}
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
@@ -2693,7 +2692,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     timestamp_bits=queues[cfg.queue_family].timestampValidBits;
     {const auto &l=properties.limits;VkDeviceSize a=256;for(VkDeviceSize x:{l.minUniformBufferOffsetAlignment,l.minStorageBufferOffsetAlignment,l.minTexelBufferOffsetAlignment,l.optimalBufferCopyOffsetAlignment,l.nonCoherentAtomSize,VkDeviceSize(16)})while(a<x)a<<=1;arena_alignment=a;}
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-mode";FILE *m=fopen(marker.c_str(),"rb");sync_mode=false;if(m){sync_mode=fgetc(m)=='1';fclose(m);}}
-     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=8;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=8;fclose(m);}perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
+     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=32;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=32;fclose(m);}perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
     for(auto &sl:slots)sl=Slot{};slot_index=0;pass_prof_enabled=false;pass_prof_next=300;pass_prof_frame=UINT64_MAX;pass_prof_draws=0;pass_prof_queries=pass_prof_slots=pass_prof_skipped_slots=0;perf=Perf{};for(auto &c:perf_timing_before)c=XbgCpuTiming::Counter{};static_arena.cached=false;support_static.clear();format_property_cache.clear();for(auto &k:format_flat_known)k=false;
     VkPhysicalDeviceShaderDrawParametersFeatures draw_parameters{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};features.pNext=&draw_parameters;vkGetPhysicalDeviceFeatures2(cfg.physical,&features);if(cfg.enabled_shader_draw_parameters && !draw_parameters.shaderDrawParameters){if(error&&bytes)snprintf(error,bytes,"shaderDrawParameters unsupported");return -1;}
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;VkResult r=vkCreateCommandPool(cfg.device,&cp,nullptr,&command_pool);if(r!=VK_SUCCESS){if(error&&bytes)snprintf(error,bytes,"vkCreateCommandPool=%d",r);return r;}
