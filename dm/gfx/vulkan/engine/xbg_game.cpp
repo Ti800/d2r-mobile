@@ -655,8 +655,13 @@ Buffer readback_buffer(size_t n,const void *data=nullptr,size_t copy=0){
 std::map<std::pair<uint64_t,uint64_t>,Buffer> snapshots,uniform_snapshots;
 uint64_t snapshot_maxlen=0;
 void desc_memo_reset();
-void snapshot_reset(){snapshots.clear();uniform_snapshots.clear();snapshot_maxlen=0;desc_memo_reset();++texel_write_epoch;}   // the guest may write memory between submissions: texel copies are re-verified
+// Direct-mapped front for the two snapshot maps: most lookups repeat within a submission (~12k of 15k per D2R camp frame).
+// Entries carry snapshot_epoch, which every reset and invalidation bumps, so a stale entry never matches.
+struct SnapFront{uint64_t address=0,bytes=0,epoch=0;Buffer buffer;};SnapFront snap_front[2][2048];uint64_t snapshot_epoch=1;
+inline SnapFront &snap_front_for(int which,uint64_t a,uint64_t n){uint64_t x=a*0x9E3779B97F4A7C15ull^n*0xC2B2AE3D27D4EB4Full;return snap_front[which][(x^(x>>31))&2047];}
+void snapshot_reset(){snapshots.clear();uniform_snapshots.clear();snapshot_maxlen=0;desc_memo_reset();++texel_write_epoch;++snapshot_epoch;}   // the guest may write memory between submissions: texel copies are re-verified
 void snapshot_invalidate(uint64_t address,uint64_t bytes){
+    ++snapshot_epoch;
     if(address<texel_hi && address+bytes>texel_lo)texel_touch(address,bytes);
     uint64_t lo=address>snapshot_maxlen?address-snapshot_maxlen:0;
     for(auto *m:{&snapshots,&uniform_snapshots})for(auto it=m->lower_bound({lo,0});it!=m->end() && it->first.first<address+bytes;){uint64_t b=it->first.first,e=b+it->first.second;if(address<e && address+bytes>b)it=m->erase(it);else ++it;}
@@ -753,7 +758,12 @@ bool snapshot(uint64_t address,size_t bytes,Buffer &out){
 extern "C" void xbg_wtrack_use_host_hooks(void){wtrack::installed=true;}
 extern "C" int xbg_wtrack_fault(void *addr){return wtrack::unprotect(uintptr_t(addr),1);}
 extern "C" void xbg_wtrack_prepare(void *addr,size_t len){if(len)wtrack::unprotect(uintptr_t(addr),len);}
+Buffer snapshot_slow(uint64_t address,size_t bytes,VkDeviceSize align);
 Buffer snapshot(uint64_t address,size_t bytes,VkDeviceSize align=4){CPU_SCOPE(Snapshot);
+    SnapFront &f=snap_front_for(0,address,bytes);if(f.epoch==snapshot_epoch && f.address==address && f.bytes==bytes){++perf.snapshot_hits;return f.buffer;}
+    Buffer b=snapshot_slow(address,bytes,align);f.address=address;f.bytes=bytes;f.epoch=snapshot_epoch;f.buffer=b;return b;
+}
+Buffer snapshot_slow(uint64_t address,size_t bytes,VkDeviceSize align){
     auto key=std::make_pair(address,uint64_t(bytes));auto it=snapshots.find(key);
     if(it!=snapshots.end()){++perf.snapshot_hits;return it->second;}
     {Buffer view;if(pending_view(address,bytes,align,view)){snapshots.emplace(key,view);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,bytes);return view;}}
@@ -1536,7 +1546,12 @@ void fill_driver(uint8_t *data,unsigned ns,unsigned bank){
 // Uniform data is bound with the guest-bound size (rounded to 16 bytes); reads
 // past it rely on robustBufferAccess like the reference Ryujinx Vulkan backend.
 size_t uniform_range(size_t copy){return std::max<size_t>(16,(copy+15)&~size_t(15));}
+Buffer uniform_snapshot_slow(uint64_t address,size_t copy);
 Buffer uniform_snapshot(uint64_t address,size_t copy){CPU_SCOPE(Snapshot);
+    SnapFront &f=snap_front_for(1,address,copy);if(f.epoch==snapshot_epoch && f.address==address && f.bytes==copy){++perf.snapshot_hits;return f.buffer;}
+    Buffer b=uniform_snapshot_slow(address,copy);f.address=address;f.bytes=copy;f.epoch=snapshot_epoch;f.buffer=b;return b;
+}
+Buffer uniform_snapshot_slow(uint64_t address,size_t copy){
     size_t n=uniform_range(copy);auto key=std::make_pair(address,uint64_t(copy));
     auto it=uniform_snapshots.find(key);if(it!=uniform_snapshots.end()){++perf.snapshot_hits;return it->second;}
     {Buffer view;if(pending_view(address,n,properties.limits.minUniformBufferOffsetAlignment,view)){uniform_snapshots.emplace(key,view);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,n);return view;}}
