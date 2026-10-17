@@ -10,6 +10,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <sched.h>
+#include <unistd.h>
+#include <time.h>
 namespace {
 std::mutex window_mutex;std::condition_variable window_cv;
 // Vulkan状态仅宿主线程使用；UI锁只保护窗口快照，不跨GPU等待。
@@ -35,6 +39,34 @@ VkSemaphore acquired;std::vector<VkSemaphore> finished;VkFence fence;bool ready=
 // ALL_COMMANDS and its release retires with a later submission, which covers this blit in queue order.
 bool overlap=false;VkCommandPool overlap_pool;VkCommandBuffer overlap_command;VkSemaphore overlap_acquired;VkFence overlap_fence;
 bool in_flight[2];unsigned flight=0;
+// 游戏线程（调用呈现的线程；同步翻译时也是翻译线程）钉在最高频的核上。Redmi K50 Ultra 上调度器一直把它放在 A710
+// （cpu4–6，MIUI 封顶 2.57 GHz），从不用空着的 X2（cpu7，封顶 2.25 GHz）；钉到 X2 后营地在 3D 比例 0.6 下从 40.2 升到
+// 44.3 fps（同进程 A/B，CPU 17.1 → 14.3 ms）。MIUI 会改线程的可用核掩码，所以每 120 次呈现核对一次。
+// 默认关闭；gfx-pin=1 才按频率选核，gfx-no-pin 关闭，gfx-pin-cpu = 十六进制掩码 指定核；gfx-ab-toggle = N 加 gfx-ab-target = pin 时每 N 秒钉 / 放开交替。
+// The game thread (the caller of present, which also translates in sync mode) runs on the cores with the highest maximum
+// frequency. On the Redmi K50 Ultra the scheduler kept it on the A710 cores (cpu4-6, capped at 2.57 GHz by MIUI) and never
+// used the idle X2 (cpu7, capped at 2.25 GHz); pinned to the X2 the camp went from 40.2 to 44.3 fps at 3D scale 0.6
+// (in-process A/B, CPU 17.1 -> 14.3 ms). MIUI rewrites thread affinity masks, so the pin is checked every 120 presents.
+// Off by default; gfx-pin=1 selects cores by frequency, gfx-no-pin disables it, and gfx-pin-cpu = hex mask picks the cores; gfx-ab-toggle = N with gfx-ab-target = pin
+// alternates pinned and released every N seconds, in phase with the engine's A/B (its PERF lines carry ab=).
+unsigned pin_mask=0;int pin_ab=0;int pin_state=-1;unsigned pin_presents=0,pin_drifts=0;cpu_set_t pin_original;bool pin_have_original=false;
+unsigned fastest_cores(){
+    unsigned best=0,mask=0,present=0;
+    for(int c=0;c<32;c++){char path[96];snprintf(path,sizeof path,"/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",c);FILE *f=fopen(path,"rb");if(!f)continue;
+        unsigned v=0;if(fscanf(f,"%u",&v)==1 && v){present|=1u<<c;if(v>best){best=v;mask=0;}if(v==best)mask|=1u<<c;}fclose(f);}
+    return mask==present?0:mask;   // 单一核心类别无需选择 | One core class: nothing to pick
+}
+void pin_update(){
+    if(!pin_mask)return;bool want=true;
+    if(pin_ab>0){timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);want=((ts.tv_sec/pin_ab)&1)==0;}
+    bool changed=int(want)!=pin_state;if(!changed && ++pin_presents%120)return;
+    if(!pin_have_original){CPU_ZERO(&pin_original);if(sched_getaffinity(0,sizeof pin_original,&pin_original)){pin_mask=0;return;}pin_have_original=true;}
+    cpu_set_t set;CPU_ZERO(&set);if(want){for(int c=0;c<32;c++)if(pin_mask>>c&1)CPU_SET(c,&set);}else set=pin_original;
+    if(!changed){cpu_set_t cur;CPU_ZERO(&cur);if(!sched_getaffinity(0,sizeof cur,&cur) && CPU_EQUAL(&cur,&set))return;++pin_drifts;}
+    int r=sched_setaffinity(0,sizeof set,&set);pin_state=want;
+    if(changed || r || pin_drifts<=4)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN pin tid=%d %s mask=%x result=%d drifts=%u",int(gettid()),want?"pinned":"released",want?pin_mask:0u,r,pin_drifts);
+    if(r && want)pin_mask=0;   // 核离线或不在cpuset时保留系统调度 | Keep system scheduling if cores are offline or outside the cpuset
+}
 void log_message(void*,const char *text){__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","%s",text);}
 [[noreturn]] void fatal(void*,const char *text){__android_log_print(ANDROID_LOG_FATAL,"dm-vulkan","%s",text);abort();}
 void destroy_present_semaphores(){for(auto s:finished)if(s)vkDestroySemaphore(device,s,nullptr);finished.clear();}
@@ -88,6 +120,7 @@ void wait_window_change(uint64_t bad){std::unique_lock<std::mutex> lock(window_m
 void wait_resize(){std::unique_lock<std::mutex> lock(window_mutex);window_cv.wait_for(lock,std::chrono::milliseconds(16),[]{return generation!=active_generation;});}
 int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uint32_t height,const int32_t crop[4],int32_t){
     std::lock_guard<std::mutex> render_lock(render_mutex);
+    pin_update();
     VkFormatProperties sp;vkGetPhysicalDeviceFormatProperties(physical,source_format,&sp);if(!(sp.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT))return VK_ERROR_FORMAT_NOT_SUPPORTED;
     int x=0,y=0,w=int(width),h=int(height);if(crop&&crop[2]>0&&crop[3]>0){x=std::clamp(crop[0],0,w);y=std::clamp(crop[1],0,h);w=std::min(crop[2],int(width)-x);h=std::min(crop[3],int(height)-y);}if(w<=0||h<=0)return VK_ERROR_INITIALIZATION_FAILED;
     for(;;){
@@ -182,7 +215,14 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;cp.queueFamilyIndex=family;if((r=vkCreateCommandPool(device,&cp,nullptr,&command_pool)))return fail("Present command pool",r);
     VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};ca.commandPool=command_pool;ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;if((r=vkAllocateCommandBuffers(device,&ca,&command)))return fail("Present command",r);
     VkSemaphoreCreateInfo sc{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};if((r=vkCreateSemaphore(device,&sc,nullptr,&acquired)))return fail("Acquire semaphore",r);VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};if((r=vkCreateFence(device,&fc,nullptr,&fence)))return fail("Present fence",r);
-    {std::string dir=path;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-overlap").c_str(),"rb");if(m){overlap=fgetc(m)=='1';fclose(m);}}
+    {std::string dir=path;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-overlap").c_str(),"rb");if(m){overlap=fgetc(m)=='1';fclose(m);}
+     auto open_marker=[&](const char *name){return fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");};
+     pin_mask=0;pin_ab=0;pin_state=-1;pin_have_original=false;pin_presents=pin_drifts=0;
+     if(FILE *p=open_marker("/gfx-pin")){if(fgetc(p)=='1')pin_mask=fastest_cores();fclose(p);}
+     if(FILE *p=open_marker("/gfx-pin-cpu")){if(fscanf(p,"%x",&pin_mask)!=1)pin_mask=0;fclose(p);}
+     if(FILE *n=open_marker("/gfx-no-pin")){pin_mask=0;fclose(n);}
+     if(FILE *t=open_marker("/gfx-ab-target")){char target[16]={0};if(fscanf(t,"%15s",target)==1 && !strcmp(target,"pin"))if(FILE *a=open_marker("/gfx-ab-toggle")){if(fscanf(a,"%d",&pin_ab)!=1)pin_ab=0;fclose(a);}fclose(t);}
+     __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN pin mask=%x ab=%d (markers gfx-no-pin, gfx-pin-cpu, gfx-ab-target=pin)",pin_mask,pin_ab);}
     if(overlap){if((r=vkCreateCommandPool(device,&cp,nullptr,&overlap_pool)))return fail("Present command pool",r);ca.commandPool=overlap_pool;if((r=vkAllocateCommandBuffers(device,&ca,&overlap_command)))return fail("Present command",r);
         if((r=vkCreateSemaphore(device,&sc,nullptr,&overlap_acquired)))return fail("Acquire semaphore",r);if((r=vkCreateFence(device,&fc,nullptr,&overlap_fence)))return fail("Present fence",r);}
     __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Present overlap=%d (marker gfx-present-overlap)",int(overlap));
