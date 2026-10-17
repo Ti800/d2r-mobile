@@ -603,7 +603,7 @@ void perf_frame(){
         for(unsigned i=0;i<XbgCpuTiming::Count && at<int(sizeof(line))-48;i++){const auto &c=timing.counters[i];if(c.calls<perf_timing_before[i].calls)perf_timing_before[i]=XbgCpuTiming::Counter{};uint64_t ns=c.exclusive_ns-perf_timing_before[i].exclusive_ns,calls=c.calls-perf_timing_before[i].calls;at+=snprintf(line+at,sizeof(line)-at," %s=%.2f/%.1f",names[i],double(ns)/1e6/tf,double(calls)/tf);perf_timing_before[i]=c;}
         xbg_logf("%s",line);
     }
-    xbg_logf("NVN PERF storage_snapshots_per_frame=%.1f union_mb_per_frame=%.2f",storage_snap_count/f,storage_pages.size()*4096.0/1048576.0/f);storage_pages.clear();storage_snap_count=0;
+    xbg_logf("NVN PERF storage_snapshots_per_frame=%.1f union_mb_per_frame=%.2f",storage_snap_count/f,storage_pages.size()*4096.0/1048576.0/tf);storage_pages.clear();storage_snap_count=0;
     xbg_logf("NVN PERF wtrack copied_kb_per_frame=%.1f dirty_pages_per_frame=%.1f mismatches=%llu fallbacks=%llu",wtrack::copied_bytes/1024.0/f,wtrack::dirty_pages/f,(unsigned long long)wtrack::mismatches,(unsigned long long)wtrack::fallbacks);wtrack::copied_bytes=wtrack::dirty_pages=0;
     xbg_logf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;
     {static uint64_t pm=0,pe=0;xbg_logf("NVN PERF pipelines_new=%llu evicted=%llu warm_hits=%llu created=%llu create_ms=%.1f create_max_ms=%.1f warm_built=%llu warm_failed=%llu warm_ms=%.0f",(unsigned long long)(pipeline_counts.misses-pm),(unsigned long long)(pipeline_counts.evictions-pe),(unsigned long long)warm::hits,(unsigned long long)warm::creates,warm::create_ns/1e6,warm::create_max_ns/1e6,(unsigned long long)warm::built.load(),(unsigned long long)warm::failed.load(),warm::build_ns.load()/1e6);warm::hits=warm::creates=warm::create_ns=warm::create_max_ns=0;pm=pipeline_counts.misses;pe=pipeline_counts.evictions;}
@@ -652,7 +652,17 @@ Buffer readback_buffer(size_t n,const void *data=nullptr,size_t copy=0){
 // Per-submission snapshot cache of guest memory ranges. Guest command streams
 // cannot change memory between draws except through in-stream CPU operations
 // (uniform updates, buffer copies, events, writebacks), which invalidate it.
-std::map<std::pair<uint64_t,uint64_t>,Buffer> snapshots,uniform_snapshots;
+// Node-recycling allocator for the per-submission snapshot maps: their nodes are dropped wholesale every submission, and
+// new/delete of ~3k nodes per frame (with scudo's locking) was ~3% of the render thread. Graphics thread only (engine mutex).
+template<class T> struct NodePool {
+    using value_type=T;NodePool()=default;template<class U> NodePool(const NodePool<U>&){}
+    static std::vector<void*> &free_list(){static std::vector<void*> f;return f;}
+    T *allocate(size_t n){if(n==1){auto &f=free_list();if(!f.empty()){void *p=f.back();f.pop_back();return static_cast<T*>(p);}}return static_cast<T*>(::operator new(n*sizeof(T)));}
+    void deallocate(T *p,size_t n){if(n==1){free_list().push_back(p);return;}::operator delete(p);}
+    template<class U> bool operator==(const NodePool<U>&)const{return true;}template<class U> bool operator!=(const NodePool<U>&)const{return false;}
+};
+using SnapMap=std::map<std::pair<uint64_t,uint64_t>,Buffer,std::less<std::pair<uint64_t,uint64_t>>,NodePool<std::pair<const std::pair<uint64_t,uint64_t>,Buffer>>>;
+SnapMap snapshots,uniform_snapshots;
 uint64_t snapshot_maxlen=0;
 void desc_memo_reset();
 // Direct-mapped front for the two snapshot maps: most lookups repeat within a submission (~12k of 15k per D2R camp frame).
@@ -767,7 +777,7 @@ Buffer snapshot_slow(uint64_t address,size_t bytes,VkDeviceSize align){
     auto key=std::make_pair(address,uint64_t(bytes));auto it=snapshots.find(key);
     if(it!=snapshots.end()){++perf.snapshot_hits;return it->second;}
     {Buffer view;if(pending_view(address,bytes,align,view)){snapshots.emplace(key,view);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,bytes);return view;}}
-    ++perf.snapshot_misses;perf.snapshot_bytes+=bytes;snap_site_bytes[snap_site<6?snap_site:0]+=bytes;if(snap_site==3){static unsigned logged=0;if(logged<40 && bytes>=65536){++logged;xbg_logf("NVN PERF storage_snapshot addr=%#llx bytes=%zu frame=%llu",(unsigned long long)address,bytes,(unsigned long long)stats.presents.load());}++storage_snap_count;for(uint64_t pg=address>>12;pg<=(address+bytes-1)>>12;pg++)storage_pages.insert(pg);}cpu_access(address,bytes,1);
+    ++perf.snapshot_misses;perf.snapshot_bytes+=bytes;snap_site_bytes[snap_site<6?snap_site:0]+=bytes;if(snap_site==3){static unsigned logged=0;if(logged<40 && bytes>=65536){++logged;xbg_logf("NVN PERF storage_snapshot addr=%#llx bytes=%zu frame=%llu",(unsigned long long)address,bytes,(unsigned long long)stats.presents.load());}++storage_snap_count;if(timing_current)for(uint64_t pg=address>>12;pg<=(address+bytes-1)>>12;pg++)storage_pages.insert(pg);}   // page union: timed frames only (~4.8k inserts per D2R frame)cpu_access(address,bytes,1);
     if(snap_site==3 && bytes>=wtrack::min_bytes && wtrack::enabled){Buffer t;if(wtrack::snapshot(address,bytes,t)){snapshots.emplace(key,t);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,bytes);return t;}}
     Buffer b=stream_buffer(bytes,reinterpret_cast<const void*>(address),bytes,false);snapshots.emplace(key,b);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,bytes);return b;
 }
