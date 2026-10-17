@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <sched.h>
 #include <unistd.h>
 #include <time.h>
@@ -49,7 +50,7 @@ bool in_flight[2];unsigned flight=0;
 // (in-process A/B, CPU 17.1 -> 14.3 ms). MIUI rewrites thread affinity masks, so the pin is checked every 120 presents.
 // Marker gfx-no-pin turns it off and gfx-pin-cpu = hex mask picks the cores; gfx-ab-toggle = N with gfx-ab-target = pin
 // alternates pinned and released every N seconds, in phase with the engine's A/B (its PERF lines carry ab=).
-unsigned pin_mask=0;int pin_ab=0;int pin_state=-1;unsigned pin_presents=0,pin_drifts=0;cpu_set_t pin_original;bool pin_have_original=false;
+unsigned pin_mask=0;int pin_ab=0;int pin_state=-1;unsigned pin_presents=0,pin_drifts=0,pin_failures=0;cpu_set_t pin_original;bool pin_have_original=false;
 unsigned fastest_cores(){
     unsigned best=0,mask=0,present=0;
     for(int c=0;c<32;c++){char path[96];snprintf(path,sizeof path,"/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",c);FILE *f=fopen(path,"rb");if(!f)continue;
@@ -63,9 +64,10 @@ void pin_update(){
     if(!pin_have_original){CPU_ZERO(&pin_original);if(sched_getaffinity(0,sizeof pin_original,&pin_original))for(int c=0;c<32;c++)CPU_SET(c,&pin_original);pin_have_original=true;}
     cpu_set_t set;CPU_ZERO(&set);if(want){for(int c=0;c<32;c++)if(pin_mask>>c&1)CPU_SET(c,&set);}else set=pin_original;
     if(!changed){cpu_set_t cur;CPU_ZERO(&cur);if(!sched_getaffinity(0,sizeof cur,&cur) && CPU_EQUAL(&cur,&set))return;++pin_drifts;}
-    int r=sched_setaffinity(0,sizeof set,&set);pin_state=want;
-    if(changed || r || pin_drifts<=4)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN pin tid=%d %s mask=%x result=%d drifts=%u",int(gettid()),want?"pinned":"released",want?pin_mask:0u,r,pin_drifts);
-    if(r && want)pin_mask=0;   // cores refused (offline or outside the cpuset): stay where the scheduler puts the thread
+    int r=sched_setaffinity(0,sizeof set,&set),err=r?errno:0;pin_state=want;if(r)++pin_failures;
+    // Refused while the app's cpuset lacks the cores (Android moves the app between cpusets, at start for one): the kernel
+    // keeps the request and applies it again when the cpuset allows, and the next check retries.
+    if(changed || pin_drifts<=4 || (r && pin_failures<=4))__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN pin tid=%d %s mask=%x result=%d errno=%d drifts=%u failures=%u",int(gettid()),want?"pinned":"released",want?pin_mask:0u,r,err,pin_drifts,pin_failures);
 }
 void log_message(void*,const char *text){__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","%s",text);}
 [[noreturn]] void fatal(void*,const char *text){__android_log_print(ANDROID_LOG_FATAL,"dm-vulkan","%s",text);abort();}
