@@ -69,10 +69,17 @@ void mtl_prog_release(prog_t *p){xbg_legacy_prog_release(p);}
 void mtl_tex_release(tex_t *t){xbg_legacy_tex_release(t);}
 void mtl_xv_window_tex(uint64_t serial){(void)serial;}
 void mtl_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyRegion *r,uint8_t *dst,size_t row,size_t img){xbg_legacy_read_texels(t,level,layer,r,dst,row,img);}
-uint64_t mtl_present(const tex_t *t,double period,const int crop[4]){win_t window={0};window.interval=period>0?1:0;if(crop)memcpy(window.crop,crop,sizeof(window.crop));xbg_present_texture(&window,t);uint64_t n=++g_present_n;/* GPU present processing completed; actual scanout timestamp is unavailable. */return n;}
+// 上屏时刻：Vulkan 没有 Metal 的 presentedTime 回调，用出图排队完成时的 CPU 时刻（单调钟，秒）代替；稳态下相邻两次之差就是帧间隔。
+// HLE 的掉帧统计与动态 3D 比例（hle_oe.c，与 iOS 同规则）靠它；原先恒为 0（无读数），安卓上动态比例从不判。
+// Present times: Vulkan has no presentedTime callback like Metal, so the CPU time (monotonic clock, seconds) when the present was queued stands in;
+// in steady state the difference of two neighbours is the frame interval. The HLE's dropped-frame count and the dynamic 3D scale (hle_oe.c, the iOS
+// rules) depend on it; it used to be always 0 (no reading), so the dynamic scale never judged on Android.
+static double g_present_at[1024];
+uint64_t mtl_present(const tex_t *t,double period,const int crop[4]){win_t window={0};window.interval=period>0?1:0;if(crop)memcpy(window.crop,crop,sizeof(window.crop));xbg_present_texture(&window,t);uint64_t n=++g_present_n;
+    struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);g_present_at[n%1024]=(double)ts.tv_sec+ts.tv_nsec*1e-9;return n;}
 void mtl_present_wait(uint64_t ticket){if(ticket>g_present_n)die("Unknown present ticket");}
 void mtl_present_flush(void){mtl_drain();}
-double mtl_presented_time(uint64_t n){(void)n;return 0;}
+double mtl_presented_time(uint64_t n){return n && n<=g_present_n && g_present_n-n<1024?g_present_at[n%1024]:0;}
 uint64_t mtl_present_count(void){return g_present_n;}
 int mtl_has_window(void){return g_config.has_window?g_config.has_window(g_config.game.userdata):0;}
 double front_display_refresh(char *name, size_t n);
