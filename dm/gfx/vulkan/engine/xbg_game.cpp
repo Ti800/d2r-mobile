@@ -364,7 +364,7 @@ uint64_t set_cache_hits=0,set_cache_misses=0,uniform_trimmed=0;bool template_ena
 // N (seconds) flips ab_on every N seconds; ab_on=false disables the optimization under test. Perf lines carry ab=.
 int ab_period=0;bool ab_on=true;
 bool ab_frame_on=true;
-// Which optimization gfx-ab-toggle switches off in its off phase (marker gfx-ab-target: wtrack, pipefast or query).
+// Which optimization gfx-ab-toggle switches off in its off phase (marker gfx-ab-target: wtrack, pipefast, query or timestamps).
 char ab_target[16]={0};
 inline bool ab_off(const char *name){return ab_period>0 && !ab_frame_on && !strcmp(ab_target,name);}
 bool ab_enabled(){if(ab_period<=0)return true;ab_on=((std::chrono::steady_clock::now().time_since_epoch().count()/1000000000ll/ab_period)&1)==0;return ab_on;}
@@ -2555,7 +2555,7 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_RESET_COUNTER:{uint64_t type=payload<uint64_t>(p,n);need(type==NVN_COUNTER_TYPE_SAMPLES_PASSED,"Unsupported pipeline counter reset");state.samples_passed=0;end_open_query();++counter_epoch;state.count_samples=true;++counter_ops[0];break;}   // the open run belongs to the old epoch
         case OP_REPORT_COUNTER:{need(n>=16,"Truncated counter report");uint64_t type,addr;memcpy(&type,p,8);memcpy(&addr,p+8,8);need(addr,"Null counter output");need(type==NVN_COUNTER_TYPE_TIMESTAMP || type==NVN_COUNTER_TYPE_SAMPLES_PASSED,"Unsupported pipeline statistics query");need(timestamp_bits,"Queue family does not support GPU timestamps");++counter_ops[type==NVN_COUNTER_TYPE_TIMESTAMP?1:2];
             PendingReport r{addr,type,counter_epoch,epochs[counter_epoch].size(),nullptr,VK_NULL_HANDLE,0,0,false};
-            if(type==NVN_COUNTER_TYPE_TIMESTAMP && !heavy_timestamps){
+            if(type==NVN_COUNTER_TYPE_TIMESTAMP && !heavy_timestamps && !ab_off("timestamps")){
                 // A bottom-of-pipe timestamp already waits for all earlier work and may be written inside a render pass: no pass
                 // end and no full barriers, so a timestamp report no longer splits a pass on a tiling GPU (4 per D2R frame).
                 // Samples reports keep the pass end below: it closes the occlusion run they sum.
