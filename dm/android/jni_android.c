@@ -156,6 +156,10 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // Storage writebacks that a newer GPU result supersedes and only the GPU reads are dropped (the engine's gfx-wb-skip; a
     // marker file still wins): 1.37 MB and about 1 ms of readback per camp frame.
     setenv("DM_GFX_WB_SKIP", "1", 0);
+    // 绘制状态与上一次绘制相同时直接沿用上一次的管线，不再序列化建管线信息去查（引擎的 gfx-pipe-memo；标记文件仍优先）。
+    // A draw whose pipeline state equals the previous draw's reuses its pipeline without serializing the create info for a
+    // lookup (the engine's gfx-pipe-memo; a marker file still wins).
+    setenv("DM_GFX_PIPE_MEMO", "1", 0);
     // Vulkan 适配器先沿用同步提交；上游新增翻译线程需独立验证对象生命周期。
     // Keep synchronous submission until the new upstream translation thread's object lifetimes are verified with Vulkan.
     setenv("DM_NVN_SYNC", "1", 0);

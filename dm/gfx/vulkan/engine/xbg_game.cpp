@@ -473,7 +473,7 @@ bool slot_pools_enabled=true,readback_cached=false;
 // Experiment (marker gfx-no-occlusion = '1'): no occlusion queries at all; counter reports then read 0 samples. Measures
 // what the per-draw precise queries cost the GPU (count_samples stays on after the game's first counter reset).
 bool heavy_timestamps=false;extern uint64_t pass_fast_hits;   // gfx-heavy-timestamps = '1': timestamp reports end the pass with full barriers, as before
-bool no_occlusion_queries=false;uint64_t occlusion_queries=0,samples_reports=0,samples_reported=0,counter_ops[3]={};extern uint64_t pipeline_fast_hits;extern uint64_t snap_front_hits,snap_map_hits,snap_invalidations,snap_invalidated;extern std::atomic<uint64_t> quad_rewrites;namespace vcache{extern bool enabled;extern uint64_t hits,hit_bytes,fills,fill_bytes,refills,volatiles,untracked,flushes;size_t live();VkDeviceSize arena_bytes();}   // counter_ops: resets, timestamp reports, samples reports recorded
+bool no_occlusion_queries=false;uint64_t occlusion_queries=0,samples_reports=0,samples_reported=0,counter_ops[3]={};extern uint64_t pipeline_fast_hits;extern bool pipe_memo;extern uint64_t pipe_memo_hits,pipe_memo_misses;extern uint64_t snap_front_hits,snap_map_hits,snap_invalidations,snap_invalidated;extern std::atomic<uint64_t> quad_rewrites;namespace vcache{extern bool enabled;extern uint64_t hits,hit_bytes,fills,fill_bytes,refills,volatiles,untracked,flushes;size_t live();VkDeviceSize arena_bytes();}   // counter_ops: resets, timestamp reports, samples reports recorded
 // Resident uniform texel copies (texel_acquire, before descriptors()).
 struct TexelKey{uint64_t base,bytes;uint32_t format;bool operator==(const TexelKey &o)const{return base==o.base&&bytes==o.bytes&&format==o.format;}};
 struct TexelKeyHash{size_t operator()(const TexelKey &k)const{uint64_t x=k.base*0x9E3779B97F4A7C15ull^k.bytes*0xC2B2AE3D27D4EB4Full^k.format;x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
@@ -687,6 +687,7 @@ void perf_frame(){
      xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;}
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
     if(wb_skip){xbg_logf("NVN PERF wbskip ab=%d skipped=%.1f (%.2fMB)",int(ab_frame_on),wb_skipped/f,wb_skipped_bytes/1048576.0/f);wb_skipped=wb_skipped_bytes=0;}
+    if(pipe_memo){xbg_logf("NVN PERF pipememo ab=%d hits=%.1f misses=%.1f",int(ab_frame_on),pipe_memo_hits/f,pipe_memo_misses/f);pipe_memo_hits=pipe_memo_misses=0;}
     perf=Perf{};perf.window_start=now;perf_timed_frames=0;
 }
 void occlusion_query(VkQueryPool &pool,uint32_t &index){
@@ -1426,6 +1427,21 @@ struct State {
     VkViewport viewport{0,0,1,1,0,1};VkRect2D scissor{{0,0},{UINT32_MAX,UINT32_MAX}};float blend_color[4]{},bias[3]{};uint32_t stencil_compare[2]{~0u,~0u},stencil_write[2]{~0u,~0u},stencil_ref[2]{};int64_t copy_stride=0;uint32_t patch_size=3;
     xbg_depth_bounds bounds{0,0,1};bool count_samples=false;uint64_t samples_passed=0;
 } state;
+// Pipeline memo (gfx-pipe-memo): every input the draw's VkGraphicsPipelineCreateInfo is built from. When a draw's inputs
+// equal the previous draw's, it gets the previous draw's pipeline without serializing the create info into a key and
+// looking it up (xbg_graphics_pipeline_key with its module-id lookups was ~6% of the game thread on Adreno 730). Raw
+// copies of the state fields, so differing padding can only cost a miss. Off unless the host asks (DM_GFX_PIPE_MEMO, which
+// the Android app sets to 1); marker gfx-pipe-memo = 1 / 0; A/B target pipememo.
+struct PipeMemoKey{const void *shader[5];const void *layout,*pass_def;VkRenderPass pass;VkPipelineLayout pipeline_layout;int32_t prim;uint32_t samples,rt_n,colors,depth,depth_format;
+    uint8_t fixed[offsetof(State,viewport)-offsetof(State,attrib)];               // attrib, stream, blend, color, mask, ms, poly, ds
+    uint8_t stencil[offsetof(State,copy_stride)-offsetof(State,blend_color)];      // blend_color, bias, stencil compare / write / reference
+    uint8_t tail[offsetof(State,count_samples)-offsetof(State,patch_size)];};      // patch_size, bounds
+PipeMemoKey pipe_memo_key,pipe_memo_next;VkPipeline pipe_memo_pipeline=VK_NULL_HANDLE;bool pipe_memo=false;uint64_t pipe_memo_hits=0,pipe_memo_misses=0;
+void pipe_memo_fill(PipeMemoKey &k,const void *layout,const void *pass_def,VkRenderPass pass,VkPipelineLayout pipeline_layout,int prim,VkSampleCountFlagBits samples,uint32_t colors){
+    memset(&k,0,sizeof k);for(unsigned i=0;i<5;i++)k.shader[i]=state.shader[i];k.layout=layout;k.pass_def=pass_def;k.pass=pass;k.pipeline_layout=pipeline_layout;k.prim=prim;k.samples=uint32_t(samples);
+    k.rt_n=uint32_t(state.rt.n);k.colors=colors;k.depth=state.rt.depth!=nullptr;k.depth_format=state.rt.depth?uint32_t(state.rt.depth->d.format):0;
+    const uint8_t *b=reinterpret_cast<const uint8_t*>(&state);memcpy(k.fixed,b+offsetof(State,attrib),sizeof k.fixed);memcpy(k.stencil,b+offsetof(State,blend_color),sizeof k.stencil);memcpy(k.tail,b+offsetof(State,patch_size),sizeof k.tail);
+}
 void validate_capabilities(const std::vector<uint32_t> &w,uint32_t stage){
     need(w.size()>=5 && w[0]==0x07230203,"Invalid packaged SPIR-V");bool group_operations=false;VkSubgroupFeatureFlags groups=0;
     for(size_t i=5;i<w.size();){uint32_t count=w[i]>>16,op=w[i]&65535;need(count && i+count<=w.size(),"Invalid SPIR-V instruction bounds");if(op>=333 && op<=366)group_operations=true;
@@ -1513,6 +1529,7 @@ std::map<std::string,PipelineEntry> pipeline_objects;
 // caches; an evicted pipeline is dropped from it.
 struct FastKeyHash{size_t operator()(const std::vector<uint32_t> &v)const{uint64_t h=1469598103934665603ull;for(uint32_t x:v){h^=x;h*=1099511628211ull;}return size_t(h^(h>>29));}};
 std::unordered_map<std::vector<uint32_t>,VkPipeline,FastKeyHash> pipeline_fast;bool pipeline_fast_enabled=true;uint64_t pipeline_fast_hits=0;
+bool pipe_memo_valid=false;   // the previous draw's pipeline (pipe_memo_key below); cleared wherever pipeline_fast drops entries
 uint64_t pipeline_tick=0;
 constexpr size_t pipeline_object_limit=4096; // field scenes exceed 256 live pipelines; eviction+rebuild caused 100ms+ hitches
 struct PipelineLease {
@@ -1651,11 +1668,11 @@ void pipeline_lookup(PipelineLease &out,const XbgPipelineKey &key,bool cacheable
         // All prior draws/dispatches waited their fence. This lookup occurs
         // before binding the current pipeline; no retained entry is in flight.
         auto oldest=std::min_element(pipeline_objects.begin(),pipeline_objects.end(),[](const auto &a,const auto &b){return a.second.last_used<b.second.last_used;});
-        {VkPipeline old=oldest->second.pipeline;retire_handle([old]{vkDestroyPipeline(cfg.device,old,nullptr);});for(auto f=pipeline_fast.begin();f!=pipeline_fast.end();)if(f->second==old)f=pipeline_fast.erase(f);else ++f;}pipeline_objects.erase(oldest);++pipeline_counts.evictions;
+        {VkPipeline old=oldest->second.pipeline;retire_handle([old]{vkDestroyPipeline(cfg.device,old,nullptr);});for(auto f=pipeline_fast.begin();f!=pipeline_fast.end();)if(f->second==old)f=pipeline_fast.erase(f);else ++f;pipe_memo_valid=false;}pipeline_objects.erase(oldest);++pipeline_counts.evictions;
     }
     pipeline_objects.emplace(std::string(bytes),PipelineEntry{out.pipeline,++pipeline_tick});
 }
-void clear_pipeline_objects(){for(auto &p:pipeline_objects)vkDestroyPipeline(cfg.device,p.second.pipeline,nullptr);pipeline_objects.clear();pipeline_fast.clear();}
+void clear_pipeline_objects(){for(auto &p:pipeline_objects)vkDestroyPipeline(cfg.device,p.second.pipeline,nullptr);pipeline_objects.clear();pipeline_fast.clear();pipe_memo_valid=false;}
 struct PipelineDefinition {
     std::vector<uint32_t> words;bool valid=false;
     void assign(const XbgPipelineKey &k,bool ok){valid=ok && k.valid;if(valid)words.assign(k.words,k.words+k.count);}
@@ -1676,7 +1693,7 @@ std::map<std::pair<float,float>,Buffer> support_static; // support block per vie
 struct SamplerFastKey{std::array<uint32_t,11> w;bool operator==(const SamplerFastKey &o)const{return w==o.w;}};
 struct SamplerFastHash{size_t operator()(const SamplerFastKey &k)const{uint64_t h=1469598103934665603ull;for(uint32_t v:k.w){h^=v;h*=1099511628211ull;}return size_t(h);}};
 std::unordered_map<SamplerFastKey,VkSampler,SamplerFastHash> sampler_fast;
-void clear_descriptor_caches(){sampler_fast.clear();pipeline_fast.clear();
+void clear_descriptor_caches(){sampler_fast.clear();pipeline_fast.clear();pipe_memo_valid=false;
     for(auto &l:layout_cache){if(l.second.tmpl)vkDestroyDescriptorUpdateTemplate(cfg.device,l.second.tmpl,nullptr);vkDestroyPipelineLayout(cfg.device,l.second.pipeline_layout,nullptr);vkDestroyDescriptorSetLayout(cfg.device,l.second.layout,nullptr);}layout_cache.clear();shader_layouts.clear();
     for(auto &x:sampler_cache)vkDestroySampler(cfg.device,x.second,nullptr);sampler_cache.clear();
     static_arena.release();support_static.clear();
@@ -2135,7 +2152,7 @@ void last_pass_reset(){last_pass.valid=false;}
 uint64_t noload_passes=0;
 struct RenderPassEntry {VkRenderPass pass{};PipelineDefinition definition;};
 std::map<std::vector<uint32_t>,RenderPassEntry> render_pass_cache;
-void clear_render_pass_cache(){for(auto &r:render_pass_cache)vkDestroyRenderPass(cfg.device,r.second.pass,nullptr);render_pass_cache.clear();pipeline_fast.clear();}
+void clear_render_pass_cache(){for(auto &r:render_pass_cache)vkDestroyRenderPass(cfg.device,r.second.pass,nullptr);render_pass_cache.clear();pipeline_fast.clear();pipe_memo_valid=false;}
 bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,bool soft=false){CPU_SCOPE(Pass);
     const bool plain_draw=c.draw && clear_color<0 && !clear_depth && !soft && !provenance_file && !capture.active && !ab_off("passfast");
     if(plain_draw && last_pass.valid && open_pass.cmd==c.command && open_pass.pass==last_pass.pass.pass && open_pass.framebuffer==last_pass.pass.framebuffer && !memcmp(&state.rt,&last_pass.rt,sizeof state.rt)){
@@ -2300,11 +2317,15 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.stageCount=stages.size();ci.pStages=stages.data();ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&ms;ci.pDepthStencilState=&ds;ci.pColorBlendState=&blend;ci.pDynamicState=&dy;ci.pTessellationState=state.shader[1]?&tess:nullptr;ci.layout=d.pipeline_layout;ci.renderPass=p.pass;
     PipelineLease pipeline;{CPU_SCOPE(Pipeline);
         static std::vector<uint32_t> fast;fast.clear();bool use_fast=pipeline_fast_enabled && !ab_off("pipefast") && d.entry->definition.valid && p.definition->valid;
-        if(use_fast){uint64_t a=uint64_t(uintptr_t(&d.entry->definition)),b=uint64_t(uintptr_t(p.definition));uint32_t ids[4]={uint32_t(a),uint32_t(a>>32),uint32_t(b),uint32_t(b>>32)};
+        bool memo=use_fast && pipe_memo && !ab_off("pipememo");
+        if(memo){pipe_memo_fill(pipe_memo_next,&d.entry->definition,p.definition,p.pass,d.pipeline_layout,prim,p.samples,active_colors);
+            if(pipe_memo_valid && !memcmp(&pipe_memo_next,&pipe_memo_key,sizeof pipe_memo_next)){pipeline.pipeline=pipe_memo_pipeline;++pipe_memo_hits;}else ++pipe_memo_misses;}
+        if(use_fast && !pipeline.pipeline){uint64_t a=uint64_t(uintptr_t(&d.entry->definition)),b=uint64_t(uintptr_t(p.definition));uint32_t ids[4]={uint32_t(a),uint32_t(a>>32),uint32_t(b),uint32_t(b>>32)};
             static XbgPipelineKey fkey;fkey.count=0;fkey.valid=true;   // 16 KB: one static, graphics thread only
             if(xbg_graphics_pipeline_key(fkey,ci,{ids,2,true},{ids+2,2,true})){fast.assign(fkey.words,fkey.words+fkey.count);auto f=pipeline_fast.find(fast);if(f!=pipeline_fast.end()){pipeline.pipeline=f->second;++pipeline_fast_hits;}}else use_fast=false;}
         if(!pipeline.pipeline){XbgPipelineKey key;bool cacheable=xbg_graphics_pipeline_key(key,ci,d.entry->definition.view(),p.definition->view());pipeline_lookup(pipeline,key,cacheable,&ci,nullptr);
-            if(use_fast && cacheable && !pipeline.transient)pipeline_fast.emplace(fast,pipeline.pipeline);}}
+            if(use_fast && cacheable && !pipeline.transient)pipeline_fast.emplace(fast,pipeline.pipeline);}
+        if(memo && use_fast && pipeline.pipeline && !pipeline.transient){pipe_memo_key=pipe_memo_next;pipe_memo_pipeline=pipeline.pipeline;pipe_memo_valid=true;}}
     // Buffer copies precede the draw; original guest layout remains unchanged.
     static std::vector<std::pair<uint32_t,Buffer*>> vertex_buffers;vertex_buffers.clear();
     Buffer *ib=nullptr;VkIndexType index_type=VK_INDEX_TYPE_UINT16;
@@ -2845,6 +2866,8 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      /* Android: no guest memory remapping probe. */
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wb-skip").c_str(),"rb");wb_skip=false;if(m){wb_skip=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_WB_SKIP"))wb_skip=atoi(e)!=0;
       xbg_logf("NVN superseded storage writebacks skipped=%d pool_flags=%d (marker gfx-wb-skip)",int(wb_skip),int(nvn_pool_flags!=nullptr));}
+     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-memo").c_str(),"rb");pipe_memo=false;pipe_memo_valid=false;if(m){pipe_memo=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_PIPE_MEMO"))pipe_memo=atoi(e)!=0;
+      xbg_logf("NVN pipeline memo for repeated draw state=%d (marker gfx-pipe-memo)",int(pipe_memo));}
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}
       format_feature_flags2=properties.apiVersion>=VK_API_VERSION_1_3;for(auto &e:ext)if(!strcmp(e.extensionName,VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME))format_feature_flags2=true;
