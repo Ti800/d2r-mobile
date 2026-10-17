@@ -433,6 +433,13 @@ void forget_framebuffers(Image &im,std::vector<VkFramebuffer> *deferred=nullptr)
 // 3.6% of the render thread on Adreno 730. gfx-no-slot-pools keeps the shared pool. Readback arenas in host-cached memory
 // (gfx-readback-cached = '1'): GPU results read back by the CPU (storage writebacks) come from uncached memory otherwise.
 bool slot_pools_enabled=true,readback_cached=false;
+// Resident uniform texel copies (texel_acquire, before descriptors()).
+struct TexelKey{uint64_t base,bytes;uint32_t format;bool operator==(const TexelKey &o)const{return base==o.base&&bytes==o.bytes&&format==o.format;}};
+struct TexelKeyHash{size_t operator()(const TexelKey &k)const{uint64_t x=k.base*0x9E3779B97F4A7C15ull^k.bytes*0xC2B2AE3D27D4EB4Full^k.format;x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
+struct TexelResident{Buffer buffer;VkBufferView view{};uint64_t hash=0,used=0,gen=0;};
+std::unordered_map<TexelKey,TexelResident,TexelKeyHash> texel_resident[2];Arena texel_arena[2];uint64_t texel_hole_bytes[2]={};
+bool texel_memo_enabled=false;uint64_t texel_gen=0,texel_refreshes=0,texel_fallbacks=0,texel_evictions=0,texel_hits=0;
+void texel_evict(unsigned si,bool all);
 // 显式gfx-pass-profile：每600次呈现采完整一帧的所有slot；整帧上限1024查询/32slot。
 // Opt-in gfx-pass-profile: sample all slots of one frame every 600 presents,
 // bounded to 1024 timestamp queries and 32 slots per selected frame.
@@ -540,6 +547,7 @@ Slot &recording_slot(){
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
         s.stream.trim();s.readback.keep_chunks=1;s.readback.trim();
+        if(texel_memo_enabled && (slot_serial&15)<2)texel_evict(slot_index,false);   // this slot's copies: its previous submission retired
         if(!s.cmd){if(slot_pools_enabled){VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;VK(vkCreateCommandPool(cfg.device,&cp,nullptr,&s.pool));}
             VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};a.commandPool=s.pool?s.pool:command_pool;a.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;a.commandBufferCount=1;VK(vkAllocateCommandBuffers(cfg.device,&a,&s.cmd));}
         s.readback.cached=readback_cached;
@@ -636,6 +644,7 @@ void perf_frame(){
      for(int i=0;i<SITE_COUNT && at<int(sizeof(line))-40;i++)if(submit_by[i])at+=snprintf(line+at,sizeof(line)-at," %s=%.2f",site_names[i],submit_by[i]/f);
      xbg_logf("%s",line);for(int i=0;i<SITE_COUNT;i++)block_ns[i]=block_calls[i]=submit_by[i]=0;legacy_wait_ns=0;}
     xbg_logf("NVN PERF fb_hits=%.1f fb_creates=%.2f fb_live=%zu",fb_hits/f,fb_creates/f,persistent_framebuffers.size());fb_hits=fb_creates=0;
+    xbg_logf("NVN PERF texel resident=%zu/%zu hits=%.1f refresh=%.1f fallback=%.2f evict=%.2f",texel_resident[0].size(),texel_resident[1].size(),texel_hits/f,texel_refreshes/f,texel_fallbacks/f,texel_evictions/f);texel_hits=texel_refreshes=texel_fallbacks=texel_evictions=0;
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
     xbg_logf("NVN PERF occlusion batch=%d queries_per_frame=%.2f",int(occlusion_batch_enabled),double(occlusion_queries_started)/f);
     xbg_logf("NVN PERF early_submit enabled=%d submits_per_frame=%.2f blocked_writeback_per_frame=%.2f",int(early_submit_enabled),early_submit_window/f,early_blocked_window/f);
@@ -1610,7 +1619,8 @@ struct ImgKey{uint64_t h,sh,tp,to,sp,so,kind;bool operator==(const ImgKey &o)con
 struct ImgKeyHash{size_t operator()(const ImgKey &k)const{uint64_t x=k.h*0x9E3779B97F4A7C15ull^k.sh*0xC2B2AE3D27D4EB4Full^k.tp^(k.to<<17)^(k.sp<<7)^k.so^(k.kind<<40);x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
 struct ImgEntry{const tex_t *tex;Image *im;VkImageView view;VkSampler sampler;const RegisteredTexture *record;uint64_t revision;};
 std::unordered_map<ImgKey,ImgEntry,ImgKeyHash> img_cache;bool img_cache_enabled=true;uint64_t img_cache_hits=0,img_cache_misses=0;
-struct DescMemo{const LayoutEntry *entry;VkDescriptorSet set;VkPipelineLayout pipeline_layout;std::vector<uint32_t> dynamic_offsets;std::vector<MemoImage> images;struct Dyn{uint64_t order;VkBuffer buffer;uint32_t offset;bool uniform;uint8_t src=0,ns=0,bank=0;};std::vector<Dyn> dyn;bool persistent=false;std::vector<std::pair<uint64_t,const void*>> tex_ids;struct Stor{uint64_t base,bytes;VkBuffer buffer;VkDeviceSize offset;};std::vector<Stor> stor;};
+struct DescMemo{const LayoutEntry *entry;VkDescriptorSet set;VkPipelineLayout pipeline_layout;std::vector<uint32_t> dynamic_offsets;std::vector<MemoImage> images;struct Dyn{uint64_t order;VkBuffer buffer;uint32_t offset;bool uniform;uint8_t src=0,ns=0,bank=0;};std::vector<Dyn> dyn;bool persistent=false;std::vector<std::pair<uint64_t,const void*>> tex_ids;struct Stor{uint64_t base,bytes;VkBuffer buffer;VkDeviceSize offset;};std::vector<Stor> stor;
+    struct Texel{const RegisteredTexture *record;uint64_t revision,base,bytes,gen;uint32_t format;};std::vector<Texel> texel;};   // texel: resident uniform texel buffers (texel_acquire)
 struct DynUbo{uint64_t order,address;size_t copy;};
 // Cross-frame memo (Claude C147): the memo lives per frame slot and survives submits. An entry is persistent when its set
 // holds no per-frame snapshot except dynamic uniform buffers (re-snapshotted on every hit, only the offset moves) and the
@@ -1624,6 +1634,7 @@ std::atomic<uint64_t> memo_epoch{1};bool dyn_partial_enabled=true;uint64_t key_d
 #define desc_memo desc_memo_slot[slot_index]
 uint64_t desc_ns[6]={};bool desc_memo_enabled=true;uint64_t desc_memo_hits=0,desc_memo_misses=0,desc_memo_why[6]={};
 std::vector<MemoImage> desc_memo_images;std::vector<DescMemo::Dyn> desc_memo_dyn;bool desc_memo_recording=false;
+std::vector<DescMemo::Texel> desc_memo_texel;bool desc_memo_texel_fail=false;
 void descriptors_build(Descriptors &out,Commands &commands,bool compute);
 // Dynamic uniform buffers (Claude C151): Maleoon allows 8 per pipeline layout. Mode 1 = every uniform buffer dynamic (fits);
 // mode 2 = only the per-draw ones (guest uniform buffers, driver blocks) dynamic, the support block (depends on the viewport
@@ -1645,6 +1656,35 @@ Buffer &support_block(){size_t n=1392;auto k=std::make_pair(state.viewport.width
 Buffer &driver_block(unsigned ns,unsigned bank){uint64_t gen=bank?tex_gen[ns]:buf_gen[ns];
     DriverCache &dc=driver_cache[ns][bank];if(dc.slot!=slot_serial || dc.gen!=gen || !dc.slot){Buffer s=stream_buffer(0x1000);fill_driver(static_cast<uint8_t*>(s.mapped),ns,bank?2:0);s.flush();dc.gen=gen;dc.slot=slot_serial;dc.buffer=s;}
     return dc.buffer;}
+// Uniform texel buffers held in resident per-slot copies, so descriptor sets that bind them can be memoized across frames
+// (D2R camp: 558 of 2188 draws per frame bind one and were rebuilt every time, ~21 us each against ~2.5 us for a memo hit).
+// A copy belongs to one slot (refreshed only while that slot records, after its previous submission retired) and is
+// refreshed from guest memory when its content hash changes, before its first read in a frame; content that changes again
+// within the frame falls back to the per-frame snapshot. A memo entry checks the copy's generation, so an evicted and
+// recreated copy is never mistaken for the one its set holds. Opt-in: gfx-texel-memo = '1'.
+TexelResident *texel_acquire(uint64_t base,uint64_t bytes,VkFormat fmt){
+    unsigned si=slot_index;auto &map=texel_resident[si];TexelKey key{base,bytes,uint32_t(fmt)};
+    cpu_access(base,bytes,8);   // pending GPU results land in guest memory first, as for snapshot()
+    uint64_t h=hash_memory(reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));
+    auto it=map.find(key);
+    if(it==map.end()){
+        if(map.size()>=8192){++texel_fallbacks;return nullptr;}
+        TexelResident r;r.buffer=texel_arena[si].alloc(size_t(bytes));
+        VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=r.buffer.buffer;v.offset=r.buffer.offset;v.format=fmt;v.range=bytes;VK(vkCreateBufferView(cfg.device,&v,nullptr,&r.view));
+        memcpy(r.buffer.mapped,reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));r.buffer.flush();r.hash=h;r.used=slot_serial;r.gen=++texel_gen;++texel_refreshes;
+        return &map.emplace(key,r).first->second;}
+    TexelResident &r=it->second;
+    if(r.hash!=h){if(r.used==slot_serial){++texel_fallbacks;return nullptr;}   // this frame already reads the earlier content
+        memcpy(r.buffer.mapped,reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));r.buffer.flush();r.hash=h;++texel_refreshes;}
+    r.used=slot_serial;return &r;
+}
+// While a slot starts recording (its previous submission retired): drop copies unused for ~128 submissions; when the holes they
+// leave in the slot's arena pass 8 MB, start the slot's store over (memo entries then fail their generation check).
+void texel_evict(unsigned si,bool all){
+    auto &map=texel_resident[si];
+    for(auto it=map.begin();it!=map.end();){if(all || it->second.used+128<slot_serial){vkDestroyBufferView(cfg.device,it->second.view,nullptr);texel_hole_bytes[si]+=it->first.bytes;it=map.erase(it);++texel_evictions;}else ++it;}
+    if(all || texel_hole_bytes[si]>8ull*1024*1024){for(auto &e:map)vkDestroyBufferView(cfg.device,e.second.view,nullptr);map.clear();texel_arena[si].release();texel_hole_bytes[si]=0;}
+}
 void descriptors(Descriptors &out,Commands &commands,bool compute){
     uint64_t tm0=perf_clock();struct MemoClock{uint64_t t0;~MemoClock(){}} mc{tm0};
     static std::vector<uint64_t> key;key.clear();static std::vector<uint8_t> ktag;ktag.clear();
@@ -1659,7 +1699,7 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
             for(auto &b:shader.bindings){
                 // Texel view 属于 slot，退休时销毁；memo 不追踪其快照或生命周期，不能保留旧 set。
                 // Slot retirement destroys texel views; memo tracks neither their snapshots nor lifetime, so exclude both kinds.
-                if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){ok=false;++desc_memo_why[0];break;}
+                if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER || (b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER && !texel_memo_enabled)){ok=false;++desc_memo_why[0];break;}
                 if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE){ok=false;++desc_memo_why[1];break;}
                 if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && shader.storage_writes.count(b.binding)){ok=false;++desc_memo_why[2];break;}
                 for(unsigned element=0;element<b.count;element++){unsigned slot=b.slot+element;
@@ -1700,6 +1740,11 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                     if(cached.record->revision!=cached.revision){same=false;break;}
                     if(t->serial!=m.tex_ids[k].first || t->mem!=m.tex_ids[k].second){same=false;break;}
                     auto li=images.find(t->serial);if(li==images.end() || li->second.get()!=m.images[k].second){same=false;break;}}
+                // Resident texel copies: same registration and range, the same copy the set holds (generation), content
+                // refreshed if the guest changed it since this slot last recorded.
+                if(same)for(auto &tr:m.texel){const tex_t &tt=tr.record->texture;
+                    if(tr.record->revision!=tr.revision || uint64_t(uintptr_t(tt.mem))!=tr.base || uint64_t(tt.L.size)!=tr.bytes){same=false;break;}
+                    TexelResident *r=texel_acquire(tr.base,tr.bytes,VkFormat(tr.format));if(!r || r->gen!=tr.gen){same=false;break;}++texel_hits;}
                 // Read-only storage ranges: refresh the snapshot (write-tracked resident copies only copy dirty pages); the set
                 // stays valid only if the range lands in the same buffer at the same offset as when the set was written.
                 if(same && m.persistent)for(auto &st:m.stor){snap_site=3;Buffer b=snapshot(st.base,st.bytes,properties.limits.minStorageBufferOffsetAlignment);snap_site=0;
@@ -1715,13 +1760,14 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                 desc_memo.erase(hit);}}
     }
     desc_ns[0]+=perf_clock()-tm0;
-    desc_memo_images.clear();desc_memo_dyn.clear();desc_memo_recording=ok;
+    desc_memo_images.clear();desc_memo_dyn.clear();desc_memo_texel.clear();desc_memo_texel_fail=false;desc_memo_recording=ok;
     {uint64_t tb=perf_clock();descriptors_build(out,commands,compute);desc_ns[4]+=perf_clock()-tb;}
     desc_memo_recording=false;
+    if(ok && desc_memo_texel_fail){ok=false;++desc_memo_why[0];}
     if(ok && !(out.written.empty() && out.buffer_views.empty() && out.set && out.dynamic_offsets.size()==desc_memo_dyn.size()))++desc_memo_why[4];
     if(ok && out.written.empty() && out.buffer_views.empty() && out.set && out.dynamic_offsets.size()==desc_memo_dyn.size()){++desc_memo_misses;
         std::sort(desc_memo_dyn.begin(),desc_memo_dyn.end(),[](const DescMemo::Dyn &a,const DescMemo::Dyn &b){return a.order<b.order;});
-        DescMemo dm{out.entry,out.set,out.pipeline_layout,out.dynamic_offsets,desc_memo_images,desc_memo_dyn};
+        DescMemo dm{out.entry,out.set,out.pipeline_layout,out.dynamic_offsets,desc_memo_images,desc_memo_dyn};dm.texel=desc_memo_texel;
         dm.persistent=xmemo_enabled && memo_dyn_ok && out.written.empty();
         for(auto &st:out.storage)dm.stor.push_back({st.first.first,st.first.second,st.second->buffer,st.second->offset});
         for(auto &ti:dm.images)dm.tex_ids.push_back({ti.first->serial,ti.first->mem});
@@ -1819,10 +1865,17 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                 else{PoolKey pk=pool_key(&state.texture_pool);if(!texture_pool_cache || !(pk==texture_pool_cache_key)){auto pool=textures.find(pk);texture_pool_cache=pool==textures.end()?&legacy_textures:&pool->second;texture_pool_cache_key=pk;}auto tex=texture_pool_cache->find(id);if(tex==texture_pool_cache->end())xbg_fatalf("Unregistered texture descriptor id=%d stage=%u slot=%u",id,ns,slot);record=&tex->second;}
                 const auto &registered=*record;const tex_t &texture=registered.texture;
                 if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){need(texture.d.target==10 && texture.mem && texture.L.size,"Invalid buffer texture");
+                    TexelResident *res=nullptr;
+                    if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER && texel_memo_enabled && !compute){Buffer pv;
+                        if(!pending_view(uint64_t(texture.mem),texture.L.size,1,pv))res=texel_acquire(uint64_t(texture.mem),texture.L.size,format(texture.d.format));
+                        if(res){if(desc_memo_recording)desc_memo_texel.push_back({record,record->revision,uint64_t(texture.mem),uint64_t(texture.L.size),res->gen,uint32_t(format(texture.d.format))});
+                            texel_views.push_back(res->view);write.pTexelBufferView=&texel_views.back();}
+                        else desc_memo_texel_fail=true;}   // the set then holds a per-frame view: not memoized
+                    if(!res){
                     Buffer *buf=nullptr;uint64_t base=uint64_t(texture.mem),bytes=texture.L.size;
                     if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){Buffer view;if(pending_view(base,bytes,1,view)){buf=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_open_pass();VkBufferCopy region{view.offset,buf->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,buf->buffer,1,&region);full_barrier(cmd);}else{cpu_access(base,bytes,8);buf=out.keep(readback_buffer(bytes,texture.mem,bytes));}out.storage.push_back({{base,bytes},buf});out.written.push_back({{base,bytes},buf});}
                     else{snap_site=4;buf=out.keep(snapshot(base,bytes,properties.limits.minTexelBufferOffsetAlignment));snap_site=0;}
-                    VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=buf->buffer;v.offset=buf->offset;v.format=format(texture.d.format);v.range=bytes;VkBufferView bv;{auto &cache=recording_slot().texel_views;std::array<uint64_t,4> key{uint64_t(v.buffer),v.offset,v.range,uint64_t(v.format)};auto f=cache.find(key);if(f!=cache.end())bv=f->second;else{VK(vkCreateBufferView(cfg.device,&v,nullptr,&bv));cache.emplace(key,bv);}}texel_views.push_back(bv);write.pTexelBufferView=&texel_views.back();}
+                    VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=buf->buffer;v.offset=buf->offset;v.format=format(texture.d.format);v.range=bytes;VkBufferView bv;{auto &cache=recording_slot().texel_views;std::array<uint64_t,4> key{uint64_t(v.buffer),v.offset,v.range,uint64_t(v.format)};auto f=cache.find(key);if(f!=cache.end())bv=f->second;else{VK(vkCreateBufferView(cfg.device,&v,nullptr,&bv));cache.emplace(key,bv);}}texel_views.push_back(bv);write.pTexelBufferView=&texel_views.back();}}
                 else{if(aspect(texture.d.format)!=VK_IMAGE_ASPECT_COLOR_BIT){auto prior=images.find(texture.serial);if(prior==images.end() || (!prior->second->uploaded && !prior->second->gpu_written))xbg_logf("NVN initial depth descriptor shader=%s stage=%u slot=%u id=%d serial=%llu format=%#x",shader.key.c_str(),ns,slot,id,(unsigned long long)texture.serial,texture.d.format);}
                     VkDescriptorImageInfo ii{};
                     Image &im=get_image(&texture,true);provenance_log("BIND shader=%s stage=%u slot=%u id=%d handle=%llu descriptorMem=%p descriptorOff=%lld type=%u",shader.key.c_str(),ns,slot,id,(unsigned long long)handle,state.texture_pool.pool?state.texture_pool.pool->mem:nullptr,(long long)state.texture_pool.off,unsigned(b.type));provenance_image("BIND",&texture,im,registered.has_view?&registered.view:nullptr);DESC_CALL(ImageTransition, prepare_read(im,commands.command));if(desc_memo_recording)desc_memo_images.push_back({&texture,&im,record,record->revision});ii.imageView=DESC_CALL(ImageView, im.view(registered.has_view?&registered.view:nullptr,false,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
@@ -2540,6 +2593,7 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
 }
 PerfCounts perf_counts(){return {pipeline_objects.size(),layout_cache.size(),sampler_cache.size(),render_pass_cache.size(),images.size(),host_segments.size(),host_bytes};}
 void destroy_slots(){
+    texel_evict(0,true);texel_evict(1,true);
     for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);if(s.pool)vkDestroyCommandPool(cfg.device,s.pool,nullptr);s=Slot{};}
     slot_index=0;snapshot_reset();
 }
@@ -2598,7 +2652,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     VkPipelineCacheCreateInfo cache{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};std::vector<uint8_t> cache_data=load_pipeline_cache();cache.initialDataSize=cache_data.size();cache.pInitialData=cache_data.empty()?nullptr:cache_data.data();r=vkCreatePipelineCache(cfg.device,&cache,nullptr,&pipeline_cache);if(r!=VK_SUCCESS){vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;if(error&&bytes)snprintf(error,bytes,"vkCreatePipelineCache=%d",r);return r;}
     xbg_module_id_hook=warm::module_id;{std::string lp=warm::list_path();FILE *nw=fopen((lp.substr(0,lp.find_last_of('/'))+"/gfx-no-warm").c_str(),"rb");warm::enabled=!nw;if(nw)fclose(nw);}warm::start();
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
-    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d",int(wtrack::enabled));{auto marker=[&](const char *name){FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");int c=-1;if(w){c=fgetc(w);fclose(w);}return c;};persistent_fb_enabled=marker("/gfx-no-persistent-fb")<0;slot_pools_enabled=marker("/gfx-no-slot-pools")<0;readback_cached=marker("/gfx-readback-cached")=='1';xbg_logf("NVN persistent framebuffers=%d slot command pools=%d cached readback=%d",int(persistent_fb_enabled),int(slot_pools_enabled),int(readback_cached));}}
+    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d",int(wtrack::enabled));{auto marker=[&](const char *name){FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");int c=-1;if(w){c=fgetc(w);fclose(w);}return c;};persistent_fb_enabled=marker("/gfx-no-persistent-fb")<0;slot_pools_enabled=marker("/gfx-no-slot-pools")<0;readback_cached=marker("/gfx-readback-cached")=='1';texel_memo_enabled=marker("/gfx-texel-memo")=='1';xbg_logf("NVN persistent framebuffers=%d slot command pools=%d cached readback=%d",int(persistent_fb_enabled),int(slot_pools_enabled),int(readback_cached));}}
      /* Android: no guest memory remapping probe. */
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}
