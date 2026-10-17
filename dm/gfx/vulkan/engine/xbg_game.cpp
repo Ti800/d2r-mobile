@@ -655,8 +655,9 @@ Buffer stream_buffer(size_t n,const void *data=nullptr,size_t copy=0,bool zero=t
     b.flush();return b;
 }
 Buffer readback_buffer(size_t n,const void *data=nullptr,size_t copy=0){
-    Buffer b=recording_slot().readback.alloc(n);memset(b.mapped,0,n);
-    if(data && copy){need(copy<=n,"Buffer copy overflow");memcpy(b.mapped,data,copy);}
+    Buffer b=recording_slot().readback.alloc(n);
+    if(data && copy){need(copy<=n,"Buffer copy overflow");memcpy(b.mapped,data,copy);}else copy=0;
+    if(copy<n)memset(static_cast<uint8_t*>(b.mapped)+copy,0,n-copy);   // only the bytes the copy leaves
     b.flush();return b;
 }
 // Per-submission snapshot cache of guest memory ranges. Guest command streams
