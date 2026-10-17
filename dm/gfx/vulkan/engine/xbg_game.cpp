@@ -748,6 +748,9 @@ bool activate(Tracked &t){
     unsigned n=nregions.load();if(n>=max_regions)return false;
     t.pbegin=uintptr_t(t.address)&~uintptr_t(4095);uintptr_t pend=(uintptr_t(t.address)+t.bytes+4095)&~uintptr_t(4095);
     for(unsigned i=0;i<n;i++){uintptr_t b=regions[i].begin.load(),e=regions[i].end.load();if(t.pbegin<e && pend>b)return false;} // overlapping regions unsupported
+    // Pages the HLE's dirty-page tracker has ever protected (the vertex/index cache) are its for good: its fault hook runs
+    // first and takes a fault on such a page as already handled, so a protection of ours there would re-fault forever.
+    if(nvn_dirty_since && nvn_dirty_tracked)for(uintptr_t pg=t.pbegin;pg<pend;pg+=4096){const void *q=reinterpret_cast<const void*>(pg);if(nvn_dirty_tracked(q,1) && nvn_dirty_since(q,1,0)){xbg_logf("NVN wtrack region refused addr=%#llx: page %#llx belongs to the dirty-page tracker",(unsigned long long)t.address,(unsigned long long)pg);return false;}}
     size_t npages=(pend-t.pbegin)>>12;
     auto *dirty=new std::atomic<uint8_t>[npages];for(size_t i=0;i<npages;i++)dirty[i].store(0);
     for(auto &v:t.v){
@@ -807,9 +810,10 @@ extern "C" void xbg_wtrack_prepare(void *addr,size_t len){if(len)wtrack::unprote
 // pages since the copy: take the stamp, write-protect the pages, then copy, so any later write faults and is newer than the
 // stamp. Copies are never rewritten (a changed range gets a new one), so in-flight submissions keep reading theirs. A range
 // that changes again within 8 submissions of being copied is volatile: it is left to the per-submission snapshot for 600
-// submissions, and its pages are no longer protected. Ranges overlapping write-tracked storage are skipped (two trackers
-// must not share pages), entries in a deleted pool are dropped, and past the budget the whole arena is handed to the
-// retiring slot and the cache starts over.
+// submissions, and its pages are no longer protected. Ranges overlapping write-tracked storage are skipped and write tracking
+// refuses pages this tracker has protected: two trackers must never share a page (each would take the other's faults).
+// Entries in a deleted pool are dropped, and past the budget the whole arena is handed to the retiring slot and the cache
+// starts over.
 namespace vcache {
 bool enabled=false;uint64_t hits=0,hit_bytes=0,fills=0,fill_bytes=0,refills=0,volatiles=0,untracked=0,flushes=0;
 constexpr size_t min_bytes=256;constexpr VkDeviceSize budget=96ull<<20;constexpr uint64_t volatile_window=8,retry_after=600;
