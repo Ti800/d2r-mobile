@@ -1122,6 +1122,9 @@ void forget_framebuffers(Image &im,std::vector<VkFramebuffer> *deferred){
 // Direct-mapped front for images.find (~12k get_image calls per D2R camp frame): erasing from or clearing images bumps
 // images_epoch, so a front entry never outlives its Image.
 struct ImgFront{uint64_t serial=0,epoch=0;Image *im=nullptr;};ImgFront img_front[1024];uint64_t images_epoch=1;
+// The Image currently registered for a serial, or null (the same front as get_image).
+Image *find_image(uint64_t serial){ImgFront &f=img_front[(serial*0x9E3779B97F4A7C15ull)>>54];if(f.epoch==images_epoch && f.serial==serial)return f.im;
+    auto it=images.find(serial);if(it==images.end())return nullptr;f.serial=serial;f.epoch=images_epoch;f.im=it->second.get();return f.im;}
 Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
     need(t && t->serial && t->magic==MAGIC('T','E','X',0),"Invalid NVN texture");
     ImgFront &front=img_front[(t->serial*0x9E3779B97F4A7C15ull)>>54];Image *hit=front.epoch==images_epoch && front.serial==t->serial?front.im:nullptr;
@@ -1787,7 +1790,7 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                 if(same)for(size_t k=0;k<m.images.size();k++){const auto &cached=m.images[k];const tex_t *t=cached.first;
                     if(cached.record->revision!=cached.revision){same=false;break;}
                     if(t->serial!=m.tex_ids[k].first || t->mem!=m.tex_ids[k].second){same=false;break;}
-                    auto li=images.find(t->serial);if(li==images.end() || li->second.get()!=m.images[k].second){same=false;break;}}
+                    if(find_image(t->serial)!=m.images[k].second){same=false;break;}}
                 // Resident texel copies: same registration and range, the same copy the set holds (generation), content
                 // refreshed if the guest changed it since this slot last recorded.
                 if(same)for(auto &tr:m.texel){const tex_t &tt=tr.record->texture;
