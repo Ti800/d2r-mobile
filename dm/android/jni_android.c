@@ -149,6 +149,10 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // Vulkan 适配器先沿用同步提交；上游新增翻译线程需独立验证对象生命周期。
     // Keep synchronous submission until the new upstream translation thread's object lifetimes are verified with Vulkan.
     setenv("DM_NVN_SYNC", "1", 0);
+    // BC 贴图按原格式采样（引擎的 gfx-native-bc；设备支持时；标记文件仍优先）：Redmi K50 Ultra 营地 GPU 少 0.5 ms，图像内存 827 → 320 MB。
+    // BC textures sampled in their own formats where the device can (the engine's gfx-native-bc; a marker file still wins):
+    // on the Redmi K50 Ultra camp GPU -0.5 ms and live image memory 827 -> 320 MB.
+    setenv("DM_GFX_NATIVE_BC", "1", 0);
     // 帧重叠缺省开：命令缓冲里的 SignalEvent 不提交、留到所在槽退役时再公布（引擎的 gfx-defer-events = 2；标记文件仍优先）。
     // 与呈现端的 gfx-present-overlap 一起，Redmi K50 Ultra 营地从 7.7 fps 到 19.5 fps（PR #9）。
     // Frame overlap on by default: command-buffer SignalEvents do not submit and are published when their slot retires (the
