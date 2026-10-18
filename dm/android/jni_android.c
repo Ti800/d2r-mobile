@@ -160,6 +160,8 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
        Enable dynamic 3D by default, starting at 0.75 with a 0.60 floor; apply Debug overrides before non-overwriting defaults. */
     setenv("DM_3D_SCALE","0.75",0);
     setenv("DM_3D_SCALE_DYN","1",0);
+    // PR23: marker gfx-async-pool-reset=1 enables device A/B; default remains off.
+    setenv("DM_GFX_ASYNC_POOL_RESET","0",0);
     setenv("DM_3D_SCALE_FLOOR","0.60",0);
     // Vulkan 适配器先沿用同步提交；上游新增翻译线程需独立验证对象生命周期。
     // Keep synchronous submission until the new upstream translation thread's object lifetimes are verified with Vulkan.
