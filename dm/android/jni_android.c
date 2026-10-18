@@ -173,6 +173,12 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // still wins): on Adreno helper invocations read garbage in subgroup shuffles, and black squares appeared around units in
     // the Den of Evil fight.
     setenv("DM_GFX_QUAD_DERIVATIVES", "1", 0);
+    // 按 32 道线程束翻译的计算着色器，在 64 道的子组里每 32 道各当一个线程束（引擎的 gfx-warp32；标记文件仍优先）：Adreno 上
+    // 杂物、草地、流体与 PPR 着色器的线程束聚合追加丢了 32–63 号车道、条目互相覆盖。
+    // Compute shaders translated for 32-lane warps run every 32 lanes of a 64-lane subgroup as their own warp (the engine's
+    // gfx-warp32; a marker file still wins): on Adreno the clutter, grass, fluid and PPR shaders' warp-aggregated appends lost
+    // lanes 32-63 and overwrote entries.
+    setenv("DM_GFX_WARP32", "1", 0);
     // 帧重叠缺省开：命令缓冲里的 SignalEvent 不提交、留到所在槽退役时再公布（引擎的 gfx-defer-events = 2；标记文件仍优先）。
     // 与呈现端的 gfx-present-overlap 一起，Redmi K50 Ultra 营地从 7.7 fps 到 19.5 fps（PR #9）。
     // Frame overlap on by default: command-buffer SignalEvents do not submit and are published when their slot retires (the
