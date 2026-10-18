@@ -14,13 +14,16 @@ def generate(output):
     table = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(table)
     shared = {"dmInputTitle", "dmNameTitle", "dmNameRule", "dmQtyTitle", "dmNameBlankRandom",
-              "dmNamePickIme", "dmNameTooShort", "dmNameEdge", "dmCancel", "dmConfirm"}
+              "dmNamePickIme", "dmNameTooShort", "dmNameEdge", "dmCancel", "dmConfirm", "dmTcCancel", "dmHudLife", "dmHudMana"}
     rows = [r for r in table.rows() if r[0].startswith("dmAndroid") or r[0] in shared]
     for folder, column in (("values", 2), ("values-zh", 1)):
         lines = ['<?xml version="1.0" encoding="utf-8"?>', '<resources>']
         for row in rows:
             value = escape(row[column]).replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"').replace("\n", "\\n")
-            lines.append(f'    <string name="{row[0].lower()}">{value}</string>')
+            # 多参数C格式由Java显式格式化，避免资源编译器误判非位置参数。
+            # Java formats shared multi-argument C strings explicitly; skip Android's positional-format check.
+            attribute = ' formatted="false"' if row[0] in {"dmHudLife", "dmHudMana", "dmAndroidHudLevel"} else ''
+            lines.append(f'    <string name="{row[0].lower()}"{attribute}>{value}</string>')
         lines.append('</resources>')
         directory = output / folder
         directory.mkdir(parents=True, exist_ok=True)

@@ -5,6 +5,9 @@ from pathlib import Path
 from PIL import Image
 import os; DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
 IOS=Path(__file__).resolve().parent.parent
+# 安卓把生成索引与贴图放仓外；默认仍验证苹果工程原路径。
+# Android keeps generated indices and textures outside the checkout; default to the Apple project's original paths.
+GENERATED=Path(os.environ.get('DM_NATIVE_ART_DIR', str(IOS/'Sources')))
 sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
 try:
  # 这里原有一组「在 DmTouchOverlay.m 里找某段源码文字」的断言（底栏跳过宿主绘制、元数据字段、重画入口等），回城钮改版后对不上。
@@ -14,7 +17,7 @@ try:
  # They guarded how the implementation is written, not behavior: who draws the bottom bar is guarded by the UI screenshots of the full regression table, and the touch-to-game protocol behavior is guarded by the C unit tests in this directory (t_native_binding / t_game_bridge / t_native_hud_bridge etc.) - deleted, not chasing the source text with edits.
  # What remains is data consistency: the three hash constants compiled into the program, the manifest, the 12 textures and the two skill tables match the actual files.
  manifest=json.loads((IOS/'Sources/TouchArt/native_art_manifest.json').read_text())
- compiled=(IOS/'Sources/dm_touch_native_art.c').read_text()
+ compiled=(GENERATED/'dm_touch_native_art.c').read_text(encoding='utf-8')
  for name,target in [('dm_ta_manifest_sha',IOS/'Sources/TouchArt/native_art_manifest.json'),
                      ('dm_ta_geometry_sha',IOS/'docs/native_art_v1_geometry.json'),
                      ('dm_ta_binding_sha',IOS/'docs/touch_layout_spec_native_binding_v5.json')]:
@@ -24,7 +27,7 @@ try:
  assert manifest['geometry_sha256']==sha(IOS/'docs/native_art_v1_geometry.json')
  assert manifest['binding_protocol_sha256']==sha(IOS/'docs/touch_layout_spec_native_binding_v5.json')
  for a in manifest['assets']:
-  with Image.open(IOS/'Sources/TouchArt'/a['asset']) as image:
+  with Image.open(GENERATED/'TouchArt'/a['asset']) as image:
    rgba=image.convert('RGBA')
    assert list(rgba.size)==a['atlas_px'], a['asset']+' dimensions'
    assert hashlib.sha256(rgba.tobytes()).hexdigest()==a['decoded_rgba_sha256'], a['asset']+' RGBA pixels'

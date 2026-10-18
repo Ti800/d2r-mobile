@@ -14,7 +14,7 @@
 #include "dm/android/touch_android.c"
 #include "dm/ios/Sources/dm_touch_controls.c"
 
-_Static_assert(DM_ANDROID_TOUCH_DRAW_FLOATS == 119, "Review the Java/native ABI before changing this test");
+_Static_assert(DM_ANDROID_TOUCH_DRAW_FLOATS == 183, "Review the Java/native ABI before changing this test");
 enum { DRAW_JOY = 12, DRAW_SWAP = 13, DRAW_DIFF = 14, DRAW_PICK0 = 15 };
 static const char *case_name = "startup";
 static unsigned checks, cases;
@@ -51,6 +51,23 @@ int dm_ui_touch_active(void) { return 0; }
 int dm_ui_bind_active(void) { return 0; }
 int dm_belt_rows(int *expanded) { if (expanded) *expanded = 0; return 1; }
 void dm_hud_get(dm_hud_info *out) { memset(out, 0, sizeof *out); }
+int dm_custom_get(const char *key) { (void)key; return 0; }
+void dm_ui_safe_left(int units) { (void)units; }
+void dm_ui_safe_right(int units) { (void)units; }
+int dm_touch_game_snapshot(dm_tg_snapshot *out) { memset(out,0,sizeof *out); return 0; }
+dm_ta_glyph dm_ta_skill(uint32_t id) { (void)id; return (dm_ta_glyph){.status=DM_TA_UNKNOWN,.atlas=-1}; }
+dm_ta_glyph dm_ta_current_set(const dm_tg_snapshot *s,uint64_t key,uint64_t now,int set) { (void)s; (void)key; (void)now; (void)set; return dm_ta_skill(0); }
+int dm_ta_frame_at(int atlas,int frame,dm_ta_frame *out) { (void)atlas; (void)frame; (void)out; return 0; }
+int dm_swapskill_slot(int slot,int *charges) { (void)slot; *charges=0; return 0; }
+int dm_ui_minimap_rect(float r[4]) { (void)r; return 0; }
+int dm_ui_map_is_full(void) { return 0; }
+void dm_ui_map_full(int on) { (void)on; unexpected_host_call(__func__); }
+unsigned dm_world_tap(float x,float y) { (void)x; (void)y; unexpected_host_call(__func__); return 0; }
+int dm_world_tap_result(unsigned seq) { (void)seq; return -1; }
+uint32_t dm_ui_hit_id(void) { return 0; }
+void dm_points_get(dm_points_info *out) { memset(out,0,sizeof *out); }
+void dm_stat_add(int stat,int n) { (void)stat; (void)n; unexpected_host_call(__func__); }
+void dm_skill_add_selected(void) { unexpected_host_call(__func__); }
 
 void dm_cursor_set_screen(float x, float y, float w, float h) { (void)x; (void)y; (void)w; (void)h; unexpected_host_call(__func__); }
 void dm_ui_touch(int phase, float x, float y) { (void)phase; (void)x; (void)y; unexpected_host_call(__func__); }
@@ -90,12 +107,12 @@ static void fixture(int navigation) {
     memset(&scene, 0, sizeof scene);
     memset(queue, 0, sizeof queue);
     head = tail = 0; ready = 0; focused = 1; cancel = resizing = ui_drag = 0;
-    width = 800; height = 375; safe_left = safe_right = safe_bottom = 0;
+    width = 800; height = 375; safe_left = safe_right = safe_bottom = 0; tablet_layout = swap_above = 0;
     epoch = world = 1; pulse_epoch = pulse_sample = resume_sample = 0; pulse_hold_start = 0;
     seen_world = seen_mouse = seen_tab = seen_use = seen_ident = seen_long = seen_item = seen_stack = 0;
     frontend = 0; fe_slot = -1; fe_drag = 0; fe_x0 = fe_y0 = 0;
     test_clock_ns = UINT64_C(100000000000); test_sample = 0;
-    dm_tc_set_safe_insets(0, 0); dm_tc_set_edge_bottom(0);
+    dm_tc_set_safe_insets(0, 0); dm_tc_set_edge_bottom(0); dm_tc_set_safe_bottom(0); dm_tc_set_swap_above(0);
     dm_tc_set_panel_state(0); dm_tc_set_tap_box(0); dm_tc_set_cur_stack(0); dm_tc_set_hover_unid(0);
     init_locked();
     dm_tc_set_navigation_mode(&tc, navigation);
@@ -138,7 +155,7 @@ static void down_target(int slot, int target, double at) {
 }
 
 static void test_idle_and_abi(void) {
-    fixture(0); float a[119], b[119]; read_twice(a); read_twice(b);
+    fixture(0); float a[DM_ANDROID_TOUCH_DRAW_FLOATS], b[DM_ANDROID_TOUCH_DRAW_FLOATS]; read_twice(a); read_twice(b);
     REQUIRE(memcmp(a, b, sizeof a) == 0);
     REQUIRE(a[0] == 800 && a[1] == 375 && a[2] == 0 && a[3] == 0);
     REQUIRE(visible(a, DRAW_JOY) && visible(a, DRAW_SWAP) && visible(a, DRAW_DIFF));
@@ -146,7 +163,7 @@ static void test_idle_and_abi(void) {
 }
 
 static void test_press_release_and_multitouch(void) {
-    fixture(0); float a[119], b[119]; read_twice(a);
+    fixture(0); float a[DM_ANDROID_TOUCH_DRAW_FLOATS], b[DM_ANDROID_TOUCH_DRAW_FLOATS]; read_twice(a);
     down_target(0, DM_TC_MAIN, 100.0); read_twice(b);
     REQUIRE(lit(b, DM_TC_MAIN)); REQUIRE(memcmp(a, b, sizeof a) != 0);
     unchanged_geometry(a, b);
@@ -162,7 +179,7 @@ static void test_press_release_and_multitouch(void) {
 }
 
 static void test_slide_cancel(void) {
-    fixture(0); float a[119]; down_target(0, DM_TC_SKILL1, 100.0);
+    fixture(0); float a[DM_ANDROID_TOUCH_DRAW_FLOATS]; down_target(0, DM_TC_SKILL1, 100.0);
     dm_tc_target map = tc.layout.target[DM_TC_MAP];
     dm_tc_move_at(&tc, 0, map.x, map.y, 100.1);
     REQUIRE(tc.finger[0].active && tc.finger[0].aim_cancelled);
@@ -173,7 +190,7 @@ static void test_slide_cancel(void) {
 }
 
 static void test_release_pulse(void) {
-    fixture(0); float a[119], b[119]; down_target(0, DM_TC_SKILL1, 100.0);
+    fixture(0); float a[DM_ANDROID_TOUCH_DRAW_FLOATS], b[DM_ANDROID_TOUCH_DRAW_FLOATS]; down_target(0, DM_TC_SKILL1, 100.0);
     dm_tc_end_at(&tc, 0, 100.01);
     REQUIRE(!tc.finger[0].active && tc.pulse_button == tc.layout.target[DM_TC_SKILL1].button);
     read_twice(a); REQUIRE(lit(a, DM_TC_SKILL1));
@@ -183,10 +200,10 @@ static void test_release_pulse(void) {
 }
 
 static void test_swap_and_delayed_pulse(void) {
-    fixture(0); float a[119], b[119]; read_twice(a);
+    fixture(0); float a[DM_ANDROID_TOUCH_DRAW_FLOATS], b[DM_ANDROID_TOUCH_DRAW_FLOATS]; read_twice(a);
     dm_tc_target swap = tc.layout.swap;
     dm_tc_begin_at(&tc, 0, swap.x, swap.y, 100.0); read_twice(b);
-    REQUIRE(tc.finger[0].target == DM_TC_SWAP && b[3] == 1 && lit(b, DRAW_SWAP));
+    REQUIRE(tc.finger[0].target == DM_TC_SWAP && b[3] == 0 && lit(b, DRAW_SWAP));
     REQUIRE(memcmp(a, b, sizeof a) != 0); unchanged_geometry(a, b);
     dm_tc_end_at(&tc, 0, 100.01); read_twice(b);
     REQUIRE(b[3] == 1 && !lit(b, DRAW_SWAP));
@@ -202,7 +219,7 @@ static void test_swap_and_delayed_pulse(void) {
 }
 
 static void test_difficulty_hit_and_close(void) {
-    fixture(0); float a[119], b[119]; read_twice(a);
+    fixture(0); float a[DM_ANDROID_TOUCH_DRAW_FLOATS], b[DM_ANDROID_TOUCH_DRAW_FLOATS]; read_twice(a);
     for (int i = 0; i < 8; ++i) REQUIRE(!visible(a, DRAW_PICK0 + i));
     dm_tc_target diff = tc.layout.diff;
     dm_tc_begin_at(&tc, 0, diff.x, diff.y, 100.0); read_twice(b);
@@ -231,7 +248,7 @@ static void test_difficulty_hit_and_close(void) {
 }
 
 static void test_belt_diff_target_does_not_light_difficulty(void) {
-    fixture(0); float a[119]; tc.belt_rows = 2; tc.belt_open = 1;
+    fixture(0); float a[DM_ANDROID_TOUCH_DRAW_FLOATS]; tc.belt_rows = 2; tc.belt_open = 1;
     dm_tc_target belt = tc.layout.target[DM_TC_BELT1];
     float row_y = belt.y - 165.0f * tc.layout.height / 1320.0f;
     dm_tc_begin_at(&tc, 0, belt.x, row_y, 100.0);
@@ -242,7 +259,7 @@ static void test_belt_diff_target_does_not_light_difficulty(void) {
 }
 
 static void test_navigation_and_resize(void) {
-    fixture(0); float a[119], b[119]; read_twice(a);
+    fixture(0); float a[DM_ANDROID_TOUCH_DRAW_FLOATS], b[DM_ANDROID_TOUCH_DRAW_FLOATS]; read_twice(a);
     dm_tc_set_navigation_mode(&tc, 1); dm_tc_enable_targets(&tc, dm_tc_nav_mask(1)); read_twice(b);
     REQUIRE(b[2] == 1 && memcmp(a, b, sizeof a) != 0);
     REQUIRE(!visible(b, DRAW_JOY) && !visible(b, DRAW_SWAP) && !visible(b, DRAW_DIFF));
@@ -277,12 +294,43 @@ static void test_android_queue_ten_short_taps(void) {
 }
 
 static void test_android_focus_cancel(void) {
-    fixture(0); float a[119]; dm_tc_target main = tc.layout.target[DM_TC_MAIN];
+    fixture(0); float a[DM_ANDROID_TOUCH_DRAW_FLOATS]; dm_tc_target main = tc.layout.target[DM_TC_MAIN];
     dm_android_touch_event(0, 0, main.x, main.y);
     REQUIRE((queue_sample() & DM_BTN_A) != 0); read_twice(a); REQUIRE(lit(a, DM_TC_MAIN));
     dm_android_touch_focus(0); REQUIRE(queue_sample() == 0); read_twice(a);
     REQUIRE(!lit(a, DM_TC_MAIN) && tc.buttons == 0 && head == tail);
     dm_android_touch_focus(1); REQUIRE(queue_sample() == 0); read_twice(a); REQUIRE(!lit(a, DM_TC_MAIN));
+}
+
+/* 同一批内取消不能把旧按下沿带给游戏；另一手指的快按仍有效。
+   Cancellation in a batch must revoke the old edge without discarding another finger's quick tap. */
+static void test_android_cancelled_latch(void) {
+    fixture(0);
+    dm_tc_target main=tc.layout.target[DM_TC_MAIN], map=tc.layout.target[DM_TC_MAP];
+    dm_android_touch_event(0,0,main.x,main.y);
+    dm_android_touch_event(1,0,map.x,map.y);
+    dm_android_touch_event(2,0,map.x,map.y);
+    REQUIRE((queue_sample() & DM_BTN_A)==0);
+    REQUIRE(tc.buttons==0);
+    fixture(0); main=tc.layout.target[DM_TC_MAIN];
+    dm_android_touch_event(0,0,main.x,main.y);
+    dm_android_touch_event(3,0,main.x,main.y);
+    dm_android_touch_event(0,1,main.x,main.y);
+    dm_android_touch_event(2,1,main.x,main.y);
+    REQUIRE((queue_sample() & DM_BTN_A)!=0);
+    REQUIRE((queue_sample() & DM_BTN_A)==0);
+}
+
+/* 换组只在原位松手时触发；滑出去再回来的手势仍取消。
+   Switching commits on release inside the original target; leaving and returning still cancels. */
+static void test_android_swap_release_cancel(void) {
+    fixture(0); dm_tc_target swap=tc.layout.swap;
+    dm_android_touch_event(0,0,swap.x,swap.y); queue_sample(); REQUIRE(tc.skill_set==0);
+    dm_android_touch_event(2,0,swap.x,swap.y); queue_sample(); REQUIRE(tc.skill_set==1);
+    dm_android_touch_event(0,0,swap.x,swap.y);
+    dm_android_touch_event(1,0,swap.x-100,swap.y);
+    dm_android_touch_event(2,0,swap.x,swap.y);
+    queue_sample(); REQUIRE(tc.skill_set==1);
 }
 
 static void run_case(const char *name, void (*body)(void)) {
@@ -291,7 +339,7 @@ static void run_case(const char *name, void (*body)(void)) {
 
 int main(void) {
     puts("SCOPE native_layout_and_input_bridge; no_Java_Canvas_no_guest_no_save_access");
-    run_case("idle_119_abi", test_idle_and_abi);
+    run_case("idle_183_abi", test_idle_and_abi);
     run_case("press_release_multitouch", test_press_release_and_multitouch);
     run_case("slide_cancelled_finger", test_slide_cancel);
     run_case("release_pulse_highlight", test_release_pulse);
@@ -301,6 +349,8 @@ int main(void) {
     run_case("navigation_and_resize", test_navigation_and_resize);
     run_case("android_queue_ten_short_taps", test_android_queue_ten_short_taps);
     run_case("android_focus_cancel", test_android_focus_cancel);
+    run_case("android_cancelled_latch", test_android_cancelled_latch);
+    run_case("android_swap_release_cancel", test_android_swap_release_cancel);
     printf("RESULT PASS cases=%u assertions=%u; game_quick_taps_10_of_10=NOT_TESTED\n", cases, checks);
     return 0;
 }
