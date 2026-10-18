@@ -1,8 +1,8 @@
-# Redmi K50 Ultra 上的主线程自旋、事件读取与四元组辅助函数调用（2026-10-19）
+# Redmi K50 Ultra 上的主线程自旋、事件读取、同步验证与四元组辅助函数调用（2026-10-19）
 
 English: [2026-10-19-spin-events-quad.md](2026-10-19-spin-events-quad.md)
 
-10-19 09:40–11:10（新西兰夏令时）在 Redmi K50 Ultra（Adreno 730、Vulkan 1.1、Android 15）上测，游戏加速开着。构建为 `android/linux-build`，3D 比例固定 0.75，另有注明的除外。
+10-19 09:40–11:30（新西兰夏令时）在 Redmi K50 Ultra（Adreno 730、Vulkan 1.1、Android 15）上测，游戏加速开着。构建为 `android/linux-build`，3D 比例固定 0.75，另有注明的除外。
 
 ## 宿主开关的按时间对照
 
@@ -38,6 +38,12 @@ D2R 主线程每帧约 45 次等两个工作线程持有的客体锁，其中 81
 - `write_report` 在 +0x60 写计数器报告（旁边的字在 +0x108）。
 
 `nvnEventGetValue` 读之前先发布待发布的事件，而且从没碰上过待发布的事件（`cpu_reads_pending=0`）。CPU 的 `nvnEventSignal` 是直接写入，没有一次写操作缺页。
+
+## 同步验证下的呈现重叠（#9，PR #28）
+
+Khronos 验证层（1.4.363.0 安卓二进制）只对本 App 作为 GPU 调试层加载，开 `validate_sync`、关 `validate_core`，呈现重叠和帧重叠都开着。
+
+它只报了一种隐患：呈现端对每张取到的交换链图像换布局时，源阶段写的是 `TOP_OF_PIPE`，而提交在 `TRANSFER` 阶段等获取信号量（`SYNC-HAZARD-WRITE-AFTER-READ`）。这与重叠无关，`main` 里也是同一个屏障。源阶段改为 `TRANSFER`（PR #28）后，营地（约 100 s）和传送加定种子打斗（约 110 s）一条消息也没有。所以两次 blit 在途时游戏输出图上没有隐患，帧重叠时引擎的资源上也没有。
 
 ## 经翻译器辅助函数的四元组 shuffle（PR #27）
 

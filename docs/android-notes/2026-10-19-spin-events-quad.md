@@ -1,8 +1,8 @@
-# Main-thread spin, event reads and quad helper calls on the Redmi K50 Ultra (2026-10-19)
+# Main-thread spin, event reads, sync validation and quad helper calls on the Redmi K50 Ultra (2026-10-19)
 
 中文：[2026-10-19-spin-events-quad.zh-CN.md](2026-10-19-spin-events-quad.zh-CN.md)
 
-Measured 09:40–11:10 NZDT on the Redmi K50 Ultra (Adreno 730, Vulkan 1.1, Android 15), Game Turbo on, build `android/linux-build`, 3D scale held at 0.75 unless noted.
+Measured 09:40–11:30 NZDT on the Redmi K50 Ultra (Adreno 730, Vulkan 1.1, Android 15), Game Turbo on, build `android/linux-build`, 3D scale held at 0.75 unless noted.
 
 ## A time-based A/B for host switches
 
@@ -38,6 +38,12 @@ The only accesses to these pages are the engine's own:
 - `write_report` writes a counter report at +0x60 (next to a word at +0x108).
 
 `nvnEventGetValue` applies pending events before it reads, and it never met a pending event (`cpu_reads_pending=0`). The CPU's `nvnEventSignal` is a plain store, and no write faulted.
+
+## Present overlap under synchronization validation (#9, PR #28)
+
+The Khronos validation layer (1.4.363.0 Android binaries) ran as a GPU debug layer for the app only, with `validate_sync` on and `validate_core` off, and with present overlap and frame overlap on.
+
+It reported one hazard: the presenter's transition of each acquired swapchain image used `TOP_OF_PIPE` as its source stage, while the submit waits on the acquire semaphore at `TRANSFER` (`SYNC-HAZARD-WRITE-AFTER-READ`). That has nothing to do with overlap, and `main` has the same barrier. With the source stage set to `TRANSFER` (PR #28), the camp (about 100 s) and a warp plus seeded fight (about 110 s) gave no messages at all. So there is no hazard on the game's output image with two blits in flight, nor on the engine's resources with frames overlapped.
 
 ## Quad shuffles through the translator's helper functions (PR #27)
 
