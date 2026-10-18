@@ -1891,6 +1891,7 @@ struct DynUbo{uint64_t order,address;size_t copy;};
 // every slot's memo lazily and returns pinned sets to that slot (recycled only after its next fence).
 // files/gfx-no-xmemo keeps the old per-submit behaviour.
 std::unordered_map<std::vector<uint64_t>,DescMemo,SetKeyHash> desc_memo_slot[2];std::unordered_map<VkDescriptorSet,PinRef> memo_pinned[2];
+size_t desc_memo_local[2]={};   // entries that are not persistent, which desc_memo_reset drops
 std::atomic<uint64_t> memo_epoch{1};bool dyn_partial_enabled=true;uint64_t key_diff[14]={};uint64_t memo_bump[5]={};uint64_t memo_slot_epoch[2]={1,1};bool xmemo_enabled=true,memo_dyn_ok=false;uint64_t xmemo_hits=0,xmemo_drops=0;
 #define desc_memo desc_memo_slot[slot_index]
 uint64_t desc_ns[6]={};bool desc_memo_enabled=true;uint64_t desc_memo_hits=0,desc_memo_misses=0,desc_memo_why[6]={};
@@ -1905,12 +1906,15 @@ unsigned dyn_mode_for(bool compute,bool *no_ubo=nullptr){unsigned all=0,vary=0;
     for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute)for(auto &b:state.shader[st]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){all+=b.count;if(b.source==XBG_SOURCE_UNIFORM||b.source==XBG_SOURCE_DRIVER0||b.source==XBG_SOURCE_DRIVER2)vary+=b.count;}
     if(no_ubo)*no_ubo=all==0;unsigned lim=properties.limits.maxDescriptorSetUniformBuffersDynamic;
     return all && all<=lim?1:(vary && vary<=lim && dyn_partial_enabled?2:0);}
-void memo_unpin_all(unsigned si){Slot &s=slots[si];for(auto &pn:memo_pinned[si])s.used_sets[pn.second.layout].push_back(pn.first);memo_pinned[si].clear();desc_memo_slot[si].clear();}
+void memo_unpin_all(unsigned si){Slot &s=slots[si];for(auto &pn:memo_pinned[si])s.used_sets[pn.second.layout].push_back(pn.first);memo_pinned[si].clear();desc_memo_slot[si].clear();desc_memo_local[si]=0;}
 void memo_check_epoch(){unsigned si=slot_index;if(memo_slot_epoch[si]!=memo_epoch || memo_pinned[si].size()>8192){if(!desc_memo_slot[si].empty())++xmemo_drops;memo_unpin_all(si);memo_slot_epoch[si]=memo_epoch;}}
 // End of a submit for the recording slot: frame-local entries go (their snapshots are per submit); persistent ones stay.
 void desc_memo_reset(){img_cache.clear();
     if(!xmemo_enabled){memo_unpin_all(slot_index);return;}
-    auto &m=desc_memo_slot[slot_index];for(auto it=m.begin();it!=m.end();){if(it->second.persistent)++it;else it=m.erase(it);}}
+    // Sweep only when the slot holds frame-local entries: walking its ~600-800 persistent entries every submission to find
+    // none was ~1% of the D2R camp's render thread on the Redmi K50 Ultra.
+    if(!desc_memo_local[slot_index])return;
+    auto &m=desc_memo_slot[slot_index];for(auto it=m.begin();it!=m.end();){if(it->second.persistent)++it;else it=m.erase(it);}desc_memo_local[slot_index]=0;}
 Buffer &support_block(){size_t n=1392;auto k=std::make_pair(state.viewport.width,state.viewport.height);
     auto it=support_static.find(k);if(it!=support_static.end())return it->second;
     Buffer s=static_arena.alloc(uniform_range(n));xbg_support_defaults(s.mapped,state.viewport.width,state.viewport.height);s.flush();return support_static.emplace(k,s).first->second;}
@@ -2027,7 +2031,7 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                 out.entry=m.entry;out.set=m.set;out.pipeline_layout=m.pipeline_layout;out.dynamic_offsets=offsets;++desc_memo_hits;if(m.persistent)++xmemo_hits;desc_ns[5]+=perf_clock()-tm0;return;}
                 ++desc_memo_why[3];
                 if(m.persistent){auto pin=memo_pinned[slot_index].find(m.set);if(pin!=memo_pinned[slot_index].end() && --pin->second.refs==0){slots[slot_index].used_sets[pin->second.layout].push_back(m.set);memo_pinned[slot_index].erase(pin);}}
-                desc_memo.erase(hit);}}
+                if(!m.persistent && desc_memo_local[slot_index])--desc_memo_local[slot_index];desc_memo.erase(hit);}}
     }
     desc_ns[0]+=perf_clock()-tm0;
     desc_memo_images.clear();desc_memo_dyn.clear();desc_memo_texel.clear();desc_memo_texel_fail=false;desc_memo_recording=ok;
@@ -2045,7 +2049,7 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
         if(dm.persistent){unsigned si=slot_index;VkDescriptorSetLayout lay=out.entry->layout;
             auto pin=memo_pinned[si].find(out.set);if(pin!=memo_pinned[si].end())++pin->second.refs;
             else{auto &u=slots[si].used_sets[lay];for(size_t i=0;i<u.size();i++)if(u[i]==out.set){u[i]=u.back();u.pop_back();break;}memo_pinned[si].emplace(out.set,PinRef{lay,1});}}
-        desc_memo.emplace(key,std::move(dm));}
+        bool local=!dm.persistent;if(desc_memo.emplace(key,std::move(dm)).second && local)++desc_memo_local[slot_index];}
 }
 void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCOPE(Descriptor);DescriptorRoot descriptor_measurement(&cpu_scope);
     // Uniform buffers use dynamic offsets (when the set fits the device limit) so per-draw constants do not change set contents.
