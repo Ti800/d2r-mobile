@@ -19,6 +19,8 @@ enum { DRAW_JOY = 12, DRAW_SWAP = 13, DRAW_DIFF = 14, DRAW_PICK0 = 15 };
 static const char *case_name = "startup";
 static unsigned checks, cases;
 static uint64_t test_clock_ns = UINT64_C(100000000000), test_sample;
+static int observed_panel;
+static unsigned panel_calls;
 
 #define REQUIRE(expression) do { \
     ++checks; \
@@ -99,9 +101,12 @@ void dm_belt_use(int col, int row) { (void)col; (void)row; unexpected_host_call(
 void dm_shop_sell_cursor(void) { unexpected_host_call(__func__); }
 void dm_tp_request(void) { unexpected_host_call(__func__); }
 
-/* No stub for dm_uiscreen_set_panel is needed: uimsg is not exercised, and
- * --gc-sections discards that unused function. Do not link host product code.
- */
+/* 观测真实桥发出的面板模式；不依赖链接器删除未用代码，不链接产品宿主。
+ * Observe the real bridge's panel mode without relying on linker garbage collection or linking the product host. */
+void dm_uiscreen_set_panel(int panel) {
+    REQUIRE(panel==0 || panel==1);
+    observed_panel=panel; ++panel_calls;
+}
 static void fixture(int navigation) {
     memset(&tc, 0, sizeof tc);
     memset(&scene, 0, sizeof scene);
@@ -112,6 +117,7 @@ static void fixture(int navigation) {
     seen_world = seen_mouse = seen_tab = seen_use = seen_ident = seen_long = seen_item = seen_stack = 0;
     frontend = 0; fe_slot = -1; fe_drag = 0; fe_x0 = fe_y0 = 0;
     test_clock_ns = UINT64_C(100000000000); test_sample = 0;
+    observed_panel=-1; panel_calls=0;
     dm_tc_set_safe_insets(0, 0); dm_tc_set_edge_bottom(0); dm_tc_set_safe_bottom(0); dm_tc_set_swap_above(0);
     dm_tc_set_panel_state(0); dm_tc_set_tap_box(0); dm_tc_set_cur_stack(0); dm_tc_set_hover_unid(0);
     init_locked();
@@ -333,6 +339,31 @@ static void test_android_swap_release_cancel(void) {
     queue_sample(); REQUIRE(tc.skill_set==1);
 }
 
+/* 从加载进入游戏、开关背包、只开NPC对话时，宿主面板模式必须各自正确。
+ * Host panel mode must distinguish entering gameplay, opening/closing inventory and an NPC-dialog-only stack. */
+static void test_android_panel_observation(void) {
+    fixture(0);
+    dm_android_touch_uimsg(NULL,"UnloadPanel","LoadScreenPanel");
+    REQUIRE(panel_calls==0 && observed_panel==-1);
+    dm_android_touch_uimsg("PanelManager","UnloadPanel","LoadScreenPanel");
+    REQUIRE(scene.game==1 && tc.navigation_mode==0 && observed_panel==0 && panel_calls==1);
+    dm_tc_target main=tc.layout.target[DM_TC_MAIN];
+    dm_android_touch_event(0,0,main.x,main.y);
+    REQUIRE((queue_sample()&DM_BTN_A)!=0);
+    dm_android_touch_event(2,0,main.x,main.y);
+    REQUIRE(head!=tail);
+    dm_android_touch_uimsg("PanelManager","OpenPanel","PlayerInventoryExpansionLayout");
+    REQUIRE(tc.navigation_mode!=0 && observed_panel==1 && panel_calls==2);
+    REQUIRE(tc.buttons==0 && head==tail && !tc.finger[0].active);
+    dm_android_touch_uimsg("PanelManager","UnloadPanel","PlayerInventoryExpansionLayout");
+    REQUIRE(tc.navigation_mode==0 && observed_panel==0 && panel_calls==3);
+    dm_android_touch_uimsg("PanelManager","OpenPanel","NpcDialogPanel");
+    REQUIRE(tc.navigation_mode!=0 && dm_tc_scene_dialog_only(&scene));
+    REQUIRE(observed_panel==0 && panel_calls==4);
+    dm_android_touch_uimsg("PanelManager","UnloadAll","");
+    REQUIRE(tc.navigation_mode==0 && observed_panel==0 && panel_calls==5);
+}
+
 static void run_case(const char *name, void (*body)(void)) {
     case_name = name; body(); ++cases; printf("PASS %s\n", name);
 }
@@ -351,6 +382,7 @@ int main(void) {
     run_case("android_focus_cancel", test_android_focus_cancel);
     run_case("android_cancelled_latch", test_android_cancelled_latch);
     run_case("android_swap_release_cancel", test_android_swap_release_cancel);
+    run_case("android_panel_observation", test_android_panel_observation);
     printf("RESULT PASS cases=%u assertions=%u; game_quick_taps_10_of_10=NOT_TESTED\n", cases, checks);
     return 0;
 }
