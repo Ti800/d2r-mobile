@@ -55,7 +55,7 @@ screen is not implemented.
 | App internal `files/dm/shaders/` | External `.xgs` bundles matching the game and Vulkan backend |
 | App internal `files/dm/overlay/` | Required CASC touch overlay, including `overlay.manifest`, generated from the matching source and the user's resources |
 | App internal `files/dm/overlay/touchart/` | Optional locally generated `dm_touch_joy.png`; otherwise the UI draws a fallback joystick |
-| Shared `Download/data/` | User's resource archives and `.build.config`; requires Android's all-files-access setting |
+| Shared `Download/S2X/D2R Mobile/data/` | User's resource archives and `.build.config`; requires Android's all-files-access setting |
 | App internal `files/save/` | Saves; preserve during upgrades |
 | App internal `files/temp/`, `files/dm/boot.log` | Temporary files and appended startup logs |
 

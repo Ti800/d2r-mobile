@@ -38,7 +38,7 @@ APK 和 Git 仓库均不含游戏程序、着色器、游戏美术或存档。�
 | 应用内部 `files/dm/shaders/` | 与游戏及 Vulkan 后端匹配的仓外 `.xgs` 包 |
 | 应用内部 `files/dm/overlay/` | 必需 CASC 触摸覆盖层，含 `overlay.manifest`，由匹配源码及用户资源生成 |
 | 应用内部 `files/dm/overlay/touchart/` | 可选本地生成的 `dm_touch_joy.png`；没有时绘制备用摇杆 |
-| 共享 `Download/data/` | 用户资源档案及 `.build.config`，需要安卓“所有文件访问”授权 |
+| 共享 `Download/S2X/D2R Mobile/data/` | 用户资源档案及 `.build.config`，需要安卓“所有文件访问”授权 |
 | 应用内部 `files/save/` | 存档，升级时必须保留 |
 | 应用内部 `files/temp/`、`files/dm/boot.log` | 临时文件及追加写入的启动日志 |
 

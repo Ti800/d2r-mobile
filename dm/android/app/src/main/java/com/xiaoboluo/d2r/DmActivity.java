@@ -72,8 +72,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (c != null) { c.hide(WindowInsets.Type.systemBars()); c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE); }
     }
 
-    // 资源在玩家放的位置读（缺省 下载/data），要「所有文件访问」权限；没有就引导去系统设置页，回来再启动
-    // Resources are read where the player put them (default Download/data), which needs "all files access"; without it, guide the player to the system settings page and start after returning
+    // 资源在玩家放的位置读（缺省 Download/S2X/D2R Mobile/data），要「所有文件访问」权限；没有就引导去系统设置页，回来再启动
+    // Resources are read where the player put them (default Download/S2X/D2R Mobile/data), which needs "all files access"; without it, guide the player to the system settings page and start after returning
     private boolean ensureFileAccess() {
         if (Environment.isExternalStorageManager()) return true;
         TextView t = new TextView(this);
@@ -114,7 +114,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (ext == null) { showStartError(getString(R.string.dmandroidstorage)); return; }
         nativeSurface(view.getHolder().getSurface(), view.getWidth(), view.getHeight());
         updateRefresh();
-        String src = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "data").getAbsolutePath();
+        String src = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "S2X/D2R Mobile/data").getAbsolutePath();
         int result = nativeStart(getFilesDir().getAbsolutePath(), ext.getAbsolutePath(), src, Locale.getDefault().toLanguageTag());
         if (result < 0) {
             int resource = switch (result) {
