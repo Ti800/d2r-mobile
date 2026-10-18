@@ -22,6 +22,24 @@ if(NOT DM_GEN_DIR OR NOT EXISTS ${DM_GEN_DIR}/dm_vault_tab.h)
 endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# App 与资源共享公开生成源码的指纹；输入清单由同一工具提供，变动会重新生成头文件。
+# The app and resources share a fingerprint of public generator inputs; one tool supplies the dependencies.
+set(DM_OVERLAY_TOOL ${DM}/ios/tools/overlay_contract.py)
+get_filename_component(DM_REPO_ROOT ${DM}/.. ABSOLUTE)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${DM_OVERLAY_TOOL})
+execute_process(COMMAND ${Python3_EXECUTABLE} ${DM_OVERLAY_TOOL} --inputs
+  OUTPUT_VARIABLE overlay_inputs RESULT_VARIABLE overlay_result OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT overlay_result EQUAL 0)
+  message(FATAL_ERROR "Cannot read overlay contract dependencies")
+endif()
+string(REPLACE "\r\n" "\n" overlay_inputs "${overlay_inputs}")
+string(REPLACE "\n" ";" overlay_inputs "${overlay_inputs}")
+list(TRANSFORM overlay_inputs PREPEND "${DM_REPO_ROOT}/")
+set(DM_OVERLAY_HEADER ${CMAKE_CURRENT_BINARY_DIR}/dm_overlay_contract.h)
+add_custom_command(OUTPUT ${DM_OVERLAY_HEADER}
+  COMMAND ${Python3_EXECUTABLE} ${DM_OVERLAY_TOOL} --repo-root ${DM_REPO_ROOT} --header ${DM_OVERLAY_HEADER}
+  DEPENDS ${overlay_inputs} VERBATIM)
+
 # Python 保留 Makefile 续行边界，避免 CMake 列表的反斜杠转义吞掉源码行。
 # Python preserves Makefile continuations instead of CMake list escaping joining them.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${HOST}/Makefile ${CMAKE_CURRENT_SOURCE_DIR}/tools/host_sources.py)
@@ -77,6 +95,7 @@ target_link_options(dmhost PRIVATE -Wl,--no-undefined -Wl,-z,nostart-stop-gc -Wl
 add_library(dm_app_main OBJECT ${HOST}/main.c)
 target_link_libraries(dm_app_main PRIVATE dmcore)
 target_compile_definitions(dm_app_main PRIVATE main=dm_main)
-add_library(dm SHARED $<TARGET_OBJECTS:dm_app_main> ${CMAKE_CURRENT_SOURCE_DIR}/jni_android.c ${CMAKE_CURRENT_SOURCE_DIR}/text_input_jni.c ${CMAKE_CURRENT_SOURCE_DIR}/touch_android_jni.c)
+add_library(dm SHARED $<TARGET_OBJECTS:dm_app_main> ${CMAKE_CURRENT_SOURCE_DIR}/jni_android.c ${CMAKE_CURRENT_SOURCE_DIR}/text_input_jni.c ${CMAKE_CURRENT_SOURCE_DIR}/touch_android_jni.c ${CMAKE_CURRENT_SOURCE_DIR}/overlay_validate.c ${DM_OVERLAY_HEADER})
+target_include_directories(dm PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(dm PRIVATE -Wl,--whole-archive dmcore -Wl,--no-whole-archive android)
 target_link_options(dm PRIVATE -Wl,--no-undefined -Wl,-z,nostart-stop-gc -Wl,-Bsymbolic)   # 汇编按页寻址宿主全局（adrp + :lo12:）：库内符号就地绑定，不许被抢占 | assembly addresses host globals by page (adrp + :lo12:): symbols bind locally inside the library and cannot be preempted

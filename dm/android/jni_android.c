@@ -23,6 +23,8 @@
 #include "vulkan_present.h"
 #include "touch_android.h"
 #include "lifecycle_dispatch.h"
+#include "overlay_validate.h"
+#include "dm_overlay_contract.h"
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -159,8 +161,16 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     } closedir(shaders); }
     if (!have_shader) { LOG("boot: no shader bundles in %s", required); return -4; }
     snprintf(required, sizeof required, "%s/overlay", g_runtime);
-    struct stat overlay_stat;
-    if (!stat(required, &overlay_stat) && S_ISDIR(overlay_stat.st_mode)) setenv("DM_ROMFS_OVERLAY", required, 1);
+    // 启动前核必需覆盖层；旧资源不能自动补指纹，也不能带着错误资源进入游戏。
+    // Validate the required overlay before starting; never stamp old resources or enter with mismatched content.
+    char overlay_reason[256];
+    dm_overlay_result overlay = dm_overlay_validate(required, DM_OVERLAY_SOURCE_SHA256, overlay_reason, sizeof overlay_reason);
+    if (overlay != DM_OVERLAY_OK) {
+        LOG("boot: overlay rejected (%d): %s", overlay, overlay_reason);
+        return overlay == DM_OVERLAY_MISSING ? -9 : -10;
+    }
+    LOG("boot: overlay verified source=%s", DM_OVERLAY_SOURCE_SHA256);
+    setenv("DM_ROMFS_OVERLAY", required, 1);
     if (!lifecycle_ready()) return -8;
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
     pthread_t th; int rc = pthread_create(&th, &a, host_thread, NULL); pthread_attr_destroy(&a);

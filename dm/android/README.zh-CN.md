@@ -36,7 +36,7 @@ APK 和 Git 仓库均不含游戏程序、着色器、游戏美术或存档。�
 | --- | --- |
 | 应用内部 `files/dm/out/` | 使用 `DM_TARGET=android` 生成的 `main`、`sdk` 改写产物，含 patched 模块、fixups 和 gates |
 | 应用内部 `files/dm/shaders/` | 与游戏及 Vulkan 后端匹配的仓外 `.xgs` 包 |
-| 应用内部 `files/dm/overlay/` | 可选 CASC 触摸覆盖层，由当前源码及用户资源生成 |
+| 应用内部 `files/dm/overlay/` | 必需 CASC 触摸覆盖层，含 `overlay.manifest`，由匹配源码及用户资源生成 |
 | 应用内部 `files/dm/overlay/touchart/` | 可选本地生成的 `dm_touch_joy.png`；没有时绘制备用摇杆 |
 | 共享 `Download/data/` | 用户资源档案及 `.build.config`，需要安卓“所有文件访问”授权 |
 | 应用内部 `files/save/` | 存档，升级时必须保留 |
@@ -60,3 +60,5 @@ java -cp /tmp/dm-input-tests com.xiaoboluo.d2r.TextInputRulesTest
 真机验收须分别记录安装、真实 GPU 出图/帧率、建角、进局、移动停止、NPC 交互、背包/技能、声音、后台恢复及保存重进。无窗口宿主帧率不等于渲染帧率。本后端尚未接入 Metal GPU 计时及实际扫描显示时间，缺失读数不能当作零耗时。
 
 Vulkan 当前每次全画，并使用同步宿主翻译（`DM_NVN_SYNC=1`）；上游新增异步路径需独立审计对象生命周期。呈现层仍逐帧等待队列。iOS 技能图、空技能槽菜单、专用数量/属性加点浮层及商店拖动跟随图尚未完整实现，通用控件和系统输入框不代表完整 iOS 功能对齐。提交上游集成前，还须在 Apple 构建机上验证 macOS/iOS 回归。
+
+覆盖层生成器将源码指纹和逐文件哈希写入 `overlay.manifest`，APK 编入同一生成器输入指纹。缺失、不完整或不匹配时，启动界面提示并在宿主线程启动前退出启动流程。须部署完整生成目录，不可把新清单贴到旧资源上，也不可在手机启动时补清单；生成器或布局修改后应重新生成。这项校验不负责认证第三方下载来源。
