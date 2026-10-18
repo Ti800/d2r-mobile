@@ -241,6 +241,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // Validate the required overlay before starting; never stamp old resources or enter with mismatched content.
     char overlay_reason[256];
     dm_overlay_result overlay = dm_overlay_validate(required, DM_OVERLAY_SOURCE_SHA256, overlay_reason, sizeof overlay_reason);
+    if (overlay == DM_OVERLAY_OK) overlay = dm_overlay_require_touch_art(required, overlay_reason, sizeof overlay_reason);
     if (overlay != DM_OVERLAY_OK) {
         LOG("boot: overlay rejected (%d): %s", overlay, overlay_reason);
         return overlay == DM_OVERLAY_MISSING ? -9 : -10;
