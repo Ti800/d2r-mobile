@@ -399,9 +399,10 @@ std::vector<PendingReport> pending_reports;
 // publishes the value when that submission's slot retires (as the Metal backend writes it from a completion handler).
 // '2' does not submit at the signal: the value waits in the slot being recorded and is published when that slot retires,
 // so a frame stays one submission and the 2-slot ring does not wrap inside it.
-// The game reads event values only through nvnEventGetValue, which resolves first (xbg_game_event_read).
-// Without the marker the host may set the default through DM_GFX_DEFER_EVENTS (the Android app sets 2); a marker '0' turns
-// deferral off.
+// The game reads event values only through nvnEventGetValue, and the host's CPU event initialize, finalize and signal land a
+// pending value first (xbg_game_event_read); a command-buffer wait on an event with a pending value completes the GPU work
+// first (main's 07ea121). Without the marker the host may set the default through DM_GFX_DEFER_EVENTS (the Android app sets
+// 2); a marker '0' turns deferral off.
 struct PendingEvent {uint64_t addr;uint32_t mode,v;const void *slot;};
 std::vector<PendingEvent> pending_events,recording_events;   // recording_events: mode 2, slot not yet submitted
 int defer_events=0;uint64_t events_deferred=0,event_reads=0;
@@ -3008,7 +3009,9 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_COUNT_+3:execute_indirect(payload<xbg_indirect>(p,n),false);break;
         case OP_COUNT_+7:execute_draw_call(payload<xbg_draw_call>(p,n));break;
         case OP_COUNT_+8:execute_indirect(payload<xbg_indirect>(p,n),true);break;
-        case OP_COUNT_+4:{auto a=payload<xbg_wait_event>(p,n);need(a.address && a.mode<=1,"Invalid event wait");auto deadline=std::chrono::steady_clock::now()+std::chrono::nanoseconds(cfg.fence_timeout_ns);for(;;){uint32_t value=__atomic_load_n(reinterpret_cast<uint32_t*>(a.address),__ATOMIC_ACQUIRE);if(a.mode==0?value==a.value:int32_t(value-a.value)>=0)break;need(std::chrono::steady_clock::now()<deadline,"NVN event wait timeout");std::this_thread::yield();}break;}
+        case OP_COUNT_+4:{auto a=payload<xbg_wait_event>(p,n);need(a.address && a.mode<=1,"Invalid event wait");
+            for(auto *list:{&pending_events,&recording_events})if(std::any_of(list->begin(),list->end(),[&](const PendingEvent &e){return e.addr==a.address;})){complete_all();break;}
+            auto deadline=std::chrono::steady_clock::now()+std::chrono::nanoseconds(cfg.fence_timeout_ns);for(;;){uint32_t value=__atomic_load_n(reinterpret_cast<uint32_t*>(a.address),__ATOMIC_ACQUIRE);if(a.mode==0?value==a.value:int32_t(value-a.value)>=0)break;need(std::chrono::steady_clock::now()<deadline,"NVN event wait timeout");std::this_thread::yield();}break;}
         case OP_COUNT_+5:state.bounds=payload<xbg_depth_bounds>(p,n);break;
         case OP_COUNT_+6:resolve_texture(payload<p_copy_t2t>(p,n));break;
         case OP_RESET_COUNTER:{uint64_t type=payload<uint64_t>(p,n);need(type==NVN_COUNTER_TYPE_SAMPLES_PASSED,"Unsupported pipeline counter reset");state.samples_passed=0;end_open_query();++counter_epoch;state.count_samples=true;++counter_ops[0];break;}   // the open run belongs to the old epoch
@@ -3119,6 +3122,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
 // nvnEventGetValue on a deferred event: finish the GPU work the signal covers, then the value is published (apply_ready_events).
 extern "C" int xbg_evguard_fault(void *addr,int is_write,void *uc){return evguard::enabled?evguard::fault(addr,is_write,uc):0;}
 extern "C" void xbg_game_event_read(const void *addr){
+    gfx_drain();
     std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized || failed)return;
     for(auto *list:{&pending_events,&recording_events})for(auto &e:*list)if(e.addr==uint64_t(reinterpret_cast<uintptr_t>(addr))){++event_reads;complete_all();return;}
 }
