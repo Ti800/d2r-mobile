@@ -103,7 +103,7 @@ static thr_t *pick(int kind, uint64_t a) {
     }
     return b;
 }
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); }
+static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->wres = res; __atomic_store_n(&t->woke, 1, __ATOMIC_RELEASE); pthread_cond_signal(&t->cv); }   // woke last: block_inner may poll it without G
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
@@ -115,6 +115,15 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {   // 启动时间线：�
     if (t->handle == 0x1001) dm_prof_add(PROF_MAIN_WAIT, d, 0);
     return r;
 }
+// 主线程的短等待先自旋再睡：D2R 主线程每帧约 45 次等工作线程持有的客体锁，81% 只等 10–25 µs（Redmi K50 Ultra 营地），其中大半是
+// futex 睡下、唤醒与核心退出空闲的开销，而不是持锁时间。先照常登记为等待者（交接仍会选中它），放开 G，轮询自己的 woke 至多
+// g_spin_ns，再照旧睡。宿主不要求就不开：DM_HLE_SPIN_US（安卓 App 设置）；只有客体主线程自旋。
+// Short waits of the main thread spin before they sleep. D2R's main thread waits ~45 times a frame on guest locks held by its
+// job workers, 81% of them for 10-25 us (Redmi K50 Ultra camp), and most of that is the futex sleep, the wake-up and the
+// core's idle exit rather than the holder. The thread registers as a waiter as before (so a handoff still picks it), releases
+// G and polls its woke flag for up to g_spin_ns, then sleeps as before. Off unless the host asks: DM_HLE_SPIN_US (the Android
+// app sets it); only the guest main thread spins.
+static uint64_t g_spin_ns; static int g_spin_init;
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
@@ -123,6 +132,18 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
     if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
+    if (!g_spin_init) { const char *e = getenv("DM_HLE_SPIN_US"); g_spin_ns = e ? (uint64_t)atoi(e) * 1000 : 0; g_spin_init = 1; }   // under G
+    if (g_spin_ns && t->handle == 0x1001 && (ns < 0 || (uint64_t)ns > g_spin_ns)) {
+        pthread_mutex_unlock(&G);
+        uint64_t end = now_ns() + g_spin_ns;
+        while (!__atomic_load_n(&t->woke, __ATOMIC_ACQUIRE) && now_ns() < end) {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        }
+        pthread_mutex_lock(&G);
+        if (t->woke) return t->wres;   // woken while spinning: wres was written under G before the waker released it
+    }
     while (!t->woke) {
         int rc;
         if (det_wait) {
