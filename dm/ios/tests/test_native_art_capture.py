@@ -2,6 +2,7 @@
 """素材采图契约与原素材哈希；不把synthetic snapshot当游戏身份。 | Asset capture contract and original asset hashes; a synthetic snapshot is not treated as game identity."""
 import argparse,hashlib,json,re
 from pathlib import Path
+from PIL import Image
 import os; DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
 IOS=Path(__file__).resolve().parent.parent
 sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
@@ -23,7 +24,10 @@ try:
  assert manifest['geometry_sha256']==sha(IOS/'docs/native_art_v1_geometry.json')
  assert manifest['binding_protocol_sha256']==sha(IOS/'docs/touch_layout_spec_native_binding_v5.json')
  for a in manifest['assets']:
-  assert sha(IOS/'Sources/TouchArt'/a['asset'])==a['derived_png_sha256']==a['decoded_png_sha256']
+  with Image.open(IOS/'Sources/TouchArt'/a['asset']) as image:
+   rgba=image.convert('RGBA')
+   assert list(rgba.size)==a['atlas_px'], a['asset']+' dimensions'
+   assert hashlib.sha256(rgba.tobytes()).hexdigest()==a['decoded_rgba_sha256'], a['asset']+' RGBA pixels'
   assert a['pixel_format_code']==61 and len(a['official_sprite_md5'])==32 and len(a['official_sprite_sha256'])==64
  import os,sys
  romfs=os.environ.get('DM_ROMFS_SRC') or os.path.join(DM_ROOT, 'data/switch/3.3.94012/Update/RomFS')   # 两张技能表不进仓库，从游戏文件现读核哈希 | the two skill tables are not kept in the repository; read fresh from the game files and verify the hashes
@@ -35,6 +39,6 @@ try:
    assert hashlib.md5(raw).hexdigest()==table['official']['ckey_md5']
  else: print('（这台机器没有游戏文件，跳过两张技能表的哈希核对）')
  assert len(manifest['assets'])==12
- print('PASS native_art_capture: 3/3 real C hash constants match actual files; geometry+binding hashes distinct; 12/12 decoded PNG hashes; 2/2 frozen official tables SHA+MD5')
+ print('PASS native_art_capture: 3/3 real C hash constants match actual files; geometry+binding hashes distinct; 12/12 dimensions and RGBA pixel hashes; 2/2 frozen official tables SHA+MD5')
 except AssertionError as e:
  print(f'FAIL: {e}');raise SystemExit(1)

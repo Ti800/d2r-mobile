@@ -26,8 +26,15 @@ STEPS = [('加宽储藏箱', ['gen_widestash_art.py', '{R}']), ('编年史盖板
          ('技能图集与索引', ['native_art/generate.py', '{R}']), ('底部 UI v4', ['gen_hud_v4.py', '{R}'])]
 
 
-def stamp(R):
+def python_command(script, *arguments):
+    # 每个生成子进程使用 UTF-8 和 LF；保留调用方已有的只读 RomFS 适配器。
+    # Every generator subprocess uses UTF-8 and LF while retaining an existing read-only RomFS adapter.
+    return [sys.executable, '-X', 'utf8', os.path.join(HERE, '..', '..', 'tools', 'winlf', 'run.py'), script, *arguments]
+
+
+def stamp(R, overlay_only=False):
     h = hashlib.sha256(open(os.path.join(R, 'data', 'build_manifest.psv'), 'rb').read())
+    h.update(b'\0overlay-only\0' if overlay_only else b'\0full-assets\0')
     for d, ds, fs in sorted(os.walk(HERE)):
         ds[:] = sorted(x for x in ds if x != '__pycache__')
         for f in sorted(fs): h.update(os.path.relpath(os.path.join(d, f), HERE).encode()); h.update(open(os.path.join(d, f), 'rb').read())
@@ -36,11 +43,18 @@ def stamp(R):
     return h.hexdigest()
 
 
-def ensure(R):
+def ensure(R, overlay_only=False):
     """产物齐、指纹没变就直接返回；否则拿锁生成。返回 True = 这次重出了。 | If the build output is complete and the fingerprint unchanged, return directly; otherwise take the lock and generate. Returns True = regenerated this time."""
     root = gen_paths.gen_dir(); st = os.path.join(root, '.stamp'); lock = os.path.join(root, '.gen_lock')
-    outs = [os.path.join(root, 'NativeHUD', 'v4', 'base.png'), os.path.join(HERE, '..', 'Sources', 'TouchArt', 'dm_native_skill_0.png'), os.path.join(HERE, '..', 'Sources', 'dm_touch_native_art.c')]
-    want = stamp(R); fresh = lambda: all(map(os.path.isfile, outs)) and os.path.isfile(st) and open(st).read() == want
+    v4 = os.path.join(root, 'NativeHUD', 'v4')
+    outs = [os.path.join(v4, 'base.png'), os.path.join(v4, 'hud.json'), os.path.join(v4, 'hud_v4_ui', 'ui.json')]
+    if not overlay_only:
+        outs += [os.path.join(HERE, '..', 'Sources', 'TouchArt', 'dm_native_skill_0.png'),
+                 os.path.join(HERE, '..', 'Sources', 'dm_touch_native_art.c'),
+                 os.path.join(v4, 'hud_v4_ui', 'sil_dm_native_skill_0.png')]
+    # 两种范围共享目录及锁，模式写进同一 stamp，不能把精简产物当成完整 iOS 产物。
+    # Both scopes share outputs and one lock; one mode-sensitive stamp prevents reusing overlay-only output as full iOS assets.
+    want = stamp(R, overlay_only=overlay_only); fresh = lambda: all(map(os.path.isfile, outs)) and os.path.isfile(st) and open(st).read() == want
     if fresh(): return False
     t0 = time.time()
     while True:
@@ -57,14 +71,16 @@ def ensure(R):
         open(os.path.join(lock, 'pid'), 'w').write(str(os.getpid()))
         if fresh(): return False   # 等锁期间别人已经生成好了 | Someone else already generated it while we waited for the lock
         if os.path.exists(st): os.remove(st)
-        run_steps(R); open(st, 'w').write(want); return True
+        run_steps(R, overlay_only=overlay_only); open(st, 'w').write(want); return True
     finally: shutil.rmtree(lock, ignore_errors=True)
 
 
-def run_steps(R):
+def run_steps(R, overlay_only=False):
     for name, cmd in STEPS:
-        t0 = time.time(); r = subprocess.run([sys.executable] + [os.path.join(HERE, c) if i == 0 else c.replace('{R}', R) for i, c in enumerate(cmd)],
-                                            capture_output=True, text=True)
+        if overlay_only and cmd[0] == 'native_art/generate.py': continue
+        argv = python_command(os.path.join(HERE, cmd[0]), *[c.replace('{R}', R) for c in cmd[1:]])
+        if overlay_only and cmd[0] == 'gen_hud_v4.py': argv.append('--overlay-only')
+        t0 = time.time(); r = subprocess.run(argv, capture_output=True, text=True)
         if r.returncode: sys.exit('🔴 生成「%s」失败：\n%s%s' % (name, r.stdout[-1500:], r.stderr[-1500:]))
         tip = [l for l in r.stdout.splitlines() if l.startswith(('没找到', '底栏素材'))]
         print('%s：%.1f 秒%s' % (name, time.time() - t0, ('（' + tip[0] + '）') if tip else ''))
