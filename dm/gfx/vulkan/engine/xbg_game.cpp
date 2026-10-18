@@ -1,3 +1,5 @@
+// NVN到Vulkan回放与资源生命周期；依据项目Vulkan基线及PR9/10的分批适配。
+// NVN-to-Vulkan replay and resource lifetimes, based on the project Vulkan baseline and adapted PR9/10 batches.
 #include "../../nvn/nvn_copy_pitch.h"
 #include <pthread.h>
 #include "xbg_game_internal.h"
@@ -167,16 +169,13 @@ thread_local XbgCpuTiming *timing_current=nullptr;
 uint64_t timing_first=0,timing_last=0,timing_start_ns=0;
 xbg_game_stats timing_before{};
 bool timing_active=false;
-// Color images are created without MUTABLE_FORMAT, which on Adreno keeps UBWC compression for render targets (Redmi K50 Ultra
-// camp: GPU 42 -> 36 ms, 21.2 -> 23.8 fps). A view in a different format upgrades the image in place (upgrade_mutable), as
-// nvn_mtl.m tex_upgrade_pfv does for Metal's lossless compression. Marker gfx-mutable-images = '1' creates every color
-// image mutable, as before.
+// 默认颜色图不带 MUTABLE_FORMAT；异格式 view 触发原地升级，gfx-mutable-images=1 回退原创建路径。
+// Color images omit MUTABLE_FORMAT by default; differing view formats trigger an in-place upgrade, and gfx-mutable-images=1 restores the original creation path.
 bool no_mutable_images=true;uint64_t mutable_upgrades=0;unsigned mutable_test=0; // mutable_test (marker gfx-mutable-test = N): force the upgrade on every Nth color image when first sampled (test)
 struct Image;void upgrade_mutable(Image &im);
 bool perf_timing=true; // always-on wall-time breakdown for NVN PERF (exclusive deltas)
-// Every scope reads the clock twice (~95k reads per D2R camp frame; ~105 ns each through the vDSO on Adreno 730
-// phones, ~19% of the render thread). Time one frame in perf_sample (marker gfx-perf-sample = N; 1 = every frame,
-// 0 = off); parts and descriptor lines are averaged over the timed frames.
+// 按 gfx-perf-sample 指定的帧间隔采样 CPU 细项；0 关闭，细项均值只统计已采样帧。
+// Sample CPU parts at the gfx-perf-sample frame interval; zero disables sampling and averages use sampled frames only.
 unsigned perf_sample=8;bool perf_frame_timed=true;uint64_t perf_timed_frames=0;
 XbgCpuTiming::Counter perf_timing_before[XbgCpuTiming::Count];
 bool descriptor_detail=false;
@@ -208,7 +207,7 @@ struct TimingRoot {
     ~TimingRoot(){timing_current=previous;}
 };
 #define CPU_SCOPE(kind) XbgCpuTiming::Scope cpu_scope(timing_current,XbgCpuTiming::kind)
-inline uint64_t perf_clock(){return timing_current?timing_clock():0;}   // hot-path sub-timers: free on untimed frames
+inline uint64_t perf_clock(){return timing_current?timing_clock():0;}   // 未采样帧不读细项时钟 | Skip sub-timer clocks on unsampled frames
 void timing_start(){
     timing_active=true;timing_start_ns=timing_clock();pipeline_before=pipeline_counts;
     timing_before={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};
@@ -285,7 +284,8 @@ uint32_t find_memory(uint32_t bits,VkMemoryPropertyFlags required,VkMemoryProper
     return memory_type(bits,required);
 }
 std::map<VkFormat,VkFormatProperties> format_property_cache;
-// Core formats (< 256) answer from a flat table: format_properties is asked for every vertex attribute of every draw.
+// 核心格式通过平表缓存查询，扩展格式保留原映射。
+// Cache core-format queries in a flat table and retain the map for extension formats.
 VkFormatProperties format_flat[256];bool format_flat_known[256];
 const VkFormatProperties &format_properties(VkFormat f){
     if(uint32_t(f)<256){if(!format_flat_known[f]){vkGetPhysicalDeviceFormatProperties(cfg.physical,f,&format_flat[f]);format_flat_known[f]=true;}return format_flat[f];}
@@ -358,15 +358,10 @@ struct EpochState{std::deque<EpochQuery> q;uint64_t base=0,known_upto=0,summed_u
 uint64_t counter_epoch=0;std::map<uint64_t,EpochState> epochs;
 struct PendingReport {uint64_t addr,type,epoch;size_t count;const void *slot;VkQueryPool ts;uint32_t ts_index;uint64_t ts_value;bool ts_known;};
 std::vector<PendingReport> pending_reports;
-// Command-buffer SignalEvent (4 per frame in D2R) completes when the GPU reaches it. Completing all work at the signal stalls
-// the CPU on the GPU at every signal; marker file gfx-defer-events = '1' instead submits the work so far without waiting and
-// publishes the value when that submission's slot retires (as the Metal backend writes it from a completion handler).
-// '2' does not submit at the signal: the value waits in the slot being recorded and is published when that slot retires,
-// so a frame stays one submission and the 2-slot ring does not wrap inside it.
-// 客体可能直接读取池；未证明全路径前只允许显式实验，产品默认同步。
-// Guest code may read the pool directly; until all paths are proven, deferral is experimental and the product stays synchronous.
+// 显式 gfx-defer-events=1 在事件处提交，=2 随当前槽提交，退休后按序发布；客体直接读池尚未证明，默认0同步。
+// Explicit gfx-defer-events=1 submits at the event, while =2 submits with its slot; retirement publishes in order. Guest direct pool reads remain unproven, so the default zero is synchronous.
 struct PendingEvent {uint64_t addr;uint32_t mode,v;const void *slot;};
-std::vector<PendingEvent> pending_events,recording_events;   // recording_events: mode 2, slot not yet submitted
+std::vector<PendingEvent> pending_events,recording_events;   // 模式2当前槽尚未提交 | Mode 2: the current slot is not submitted yet
 int defer_events=0;uint64_t events_deferred=0,event_reads=0;
 struct PendingWriteback {uint64_t addr,bytes;Buffer buffer;const void *slot;};
 std::vector<PendingWriteback> pending_writebacks;
@@ -395,7 +390,7 @@ int ab_period=0;bool ab_on=true;
 bool ab_frame_on=true;
 bool ab_enabled(){if(ab_period<=0)return true;ab_on=((std::chrono::steady_clock::now().time_since_epoch().count()/1000000000ll/ab_period)&1)==0;return ab_on;}
 struct Slot {
-    VkCommandBuffer cmd{};VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0; // covers: guest fence value complete once this slot retires
+    VkCommandBuffer cmd{};VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0; // 槽退休后完成的客体栅栏值 | Guest fence value completed by slot retirement
     std::vector<VkQueryPool> occlusion_pools,timestamp_pools;uint32_t occlusion_used=0,timestamp_used=0;
     Retire retire;Arena stream,readback;std::vector<VkDescriptorPool> pools;size_t pool_next=0;
     std::map<std::vector<uint64_t>,VkFramebuffer> framebuffers;
@@ -414,8 +409,8 @@ struct Slot {
     std::vector<struct Descriptors*> desc_used; // pooled per-draw descriptor records, returned after this slot's fence // handed out this frame; recycled into spare_sets after the slot fence (no per-frame pool reset)
 };
 Slot slots[2];unsigned slot_index=0;
-// Where the CPU blocks on a busy slot fence, and why slots are submitted (NVN PERF block_ms).
-// The outermost site wins, except that a ring wrap in recording_slot is always counted as ring.
+// 记录槽栅栏阻塞及提交原因；最外层调用计因，环绕等待始终记 ring。
+// Record slot-fence blocking and submission reasons; charge the outer call site except that ring waits always count as ring.
 enum SyncSite{SITE_OTHER,SITE_RING,SITE_PRESENT,SITE_EVENT,SITE_ARENA,SITE_GPU_SYNC,SITE_COMPLETE,SITE_POLL,SITE_LEGACY_WAIT,SITE_COUNT};
 int sync_site=SITE_OTHER;uint64_t block_ns[SITE_COUNT],block_calls[SITE_COUNT],submit_by[SITE_COUNT],legacy_wait_ns=0;
 struct SiteScope{int old;explicit SiteScope(int site,bool force=false):old(sync_site){if(force || sync_site==SITE_OTHER)sync_site=site;}~SiteScope(){sync_site=old;}};
@@ -425,28 +420,27 @@ uint64_t write_seq=1,barrier_seq=0; // image writes vs. last full barrier (rende
 // since the last barrier, or a layout change ends the open pass first.
 struct Image;
 void bind_cache_reset();
-// Attachment images of a pass (8 color + depth): fixed capacity, so building a Pass per draw does not allocate.
+// 渲染段附件固定最多8个颜色加1个深度，避免每次 draw 分配列表。
+// A pass has at most eight color attachments plus one depth attachment, avoiding a list allocation per draw.
 struct ImageList{Image *v[9];uint32_t n=0;void push_back(Image *i){if(n<9)v[n++]=i;}Image **begin(){return v;}Image **end(){return v+n;}Image *const *begin()const{return v;}Image *const *end()const{return v+n;}
     size_t size()const{return n;}bool empty()const{return !n;}Image *operator[](size_t i)const{return v[i];}};
 struct OpenPass {VkRenderPass pass{};VkFramebuffer framebuffer{};VkCommandBuffer cmd{};ImageList images;} open_pass;
-// Framebuffers of cached render passes, kept across frames (creating and destroying one per pass per frame was ~5% of the
-// render thread on Adreno 730). Each attachment Image lists the keys of the framebuffers that use its views; the first of
-// them to be destroyed (all GPU work that used it is complete by then) takes the framebuffer along. gfx-no-persistent-fb
-// keeps the former per-slot cache.
+// 缓存 pass 的 framebuffer 跨帧保留，引用它的首个 Image 退役时清理；gfx-no-persistent-fb 回退按槽缓存。
+// Keep cached-pass framebuffers across frames and release them with the first retired Image referencing them; gfx-no-persistent-fb restores per-slot caching.
 std::map<std::vector<uint64_t>,VkFramebuffer> persistent_framebuffers;bool persistent_fb_enabled=true;uint64_t fb_hits=0,fb_creates=0;
 void forget_framebuffers(Image &im,std::vector<VkFramebuffer> *deferred=nullptr);
-// Per-slot command pools reset whole (vkResetCommandPool) instead of resetting the command buffer: the buffer reset was
-// 3.6% of the render thread on Adreno 730. gfx-no-slot-pools keeps the shared pool. Readback arenas in host-cached memory
-// (gfx-readback-cached = '1'): GPU results read back by the CPU (storage writebacks) come from uncached memory otherwise.
+// 默认每槽独立命令池并整体重置；gfx-no-slot-pools 回退共享池，gfx-readback-cached=1 显式选择可缓存读回。
+// Use independently reset per-slot command pools by default; gfx-no-slot-pools restores the shared pool, and gfx-readback-cached=1 explicitly selects cached readback memory.
 bool slot_pools_enabled=true,readback_cached=false;
-// Resident uniform texel copies (texel_acquire, before descriptors()).
+// uniform texel 按槽驻留，具体获取在 descriptors 前定义。
+// Uniform texel copies reside per slot; acquisition is defined before descriptors.
 struct TexelKey{uint64_t base,bytes;uint32_t format;bool operator==(const TexelKey &o)const{return base==o.base&&bytes==o.bytes&&format==o.format;}};
 struct TexelKeyHash{size_t operator()(const TexelKey &k)const{uint64_t x=k.base*0x9E3779B97F4A7C15ull^k.bytes*0xC2B2AE3D27D4EB4Full^k.format;x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
-struct TexelResident{Buffer buffer;VkBufferView view{};uint64_t hash=0,used=0,gen=0,checked=0,check_epoch=0;};   // checked: verified in this submission
+struct TexelResident{Buffer buffer;VkBufferView view{};uint64_t hash=0,used=0,gen=0,checked=0,check_epoch=0;};   // 本次提交已验证 | Verified in this submission
 std::unordered_map<TexelKey,TexelResident,TexelKeyHash> texel_resident[2];Arena texel_arena[2];uint64_t texel_hole_bytes[2]={},texel_live_bytes[2]={};
 bool texel_memo_enabled=false;uint64_t texel_gen=0,texel_refreshes=0,texel_fallbacks=0,texel_evictions=0,texel_hits=0;
-// A copy verified earlier in this submission stays valid until an in-stream CPU write overlaps it (snapshot_invalidate
-// bumps texel_write_epoch), so a ~1 MB range bound by 558 draws is hashed once per frame, not per draw.
+// 本次提交已核副本复用至重叠的流内 CPU 写入；snapshot_invalidate 推进写代际。
+// Reuse a copy checked in this submission until an overlapping in-stream CPU write; snapshot_invalidate advances the write epoch.
 uint64_t texel_write_epoch=1,texel_lo=UINT64_MAX,texel_hi=0;void texel_touch(uint64_t address,uint64_t bytes);
 void texel_evict(unsigned si,bool all);
 // 显式gfx-pass-profile：每600次呈现采完整一帧的所有slot；整帧上限1024查询/32slot。
@@ -493,7 +487,8 @@ void apply_event(uint64_t addr,uint32_t mode,uint32_t v){
     snapshot_invalidate(addr,4);auto ptr=reinterpret_cast<uint32_t*>(addr);
     if(mode==NVN_EVENT_SIGNAL_MODE_ADD)__atomic_fetch_add(ptr,v,__ATOMIC_SEQ_CST);else{need(mode==NVN_EVENT_SIGNAL_MODE_WRITE,"Unknown event mode");__atomic_store_n(ptr,v,__ATOMIC_SEQ_CST);}
 }
-// Deferred events in recording order; stop at the first whose slot is still in flight (slots retire in submission order).
+// 延后事件按记录顺序发布，遇到首个未退休槽即停止。
+// Publish deferred events in recording order, stopping at the first unretired slot.
 void apply_ready_events(){
     size_t k=0;for(;k<pending_events.size();++k){const PendingEvent &e=pending_events[k];if(static_cast<const Slot*>(e.slot)->pending)break;apply_event(e.addr,e.mode,e.v);}
     pending_events.erase(pending_events.begin(),pending_events.begin()+k);
@@ -547,7 +542,7 @@ void retire_slot(Slot &s){
     for(auto &u:s.used_sets){auto &sp=s.spare_sets[u.first];sp.insert(sp.end(),u.second.begin(),u.second.end());u.second.clear();}s.set_cache.clear();
     cleanup_ns[0]+=c1-c0;cleanup_ns[1]+=c2-c1;cleanup_ns[2]+=c3-c2;cleanup_ns[3]+=c4-c3;cleanup_ns[4]+=timing_clock()-c4;
     s.pending=false;
-    if(!resolving_pending)apply_ready_events();   // after this slot's writebacks; inside resolve_pending its own copy runs first
+    if(!resolving_pending)apply_ready_events();   // 在本槽写回后发布；resolve_pending 内先复制 | Publish after slot writebacks; resolve_pending copies first
 }
 Slot &recording_slot(){
     Slot &s=slots[slot_index];
@@ -556,7 +551,7 @@ Slot &recording_slot(){
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
         s.stream.trim();s.readback.keep_chunks=1;s.readback.trim();
-        if(texel_memo_enabled && (slot_serial&15)<2)texel_evict(slot_index,false);   // this slot's copies: its previous submission retired
+        if(texel_memo_enabled && (slot_serial&15)<2)texel_evict(slot_index,false);   // 本槽旧提交已退休 | The previous submission of this slot has retired
         if(!s.cmd){if(slot_pools_enabled){VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;VK(vkCreateCommandPool(cfg.device,&cp,nullptr,&s.pool));}
             VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};a.commandPool=s.pool?s.pool:command_pool;a.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;a.commandBufferCount=1;VK(vkAllocateCommandBuffers(cfg.device,&a,&s.cmd));}
         s.readback.cached=readback_cached;
@@ -628,7 +623,7 @@ void perf_frame(){
     uint64_t now=timing_clock();if(!perf.window_start){perf.window_start=now;perf.frames=0;return;}
     if(++perf.frames<60)return;
     double wall=double(now-perf.window_start)/1e6,f=double(perf.frames);
-    const double tf=perf_timed_frames?double(perf_timed_frames):1.0;   // parts and descriptor timers come from the timed frames only
+    const double tf=perf_timed_frames?double(perf_timed_frames):1.0;   // 细项与描述符只统计已采样帧 | Parts and descriptors use sampled frames only
     xbg_logf("NVN PERF v=1 sync=%d frames=%llu wall_ms=%.1f fps=%.2f submit_cpu_ms=%.2f present_cpu_ms=%.2f gpu_ms=%.2f gpu_samples=%llu submits=%.2f waits=%.2f sync_wb=%llu sync_rb=%llu sync_q=%llu ops=%.1f folded=%.1f passes=%.1f draws=%.1f dispatches=%.1f why=w%llu/p%llu/a%llu(%llu,%llu,%llu,%llu,%llu,%llu|%llu,%llu,%llu,%llu)/c%llu/f%llu/s%llu views=%llu snap_hit=%llu snap_miss=%llu snap_mb=%.1f arena_peak_mb=%.1f pipelines=%zu layouts=%zu samplers=%zu passes=%zu images=%zu host_segments=%zu host_mb=%.1f",
         int(sync_mode),(unsigned long long)perf.frames,wall,f*1000.0/wall,double(perf.submit_cpu_ns)/1e6/f,double(perf.present_cpu_ns)/1e6/f,perf.gpu_samples?double(perf.gpu_ns)/1e6/f:-1.0,(unsigned long long)perf.gpu_samples,
         double(perf.submits)/f,double(perf.waits)/f,(unsigned long long)perf.sync_writeback,(unsigned long long)perf.sync_readback,(unsigned long long)perf.sync_query,double(perf.ops)/f,double(perf.folded_clears)/f,double(perf.passes)/f,double(perf.draws)/f,double(perf.dispatches)/f,
@@ -684,7 +679,7 @@ Buffer stream_buffer(size_t n,const void *data=nullptr,size_t copy=0,bool zero=t
 Buffer readback_buffer(size_t n,const void *data=nullptr,size_t copy=0){
     Buffer b=recording_slot().readback.alloc(n);
     if(data && copy){need(copy<=n,"Buffer copy overflow");memcpy(b.mapped,data,copy);}else copy=0;
-    if(copy<n)memset(static_cast<uint8_t*>(b.mapped)+copy,0,n-copy);   // only the bytes the copy leaves
+    if(copy<n)memset(static_cast<uint8_t*>(b.mapped)+copy,0,n-copy);   // 只清零未复制的字节 | Zero only bytes not copied
     b.flush();return b;
 }
 // Per-submission snapshot cache of guest memory ranges. Guest command streams
@@ -693,8 +688,8 @@ Buffer readback_buffer(size_t n,const void *data=nullptr,size_t copy=0){
 std::map<std::pair<uint64_t,uint64_t>,Buffer> snapshots,uniform_snapshots;
 uint64_t snapshot_maxlen=0;
 void desc_memo_reset();
-// Direct-mapped front for the two snapshot maps: most lookups repeat within a submission (~12k of 15k per D2R camp frame).
-// Entries carry snapshot_epoch, which every reset and invalidation bumps, so a stale entry never matches.
+// 两种快照映射前加直接映射缓存；重置或失效推进 snapshot_epoch，旧项不能命中。
+// Add direct-mapped fronts to both snapshot maps; reset or invalidation advances snapshot_epoch so stale entries cannot hit.
 struct SnapFront{uint64_t address=0,bytes=0,epoch=0;Buffer buffer;};SnapFront snap_front[2][2048];uint64_t snapshot_epoch=1;
 inline SnapFront &snap_front_for(int which,uint64_t a,uint64_t n){uint64_t x=a*0x9E3779B97F4A7C15ull^n*0xC2B2AE3D27D4EB4Full;return snap_front[which][(x^(x>>31))&2047];}
 void snapshot_reset(){snapshots.clear();uniform_snapshots.clear();snapshot_maxlen=0;desc_memo_reset();++snapshot_epoch;++texel_write_epoch;}
@@ -724,8 +719,9 @@ bool pending_view(uint64_t address,uint64_t bytes,VkDeviceSize align,Buffer &out
 namespace wtrack {
 constexpr size_t min_bytes=1u<<20;constexpr unsigned max_regions=8,versions=2;bool enabled=false;
 struct Region{std::atomic<uintptr_t> begin{0},end{0};std::atomic<uint8_t> *dirty=nullptr;};
-Region regions[max_regions];std::atomic<unsigned> nregions{0};struct sigaction previous{};bool installed=false;
-// Re-enable writes to the tracked pages in [a,a+len) and mark them dirty. Signal-safe: atomics and mprotect only.
+Region regions[max_regions];std::atomic<unsigned> nregions{0};struct sigaction previous{};bool installed=false,host_hooks=false;
+// 恢复区间内跟踪页的写权限并标脏；信号路径只用原子操作和 mprotect。
+// Restore write access to tracked pages in the range and mark them dirty; the signal path uses only atomics and mprotect.
 bool unprotect(uintptr_t a,size_t len){if(!len || a>UINTPTR_MAX-len)return false;bool any=false;unsigned n=nregions.load(std::memory_order_acquire);
     for(unsigned i=0;i<n;i++){uintptr_t b=regions[i].begin.load(std::memory_order_relaxed),e=regions[i].end.load(std::memory_order_relaxed);
         uintptr_t lo=std::max(a,b),hi=std::min(a+len,e);if(lo>=hi)continue;size_t p0=(lo-b)>>12,p1=(hi-1-b)>>12;
@@ -743,7 +739,7 @@ struct Tracked{uint64_t address=0;size_t bytes=0;uintptr_t pbegin=0;size_t npage
 std::map<std::pair<uint64_t,size_t>,std::unique_ptr<Tracked>> tracked;bool exhausted=false;
 uint64_t copied_bytes=0,dirty_pages=0,mismatches=0,fallbacks=0;
 bool activate(Tracked &t){
-    if(!installed){   // a host that routes faults to xbg_wtrack_fault marks this installed (xbg_wtrack_use_host_hooks)
+    if(!installed){   // 宿主路由fault时标记已安装 | Host fault routing marks the handler installed
         struct sigaction sa{};sa.sa_sigaction=handler;sa.sa_flags=SA_SIGINFO|SA_ONSTACK|SA_NODEFER;sigemptyset(&sa.sa_mask);if(sigaction(SIGSEGV,&sa,&previous)){enabled=false;return false;}installed=true;}
     unsigned n=nregions.load();if(n>=max_regions)return false;
     t.pbegin=uintptr_t(t.address)&~uintptr_t(4095);uintptr_t pend=(uintptr_t(t.address)+t.bytes+4095)&~uintptr_t(4095);
@@ -789,11 +785,28 @@ bool snapshot(uint64_t address,size_t bytes,Buffer &out){
     if(!pick->coherent){VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};mr.memory=pick->memory;mr.size=VK_WHOLE_SIZE;VK(vkFlushMappedMemoryRanges(cfg.device,1,&mr));}
     pick->last_use=slot_serial;out=Buffer{};out.buffer=pick->buffer;out.memory=pick->memory;out.offset=0;out.size=bytes;out.mapped=pick->mapped;out.coherent=pick->coherent;return true;
 }
+// 队列空闲后恢复保护页，再释放所有版本；宿主信号钩子保留注册身份。
+// After queue idle, restore protected pages before freeing versions; preserve host hook registration.
+void release(){
+    for(unsigned i=0;i<nregions.load();i++){
+        uintptr_t b=regions[i].begin.load(),e=regions[i].end.load();
+        if(e>b)need(mprotect(reinterpret_cast<void*>(b),e-b,PROT_READ|PROT_WRITE)==0,"Restore tracked guest pages failed");
+        delete[] regions[i].dirty;regions[i].dirty=nullptr;regions[i].begin=0;regions[i].end=0;
+    }
+    nregions=0;
+    for(auto &t:tracked)for(auto &v:t.second->v){
+        if(v.mapped)vkUnmapMemory(cfg.device,v.memory);
+        if(v.buffer)vkDestroyBuffer(cfg.device,v.buffer,nullptr);
+        if(v.memory)vkFreeMemory(cfg.device,v.memory,nullptr);
+    }
+    tracked.clear();exhausted=false;enabled=false;
+    if(installed && !host_hooks){sigaction(SIGSEGV,&previous,nullptr);installed=false;}
 }
-// Host fault hooks for write tracking. A host with one SIGSEGV handler of its own (dm crash.c) calls
-// xbg_wtrack_use_host_hooks() once and routes faults here instead of letting the engine install a handler;
-// xbg_wtrack_prepare is for host writes into guest memory that do not fault (a syscall gets EFAULT).
-extern "C" void xbg_wtrack_use_host_hooks(void){wtrack::installed=true;}
+
+}
+// 宿主统一处理 SIGSEGV 时注册写跟踪钩子；系统调用写客体页必须先走 prepare，避免 EFAULT。
+// Register write-tracking hooks when the host owns SIGSEGV; syscall writes into guest pages must call prepare first to avoid EFAULT.
+extern "C" void xbg_wtrack_use_host_hooks(void){wtrack::installed=wtrack::host_hooks=true;}
 extern "C" int xbg_wtrack_fault(void *addr){return wtrack::unprotect(uintptr_t(addr),1);}
 extern "C" void xbg_wtrack_prepare(void *addr,size_t len){if(len)wtrack::unprotect(uintptr_t(addr),len);}
 Buffer snapshot_slow(uint64_t address,size_t bytes,VkDeviceSize align);
@@ -881,7 +894,7 @@ void capability_report(){
 }
 struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;VkImageCreateInfo create{}; // create: as created (no pNext), for upgrade_mutable
+    VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;VkImageCreateInfo create{}; // 保存无pNext的创建参数供升级 | Saved creation info without pNext for upgrade
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;
     std::map<std::array<uint32_t,8>,VkImageView> views;std::vector<std::vector<uint64_t>> fb_keys; // fb_keys: persistent framebuffers using these views
     ~Image(){forget_framebuffers(*this);for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
@@ -1128,12 +1141,12 @@ void append_depth_planes(std::vector<uint8_t> &data,std::vector<VkBufferImageCop
 }
 
 void forget_framebuffers(Image &im,std::vector<VkFramebuffer> *deferred){
-    for(auto &k:im.fb_keys){auto f=persistent_framebuffers.find(k);if(f==persistent_framebuffers.end())continue;   // already gone with another image
+    for(auto &k:im.fb_keys){auto f=persistent_framebuffers.find(k);if(f==persistent_framebuffers.end())continue;   // 已随其他图像清理 | Already released with another image
         if(deferred)deferred->push_back(f->second);else vkDestroyFramebuffer(cfg.device,f->second,nullptr);persistent_framebuffers.erase(f);}
     im.fb_keys.clear();
 }
-// Direct-mapped front for images.find (~12k get_image calls per D2R camp frame): erasing from or clearing images bumps
-// images_epoch, so a front entry never outlives its Image.
+// 图像直接缓存以 serial 与 images_epoch 为键；删除或清空映射推进代际。
+// Key the image front cache by serial and images_epoch; erasing or clearing the map advances its epoch.
 struct ImgFront{uint64_t serial=0,epoch=0;Image *im=nullptr;};ImgFront img_front[1024];uint64_t images_epoch=1;
 Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
     need(t && t->serial && t->magic==MAGIC('T','E','X',0),"Invalid NVN texture");
@@ -1644,19 +1657,18 @@ struct ImgKey{uint64_t h,sh,tp,to,sp,so,kind;bool operator==(const ImgKey &o)con
 struct ImgKeyHash{size_t operator()(const ImgKey &k)const{uint64_t x=k.h*0x9E3779B97F4A7C15ull^k.sh*0xC2B2AE3D27D4EB4Full^k.tp^(k.to<<17)^(k.sp<<7)^k.so^(k.kind<<40);x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
 struct ImgEntry{const tex_t *tex;Image *im;VkImageView view;VkSampler sampler;const RegisteredTexture *record;uint64_t revision;};
 std::unordered_map<ImgKey,ImgEntry,ImgKeyHash> img_cache;bool img_cache_enabled=true;uint64_t img_cache_hits=0,img_cache_misses=0;
-// Recreate an image created without MUTABLE_FORMAT with it, copy every level and layer, and retire the old image and its
-// views (queue order keeps earlier recorded uses on the old one). Cached descriptor sets and the image cache hold the old
-// views: memo_epoch and img_cache drop them. Field counts on Metal: 0 of 17473 textures needed this (nvn_mtl.m).
+// 异格式 view 需要时复制各级/层到 mutable 图；旧 framebuffer、view、图和内存经当前槽 retire_handle 退役，缓存失效。
+// When a differing view requires it, copy all levels/layers into a mutable image; retire old framebuffers, views, image and memory through the current slot retire_handle, and invalidate caches.
 void upgrade_mutable(Image &im){
     VkImageCreateInfo ci=im.create;ci.flags|=VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     VkImage image{};VK(vkCreateImage(cfg.device,&ci,nullptr,&image));VkMemoryRequirements r;vkGetImageMemoryRequirements(cfg.device,image,&r);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=r.size;ai.memoryTypeIndex=memory_type(r.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkDeviceMemory memory{};VK(vkAllocateMemory(cfg.device,&ai,nullptr,&memory));VK(vkBindImageMemory(cfg.device,image,memory,0));
-    Commands c;   // non-draw: ends an open pass, full barriers before and after
+    Commands c;   // 非draw结束pass并前后设屏障 | Non-draw ends the pass with barriers before and after
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;b.newLayout=VK_IMAGE_LAYOUT_GENERAL;b.image=image;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
     b.subresourceRange={im.aspects,0,im.levels,0,im.layers};b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);
-    bool copied=im.layout!=VK_IMAGE_LAYOUT_UNDEFINED;   // nothing defined to copy yet
+    bool copied=im.layout!=VK_IMAGE_LAYOUT_UNDEFINED;   // 尚无已定义内容 | No defined contents to copy yet
     if(copied){im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);std::vector<VkImageCopy> regions;
         for(uint32_t l=0;l<im.levels;l++){VkImageCopy rc{};rc.srcSubresource={im.aspects,l,0,im.layers};rc.dstSubresource=rc.srcSubresource;rc.extent={std::max(1u,im.width>>l),std::max(1u,im.height>>l),std::max(1u,im.depth>>l)};regions.push_back(rc);}
         vkCmdCopyImage(c.command,im.image,VK_IMAGE_LAYOUT_GENERAL,image,VK_IMAGE_LAYOUT_GENERAL,uint32_t(regions.size()),regions.data());}
@@ -1669,7 +1681,7 @@ void upgrade_mutable(Image &im){
     xbg_logf("NVN mutable upgrade serial=%llu fmt=%d %ux%ux%u levels=%u layers=%u copied=%d total=%llu",(unsigned long long)im.source.serial,int(im.fmt),im.width,im.height,im.depth,im.levels,im.layers,int(copied),(unsigned long long)mutable_upgrades);
 }
 struct DescMemo{const LayoutEntry *entry;VkDescriptorSet set;VkPipelineLayout pipeline_layout;std::vector<uint32_t> dynamic_offsets;std::vector<MemoImage> images;struct Dyn{uint64_t order;VkBuffer buffer;uint32_t offset;bool uniform;uint8_t src=0,ns=0,bank=0;};std::vector<Dyn> dyn;bool persistent=false;std::vector<std::pair<uint64_t,const void*>> tex_ids;struct Stor{uint64_t base,bytes;VkBuffer buffer;VkDeviceSize offset;};std::vector<Stor> stor;
-    struct Texel{const RegisteredTexture *record;uint64_t revision,base,bytes,gen;uint32_t format;};std::vector<Texel> texel;};   // texel: resident uniform texel buffers (texel_acquire)
+    struct Texel{const RegisteredTexture *record;uint64_t revision,base,bytes,gen;uint32_t format;};std::vector<Texel> texel;};   // 驻留uniform texel副本 | Resident uniform texel copies
 struct DynUbo{uint64_t order,address;size_t copy;};
 // Cross-frame memo (Claude C147): the memo lives per frame slot and survives submits. An entry is persistent when its set
 // holds no per-frame snapshot except dynamic uniform buffers (re-snapshotted on every hit, only the offset moves) and the
@@ -1705,12 +1717,8 @@ Buffer &support_block(){size_t n=1392;auto k=std::make_pair(state.viewport.width
 Buffer &driver_block(unsigned ns,unsigned bank){uint64_t gen=bank?tex_gen[ns]:buf_gen[ns];
     DriverCache &dc=driver_cache[ns][bank];if(dc.slot!=slot_serial || dc.gen!=gen || !dc.slot){Buffer s=stream_buffer(0x1000);fill_driver(static_cast<uint8_t*>(s.mapped),ns,bank?2:0);s.flush();dc.gen=gen;dc.slot=slot_serial;dc.buffer=s;}
     return dc.buffer;}
-// Uniform texel buffers held in resident per-slot copies, so descriptor sets that bind them can be memoized across frames
-// (D2R camp: 558 of 2188 draws per frame bind one and were rebuilt every time, ~21 us each against ~2.5 us for a memo hit).
-// A copy belongs to one slot (refreshed only while that slot records, after its previous submission retired) and is
-// refreshed from guest memory when its content hash changes, before its first read in a frame; content that changes again
-// within the frame falls back to the per-frame snapshot. A memo entry checks the copy's generation, so an evicted and
-// recreated copy is never mistaken for the one its set holds. Opt-in: gfx-texel-memo = '1'.
+// uniform texel 副本按槽驻留并验证内容；槽内再次改动走临时快照，memo 按注册版本和副本代际核验。默认关闭，仅 gfx-texel-memo=1 实验。
+// Uniform texel copies reside per slot with content checks; a second in-slot change uses a transient snapshot, and memo checks registration revisions and copy generations. Off by default, experimental with gfx-texel-memo=1.
 TexelResident *texel_acquire(uint64_t base,uint64_t bytes,VkFormat fmt){
     if(!bytes || base>UINT64_MAX-bytes || bytes>64ull*1024*1024){++texel_fallbacks;return nullptr;}
     // 待写回的数据走原快照路径，不允许驻留命中绕过 GPU 写入或跨槽排空。
@@ -1730,16 +1738,16 @@ TexelResident *texel_acquire(uint64_t base,uint64_t bytes,VkFormat fmt){
         r.checked=slot_serial;r.check_epoch=texel_write_epoch;texel_lo=std::min(texel_lo,base);texel_hi=std::max(texel_hi,base+bytes);
         texel_live_bytes[si]+=bytes;return &map.emplace(key,r).first->second;}
     TexelResident &r=it->second;
-    if(r.hash!=h){if(r.used==slot_serial){++texel_fallbacks;return nullptr;}   // this frame already reads the earlier content
+    if(r.hash!=h){if(r.used==slot_serial){++texel_fallbacks;return nullptr;}   // 本帧已读取旧内容 | This frame already reads earlier contents
         memcpy(r.buffer.mapped,reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));r.buffer.flush();r.hash=h;++texel_refreshes;}
     r.used=slot_serial;r.checked=slot_serial;r.check_epoch=texel_write_epoch;return &r;
 }
 void texel_touch(uint64_t address,uint64_t bytes){
-    auto &map=texel_resident[slot_index];if(map.size()>64){++texel_write_epoch;return;}   // many copies: invalidate coarsely
+    auto &map=texel_resident[slot_index];if(map.size()>64){++texel_write_epoch;return;}   // 副本多时整体失效 | Invalidate coarsely with many copies
     for(auto &e:map)if(address<e.first.base+e.first.bytes && address+bytes>e.first.base){++texel_write_epoch;return;}
 }
-// While a slot starts recording (its previous submission retired): drop copies unused for ~128 submissions; when the holes they
-// leave in the slot's arena pass 8 MB, start the slot's store over (memo entries then fail their generation check).
+// 槽旧提交退休后淘汰128次提交未用副本；洞超过8 MiB 时销毁所有 view 并释放 arena，旧 memo 代际不能命中。
+// After the slot retires, evict copies unused for 128 submissions; holes above 8 MiB destroy all views and release the arena, invalidating old memo generations.
 void texel_evict(unsigned si,bool all){
     need(!slots[si].pending && (!slots[si].recording || !slots[si].ops),"Evict texel residents only after slot retirement");
     auto &map=texel_resident[si];
@@ -1801,8 +1809,8 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                     if(cached.record->revision!=cached.revision){same=false;break;}
                     if(t->serial!=m.tex_ids[k].first || t->mem!=m.tex_ids[k].second){same=false;break;}
                     auto li=images.find(t->serial);if(li==images.end() || li->second.get()!=m.images[k].second){same=false;break;}}
-                // Resident texel copies: same registration and range, the same copy the set holds (generation), content
-                // refreshed if the guest changed it since this slot last recorded.
+                // 驻留副本核对注册、范围和代际；客体在上次记录后改过时刷新内容。
+                // Check resident registration, range and generation; refresh contents changed since the last recording.
                 if(same)for(auto &tr:m.texel){const tex_t &tt=tr.record->texture;
                     if(tr.record->revision!=tr.revision || uint64_t(uintptr_t(tt.mem))!=tr.base || uint64_t(tt.L.size)!=tr.bytes){same=false;break;}
                     TexelResident *r=texel_acquire(tr.base,tr.bytes,VkFormat(tr.format));if(!r || r->gen!=tr.gen){same=false;break;}++texel_hits;}
@@ -1931,7 +1939,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                         if(!pending_view(uint64_t(texture.mem),texture.L.size,1,pv))res=texel_acquire(uint64_t(texture.mem),texture.L.size,format(texture.d.format));
                         if(res){if(desc_memo_recording)desc_memo_texel.push_back({record,record->revision,uint64_t(texture.mem),uint64_t(texture.L.size),res->gen,uint32_t(format(texture.d.format))});
                             texel_views.push_back(res->view);write.pTexelBufferView=&texel_views.back();}
-                        else desc_memo_texel_fail=true;}   // the set then holds a per-frame view: not memoized
+                        else desc_memo_texel_fail=true;}   // 集合包含临时view，不memo | The set holds a transient view and is not memoized
                     if(!res){
                     Buffer *buf=nullptr;uint64_t base=uint64_t(texture.mem),bytes=texture.L.size;
                     if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){Buffer view;if(pending_view(base,bytes,1,view)){buf=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_open_pass();VkBufferCopy region{view.offset,buf->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,buf->buffer,1,&region);full_barrier(cmd);}else{cpu_access(base,bytes,8);buf=out.keep(readback_buffer(bytes,texture.mem,bytes));}out.storage.push_back({{base,bytes},buf});out.written.push_back({{base,bytes},buf});}
@@ -2030,7 +2038,7 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     if(result && soft)return false;
     if(result)xbg_fatalf("NVN framebuffer %s result=%d attachment=%d",xbg_framebuffer_error(result),result,bad==UINT32_MAX?-1:int(bad));
     p.width=plan.width;p.height=plan.height;p.samples=VkSampleCountFlagBits(plan.samples);
-    static std::vector<VkAttachmentDescription> descriptions;descriptions.clear();static std::vector<VkImageView> views;views.clear();   // not re-entrant: graphics thread
+    static std::vector<VkAttachmentDescription> descriptions;descriptions.clear();static std::vector<VkImageView> views;views.clear();   // 图形线程串行，不可重入 | Serialized on the graphics thread, not reentrant
     static std::vector<VkAttachmentReference> colors;colors.assign(size_t(state.rt.n),{VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_GENERAL});VkAttachmentReference depth{VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_GENERAL};
     for(unsigned slot=0;slot<9;slot++)if(targets[slot]){
         Image &im=get_image(targets[slot],false);const view_t *view=selected[slot];
@@ -2050,8 +2058,8 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
         else{VK(vkCreateRenderPass(cfg.device,&rp,nullptr,&p.pass));VkRenderPass rpass=p.pass;retire_handle([rpass]{vkDestroyRenderPass(cfg.device,rpass,nullptr);});static PipelineDefinition invalid;p.definition=&invalid;}
     }
     Slot &slot=recording_slot();static std::vector<uint64_t> fb_key;fb_key.assign({uint64_t(p.pass),p.width,p.height});for(auto v:views)fb_key.push_back(uint64_t(v));
-    // Cached render passes live until shutdown, so their framebuffers can outlive the frame; they go with the first of their
-    // images (forget_framebuffers). A pass outside the cache is retired with this slot, and so are its framebuffers.
+    // 缓存pass的framebuffer随首个关联图像退役；非缓存pass及framebuffer随槽退役。
+    // Cached-pass framebuffers retire with their first associated image; uncached passes and framebuffers retire with the slot.
     bool persistent=persistent_fb_enabled && p.definition && p.definition->valid;
     auto &cache=persistent?persistent_framebuffers:slot.framebuffers;
     auto cached=cache.find(fb_key);
@@ -2525,8 +2533,8 @@ void resolve_texture(const p_copy_t2t &p){
 
 // CPU-visible writes occur only after all preceding synchronous GPU work finished.
 // Every byte count and opcode is checked; unknown commands terminate with context.
-// Consecutive commands nearly always sit in one range: remember the last one (pools change only under the mutex,
-// and clear it; host segments are freed only at shutdown).
+// 缓存连续命令所在的内存区间；内存池变动和宿主段清理时清空缓存。
+// Cache the memory range holding consecutive commands; invalidate it when pools change or host segments are released.
 uintptr_t cmd_range_lo=0;size_t cmd_range_bytes=0;
 size_t command_available(const uint8_t *p){uintptr_t address=uintptr_t(p);if(address-cmd_range_lo<cmd_range_bytes)return cmd_range_bytes-(address-cmd_range_lo);auto it=pools.upper_bound(address);if(it!=pools.begin()){--it;if(address>=it->first && address-it->first<it->second){cmd_range_lo=it->first;cmd_range_bytes=it->second;return it->second-(address-it->first);}}{auto h=host_ranges.upper_bound(address);if(h!=host_ranges.begin()){--h;if(address>=h->first && address-h->first<h->second){cmd_range_lo=h->first;cmd_range_bytes=h->second;return h->second-(address-h->first);}}}xbg_fatalf("NVN command address %#llx is outside registered command pools",(unsigned long long)address);}
 void execute_draw_call(const xbg_draw_call &p){
@@ -2590,11 +2598,11 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_JUMP:pc=reinterpret_cast<const uint8_t*>(payload<uint64_t>(p,n));continue;
         case OP_CALL:execute(reinterpret_cast<const uint8_t*>(payload<uint64_t>(p,n)),depth+1,budget);break;
         case OP_SIGNAL_EVENT:{need(n>=16,"Truncated event");uint64_t addr;uint32_t mode,v;memcpy(&addr,p,8);memcpy(&mode,p+8,4);memcpy(&v,p+12,4);need(addr,"Null event address");SiteScope site(SITE_EVENT);
-            if(defer_events){   // hand the work so far to the GPU without waiting; publish when that submission retires
+            if(defer_events){   // 不等待地提交，退休后发布 | Submit without waiting and publish after retirement
                 Slot &cur=slots[slot_index];
                 if(defer_events==2 && cur.recording && cur.ops){recording_events.push_back({addr,mode,v,&cur});++events_deferred;break;}
                 if(cur.recording && cur.ops)submit_slots(false);
-                Slot &last=slots[slot_index^1];   // most recent submission (just made, or the previous one)
+                Slot &last=slots[slot_index^1];   // 最近一次提交 | Most recent submission
                 if(last.pending){pending_events.push_back({addr,mode,v,&last});++events_deferred;}else apply_event(addr,mode,v);
                 break;}
             complete_all();cpu_access(addr,4,10);snapshot_invalidate(addr,4);auto ptr=reinterpret_cast<uint32_t*>(addr);if(mode==NVN_EVENT_SIGNAL_MODE_ADD)__atomic_fetch_add(ptr,v,__ATOMIC_SEQ_CST);else{need(mode==NVN_EVENT_SIGNAL_MODE_WRITE,"Unknown event mode");__atomic_store_n(ptr,v,__ATOMIC_SEQ_CST);}break;}
@@ -2731,7 +2739,8 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      ++slot_serial;gfx_enqueued=0;gfx_executed=0;gfx_presents_queued=0;gfx_async=false; /* Android game command memory remains guest-owned. */if(gfx_async)gfx_worker=std::thread(gfx_worker_loop);xbg_logf("NVN async translation=%d",int(gfx_async));}
     return 0;
 }
-// nvnEventGetValue on a deferred event: finish the GPU work the signal covers, then the value is published (apply_ready_events).
+// CPU 事件读写及存储重用前排空翻译并完成覆盖的延后事件。
+// Before CPU event accesses or storage reuse, drain translation and complete covering deferred events.
 extern "C" void xbg_game_event_read(const void *addr){
     gfx_drain();
     std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized || failed)return;
@@ -2804,7 +2813,7 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
 static void xbg_legacy_pool_add_now(void *p,size_t n){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&n,"Invalid NVN pool");pools[uintptr_t(p)]=n;cmd_range_lo=0;cmd_range_bytes=0;auto epoch=provenance.pool(uint64_t(p),true);provenance_log("POOL_ADD mem=%p bytes=%zu epoch=%llu",p,n,epoch);}
 static void xbg_legacy_pool_del_now(void *p){std::lock_guard<std::recursive_mutex> lock(mutex);provenance_log("POOL_DEL mem=%p epoch=%llu",p,provenance.epoch(uint64_t(p)));provenance.pool(uint64_t(p),false);pools.erase(uintptr_t(p));cmd_range_lo=0;cmd_range_bytes=0;}
