@@ -2146,17 +2146,18 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
         xbg_logf("NVN BC upload format=%#x level=%u layer=%u region=%dx%dx%d src=%zu decoded=%zu",p.tex->d.format,level,layer,p.r.width,p.r.height,p.r.depth,source_bytes,bytes);return;
     }
     size_t row,image,n;
-    need(nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,1,1,im.bpp,state.copy_stride,state.copy_image_stride,&row,&image,&n) && row%im.bpp==0 && row/im.bpp<=UINT32_MAX && n<=256ull*1024*1024,"Invalid or oversized color copy stride/extent");
+    need(nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,1,1,im.bpp,state.copy_stride,state.copy_image_stride,&row,&image,&n) && n<=256ull*1024*1024,"Invalid or oversized color copy stride/extent");
     need(p.src<=UINT64_MAX-n,"Color copy address overflow");
     if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,n,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
         if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
     size_t slice_alignment=4;while(slice_alignment%im.bpp)slice_alignment+=4;
-    size_t staging_image=((row*size_t(p.r.height)+slice_alignment-1)/slice_alignment)*slice_alignment,staging_bytes=staging_image*size_t(p.r.depth);
+    size_t staging_row=size_t(p.r.width)*im.bpp;
+    size_t staging_image=((staging_row*size_t(p.r.height)+slice_alignment-1)/slice_alignment)*slice_alignment,staging_bytes=staging_image*size_t(p.r.depth);
     need(staging_bytes<=256ull*1024*1024,"Color staging exceeds memory bound");
     std::vector<uint8_t> upload;
     if(!to_buffer){cpu_access(p.src,n,9);upload.resize(staging_bytes);
         for(int k=0;k<p.r.depth;k++)for(int y=0;y<p.r.height;y++)
-            memcpy(upload.data()+size_t(k)*staging_image+size_t(y)*row,reinterpret_cast<const uint8_t*>(p.src)+size_t(k)*image+size_t(y)*row,size_t(p.r.width)*im.bpp);
+            memcpy(upload.data()+size_t(k)*staging_image+size_t(y)*staging_row,reinterpret_cast<const uint8_t*>(p.src)+size_t(k)*image+size_t(y)*row,size_t(p.r.width)*im.bpp);
     }
     Buffer b=to_buffer?readback_buffer(staging_bytes):stream_buffer(staging_bytes,upload.data(),staging_bytes,false);
     Commands c;im.transition(c.command,to_buffer?VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -2164,7 +2165,7 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
     // Record each slice separately to allow byte image strides indivisible by row strides.
     std::vector<VkBufferImageCopy> copies;
     for(int k=0;k<p.r.depth;k++){
-        VkBufferImageCopy r{};r.bufferOffset=b.offset+size_t(k)*staging_image;r.bufferRowLength=uint32_t(row/im.bpp);
+        VkBufferImageCopy r{};r.bufferOffset=b.offset+size_t(k)*staging_image;r.bufferRowLength=0;
         r.imageSubresource=copy_layers(im,level,layer,p.r);r.imageSubresource.layerCount=1;
         r.imageOffset=copy_offset(im,p.r);r.imageExtent={uint32_t(p.r.width),uint32_t(p.r.height),1};
         if(im.source.d.target==2)r.imageOffset.z+=k;else r.imageSubresource.baseArrayLayer+=k;
@@ -2174,7 +2175,7 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
     if(to_buffer){gpu_sync(perf.sync_readback);b.invalidate();invalidate_cpu_range(p.src,n);
         for(int k=0;k<p.r.depth;k++)for(int y=0;y<p.r.height;y++){
             size_t off=size_t(k)*image+size_t(y)*row;
-            memcpy(reinterpret_cast<uint8_t*>(p.src)+off,static_cast<const uint8_t*>(b.mapped)+size_t(k)*staging_image+size_t(y)*row,size_t(p.r.width)*im.bpp);
+            memcpy(reinterpret_cast<uint8_t*>(p.src)+off,static_cast<const uint8_t*>(b.mapped)+size_t(k)*staging_image+size_t(y)*staging_row,size_t(p.r.width)*im.bpp);
         }
     }else im.gpu_written=true,provenance_write(im,__LINE__);
 }
