@@ -6,12 +6,15 @@
 # Usage: gen_romfs_overlay.py <original game RomFS> <output dir>. The base image is written into the borrowed path (dm/data/casc_overlay/borrowed_paths.tsv), the layout replaces the controller HUDPanelHD.json;
 # the other data archives are still supplied by the base RomFS (at launch the App checks this layer first via DM_ROMFS_OVERLAY), so only the new .build.config and the one data archive newly written this time are copied.
 import re
-import json, os, struct, subprocess, sys, tempfile, shutil
+import json, os, struct, subprocess, sys, tempfile, shutil, runpy
+# 当前进程也用同一 LF 写出规则；原资源只读适配器仍在调用链内。
+# Apply the same LF output policy here; keep the original read-only resource adapter in the call chain.
+runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tools', 'winlf', 'sitecustomize.py'))
 from PIL import Image
 HERE=os.path.dirname(os.path.abspath(__file__)); V4=os.environ.get('DM_HUD_V4_DIR') or __import__('gen_paths').gen_dir('NativeHUD','v4')   # 试调时可指向别的产物目录 | Can point to another build output directory when tuning
 romfs, out = sys.argv[1], sys.argv[2]
 GENERATED_OVERLAYS = []
-sys.path.insert(0,HERE); import gen_assets; gen_assets.ensure(romfs)   # 要读的生成资源（底栏 v4、选角右侧面板…）先确保齐全；输入没变不重出（gen_assets.py 文件头） | First make sure the generated resources to be read (bottom bar v4, character select right panel...) are complete; not regenerated if inputs are unchanged (gen_assets.py file header)
+sys.path.insert(0,HERE); import gen_assets; gen_assets.ensure(romfs, overlay_only=True)   # 要读的生成资源（底栏 v4、选角右侧面板…）先确保齐全；输入没变不重出（gen_assets.py 文件头） | First make sure the generated resources to be read (bottom bar v4, character select right panel...) are complete; not regenerated if inputs are unchanged (gen_assets.py file header)
 REPL={'data/hd/global/ui/panel/hud_02/bugbtn.sprite':'base.sprite',            # 借用路径（登记表「当前用途」= 底部 UI v4 底图） | Borrowed path (registry 「当前用途」(current use) = bottom UI v4 base image)
       'data/hd/global/ui/panel/hud_02/front_panel.sprite':'close.sprite',       # 借用路径：局内面板外框右上角的关闭按钮图（NativeHUD/touch/close.png，gen_close_btn.py） | Borrowed path: the close button image at the top-right corner of the in-game panel outer frame (NativeHUD/touch/close.png, gen_close_btn.py)
       'data/global/ui/layouts/controller/hudpanelhd.json':os.path.join(V4,'hud.json')}
@@ -198,7 +201,7 @@ with tempfile.TemporaryDirectory() as t:
         if shared!=sorted(SHARED_TODO): raise SystemExit('gen_romfs_overlay：两种模式共用的改过的布局与存量清单不一致（多出的要按模式分开：改过的放触屏目录 / 另起新名，原路径留原版）：多 %s，少 %s' % (sorted(set(shared)-set(SHARED_TODO)), sorted(set(SHARED_TODO)-set(shared))))
         with open(os.path.join(t,tag+'repl.tsv'),'w') as f:
             for k,v in repl.items(): f.write(f'{"" if k in MAN else "+"}{k}\t{os.path.join(t,v)}\n')   # 新增路径前加「+」（casc_overlay.py） | New paths are prefixed with "+" (casc_overlay.py)
-        subprocess.run([sys.executable,os.path.join(HERE,'..','..','tools','casc_overlay.py'),romfs,os.path.join(t,tag+'ov'),os.path.join(t,tag+'repl.tsv'),'--thin']+(['--prebuilt',prebuilt] if prebuilt else []),check=True,stdout=subprocess.DEVNULL)
+        subprocess.run(gen_assets.python_command(os.path.join(HERE,'..','..','tools','casc_overlay.py'),romfs,os.path.join(t,tag+'ov'),os.path.join(t,tag+'repl.tsv'),'--thin')+(['--prebuilt',prebuilt] if prebuilt else []),check=True,stdout=subprocess.DEVNULL)
         src=os.path.join(t,tag+'ov','data'); new=[n for n in os.listdir(src) if n.endswith('.data') and not os.path.islink(os.path.join(src,n))]
         assert len(new)==1, new
         shutil.rmtree(dst,ignore_errors=True); os.makedirs(os.path.join(dst,'data'))
