@@ -64,6 +64,21 @@ The presenter's swapchain was 2712×1220. Every frame it cleared the whole image
 
 About 13 MB less memory traffic per frame, a smoother upscale than nearest, the same picture otherwise. Marker `gfx-present-native` = 0 keeps the old swapchain; `gfx-present-timing` logs the presenter's GPU time.
 
+## The touch overlay redrew on every refresh (PR #19)
+
+In a fight the busiest threads were the game thread (72% of the X2 core), two game workers (15–20% each) and Android's own `RenderThread` at 12%. `TouchOverlay`, the view that draws the touch controls over the game, asked for another redraw at the end of every `onDraw`, so HWUI rendered it on every display refresh: 1,228 frames in 10 s at 120 Hz. It now checks the native layout once per refresh and redraws only when that changes.
+
+| Den of Evil | HWUI frames in 10 s | `RenderThread` CPU | Game GPU per frame |
+|---|---|---|---|
+| Before | 1,228 | 12.2% of a core | 14.55 ms |
+| After | 0 (nothing pressed) | not among the busy threads | 14.43 ms |
+
+Pressed buttons still highlight and clear on release.
+
+## Async translation is still slower
+
+With `DM_NVN_SYNC=0` (translation on its own thread, the iOS mode) the seeded Den fight ran at 35.2 fps against 59.6: the game waited 13–15 ms a frame on fences for work the translation thread had not submitted yet, half the frames dropped, and the dynamic scale went down to 0.6. Sync mode stays the Android default.
+
 ## MIUI Game Turbo: the biggest single step
 
 MIUI keeps an app's CPU and GPU clocks capped unless the app is in its Game Turbo list (Security → Game Turbo / Game Space → +). The manifest's `appCategory="game"` is not enough. With D2R Mobile added, `settings get secure gb_boosting` reads 1 while the game runs and the caps lift:
