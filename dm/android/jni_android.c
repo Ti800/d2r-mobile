@@ -159,6 +159,12 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // Cross-frame vertex and index copies on by default (the engine's gfx-vcache, through nvn_dirty.c's write-protect
     // tracking; a marker file still wins): about 0.7 ms less CPU per camp frame on the Redmi K50 Ultra.
     setenv("DM_GFX_VCACHE", "1", 0);
+    // 贴图内容检查走同一个写保护脏页跟踪（引擎的 gfx-tex-dirty；标记文件仍优先），同 iOS nvn_mtl.m：上传后设只读，游戏写过
+    // 才重新散列；原先每张贴图每 16 次提交整张重算一次（Redmi K50 Ultra 洞穴打斗渲染线程每帧约 0.27 ms）。
+    // Texture content checks through the same write-protect tracking (the engine's gfx-tex-dirty; a marker file still wins),
+    // as nvn_mtl.m does on iOS: write-protected after upload and re-hashed only after a guest write; before, every texture was
+    // re-hashed whole on every 16th submission (~0.27 ms of the render thread per Den of Evil fight frame).
+    setenv("DM_GFX_TEX_DIRTY", "1", 0);
     if (!getenv("DM_LANG") && *lg) setenv("DM_LANG", lg, 0);   // 首次安装的语言按系统首选（同 iOS CFLocaleCopyPreferredLanguages，见 dm_i18n.c） | first-install language follows the system preference (as iOS CFLocaleCopyPreferredLanguages, see dm_i18n.c)
     if (chdir(g_files)) LOG("【红】chdir %s 失败 errno %d", g_files, errno);
     (*env)->ReleaseStringUTFChars(env, files, f); (*env)->ReleaseStringUTFChars(env, ext, x); (*env)->ReleaseStringUTFChars(env, src, s); (*env)->ReleaseStringUTFChars(env, lang, lg);
