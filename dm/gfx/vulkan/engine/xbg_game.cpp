@@ -602,7 +602,7 @@ void save_pipeline_cache(){
     bool ok=fwrite(data.data(),1,n,f)==n;ok=fclose(f)==0&&ok;if(ok)ok=rename(tmp.c_str(),path.c_str())==0;
     warm::flush();xbg_logf("NVN pipeline cache save bytes=%zu new=%zu ok=%d",n,pipelines_unsaved,int(ok));if(ok)pipelines_unsaved=0;
 }
-extern bool tex_dirty;extern uint64_t tex_dirty_uploads,tex_dirty_checks,tex_dirty_changed;   // texture checks through the dirty tracker (get_image)
+extern bool tex_dirty;extern uint64_t tex_dirty_tracked,tex_dirty_checks,tex_dirty_changed;   // texture checks through the dirty tracker (get_image)
 void perf_frame(){
     {texel_distinct+=texel_frame_keys.size();for(auto k:texel_frame_keys)if(texel_prev_keys.count(k))++texel_reused;texel_prev_keys.swap(texel_frame_keys);texel_frame_keys.clear();}
     if(perf_frame_timed)++perf_timed_frames;perf_frame_timed=perf_sample && stats.presents.load()%perf_sample==0;   // the next frame
@@ -626,7 +626,7 @@ void perf_frame(){
     xbg_logf("NVN PERF wtrack copied_kb_per_frame=%.1f dirty_pages_per_frame=%.1f mismatches=%llu fallbacks=%llu",wtrack::copied_bytes/1024.0/f,wtrack::dirty_pages/f,(unsigned long long)wtrack::mismatches,(unsigned long long)wtrack::fallbacks);wtrack::copied_bytes=wtrack::dirty_pages=0;
     xbg_logf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;
     xbg_logf("NVN PERF snapfront front_hits=%.1f map_hits=%.1f invalidations=%.1f erased=%.1f",snap_front_hits/f,snap_map_hits/f,snap_invalidations/f,snap_invalidated/f);snap_front_hits=snap_map_hits=snap_invalidations=snap_invalidated=0;
-    if(tex_dirty){xbg_logf("NVN PERF texdirty uploads=%.1f checks=%.1f changed=%.1f",tex_dirty_uploads/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_uploads=tex_dirty_checks=tex_dirty_changed=0;}
+    if(tex_dirty){xbg_logf("NVN PERF texdirty tracked=%.1f checks=%.1f changed=%.1f",tex_dirty_tracked/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_tracked=tex_dirty_checks=tex_dirty_changed=0;}
     if(vcache::enabled){xbg_logf("NVN PERF vcache hits=%.1f (%.2fMB) fills=%.1f (%.2fMB) refills=%.2f volatile=%llu untracked=%llu flushes=%llu entries=%zu arena=%.1fMB pools=%d",vcache::hits/f,vcache::hit_bytes/1048576.0/f,vcache::fills/f,vcache::fill_bytes/1048576.0/f,vcache::refills/f,(unsigned long long)vcache::volatiles,(unsigned long long)vcache::untracked,(unsigned long long)vcache::flushes,vcache::live(),vcache::arena_bytes()/1048576.0,[]{int live=0,used=0;uint64_t adds=0;if(nvn_dirty_slot_stats)nvn_dirty_slot_stats(&live,&used,&adds);return used;}());vcache::hits=vcache::hit_bytes=vcache::fills=vcache::fill_bytes=vcache::refills=0;}
     {static uint64_t pm=0,pe=0;xbg_logf("NVN PERF pipelines_new=%llu evicted=%llu warm_hits=%llu created=%llu create_ms=%.1f create_max_ms=%.1f warm_built=%llu warm_failed=%llu warm_ms=%.0f",(unsigned long long)(pipeline_counts.misses-pm),(unsigned long long)(pipeline_counts.evictions-pe),(unsigned long long)warm::hits,(unsigned long long)warm::creates,warm::create_ns/1e6,warm::create_max_ns/1e6,(unsigned long long)warm::built.load(),(unsigned long long)warm::failed.load(),warm::build_ns.load()/1e6);warm::hits=warm::creates=warm::create_ns=warm::create_max_ns=0;pm=pipeline_counts.misses;pe=pipeline_counts.evictions;}
     xbg_logf("NVN PERF setcache ab=%d hits=%.1f misses=%.1f template=%.1f plain=%.1f memo_hits=%.1f memo_misses=%.1f why=texel%.1f/simg%.1f/sw%.1f/dynbuf%.1f/store%.1f",int(ab_frame_on),set_cache_hits/f,set_cache_misses/f,template_updates/f,plain_updates/f,desc_memo_hits/f,desc_memo_misses/f,desc_memo_why[0]/f,desc_memo_why[1]/f,desc_memo_why[2]/f,desc_memo_why[3]/f,desc_memo_why[4]/f);desc_memo_hits=desc_memo_misses=0;for(auto &w:desc_memo_why)w=0;xbg_logf("NVN PERF keydiff shader%.0f pool%.0f ubo%.0f uaddr%.0f size%.0f vp%.0f alpha%.0f drv%.0f tex%.0f samp%.0f saddr%.0f same%.0f new%.0f len%.0f",key_diff[0]/f,key_diff[1]/f,key_diff[2]/f,key_diff[3]/f,key_diff[4]/f,key_diff[5]/f,key_diff[6]/f,key_diff[7]/f,key_diff[8]/f,key_diff[9]/f,key_diff[10]/f,key_diff[11]/f,key_diff[12]/f,key_diff[13]/f);for(auto &k:key_diff)k=0;
@@ -806,12 +806,13 @@ bool snapshot(uint64_t address,size_t bytes,Buffer &out){
 extern "C" void xbg_wtrack_use_host_hooks(void){wtrack::installed=true;if(wtrack::marker!=0)wtrack::enabled=true;xbg_logf("NVN wtrack through host hooks enabled=%d",int(wtrack::enabled));}
 extern "C" int xbg_wtrack_fault(void *addr){return wtrack::unprotect(uintptr_t(addr),1);}
 extern "C" void xbg_wtrack_prepare(void *addr,size_t len){if(len)wtrack::unprotect(uintptr_t(addr),len);}
-// Texture content checks through the write-protect tracker (nvn_dirty.c), as nvn_mtl.m tex_mtl does on iOS: an upload
-// write-protects the texture's pages and keeps the tracker's stamp, and a check hashes the texture only if the guest wrote
-// its pages since. The hash checks re-hashed every bound texture on its 16th submission (~0.27 ms of the render thread per
-// D2R fight frame on the Redmi K50 Ultra) and saw a streamed write up to 16 submissions late. Untracked pools keep them.
-// Marker gfx-tex-dirty = 1 / 0, else DM_GFX_TEX_DIRTY (the Android app sets 1); A/B target texdirty; NVN PERF texdirty.
-bool tex_dirty=false;uint64_t tex_dirty_uploads=0,tex_dirty_checks=0,tex_dirty_changed=0;
+// Texture content checks through the write-protect tracker (nvn_dirty.c), as nvn_mtl.m tex_mtl does on iOS: once a texture
+// has been unchanged for 4 checks its pages are write-protected with the tracker's stamp, and a check then hashes it only if
+// the guest wrote its pages since. The hash checks re-hashed every bound texture on its 16th submission (~0.27 ms of the
+// render thread per D2R fight frame on the Redmi K50 Ultra) and saw a streamed write up to 16 submissions late. Untracked
+// pools keep them. Marker gfx-tex-dirty = 1 / 0, else DM_GFX_TEX_DIRTY (the Android app sets 1); A/B target texdirty;
+// NVN PERF texdirty: textures that started tracking, checks that hashed after a write, changes found.
+bool tex_dirty=false;uint64_t tex_dirty_tracked=0,tex_dirty_checks=0,tex_dirty_changed=0;
 // Cross-frame copies of vertex and index ranges (marker gfx-vcache = 1 / 0, else DM_GFX_VCACHE, which the Android app sets
 // to 1; A/B target vcache). In the D2R camp 99% of the 6.4 MB of
 // vertex data and all 1.45 MB of index data a frame copies are the same as the frame before (diagnostic gfx-snap-census).
@@ -913,7 +914,7 @@ struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;VkImageCreateInfo create{}; // create: as created (no pNext), for upgrade_mutable
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;
-    uint64_t dirty_stamp=0,dirty_seen=0;   // tex_dirty: the tracker stamp of the uploaded content (0: untracked) and the tracker generation last checked
+    uint64_t dirty_stamp=0,dirty_seen=0;   // tex_dirty: the tracker stamp of the checked content (0: not tracked yet) and the tracker generation last checked
     std::map<std::array<uint32_t,8>,VkImageView> views;std::vector<std::vector<uint64_t>> fb_keys; // fb_keys: persistent framebuffers using these views
     ~Image(){forget_framebuffers(*this);for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
     void transition(VkCommandBuffer cmd,VkImageLayout next){
@@ -1213,16 +1214,18 @@ Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
                 if(hash_memory(t->mem,t->L.size)!=im.cpu_hash){im.uploaded=false;im.stable_checks=0;++tex_dirty_changed;}else im.dirty_stamp=stamp;
                 now=stamp;}
             im.dirty_seen=now;}
-        // Textures unchanged for 4 checks are re-verified every 16th submission (staggered).
-        else if(im.stable_checks<4 || ((stats.submissions+t->serial)&15)==0){uint64_t hash=hash_memory(t->mem,t->L.size);if(hash!=im.cpu_hash){im.uploaded=false;im.stable_checks=0;}else ++im.stable_checks;}
+        // Textures unchanged for 4 checks are re-verified every 16th submission (staggered). With tex_dirty the 4th unchanged
+        // check write-protects a tracked texture instead (protect and stamp before the hash), and the tracker answers from then
+        // on: protecting at upload faulted ~40k times per level load on the Redmi, as the loader went on writing those pages.
+        else if(im.stable_checks<4 || ((stats.submissions+t->serial)&15)==0){
+            const bool track=tex_dirty && im.stable_checks==3 && !ab_off("texdirty") && nvn_dirty_tracked && nvn_dirty_protect && nvn_dirty_now && nvn_dirty_since && nvn_dirty_tracked(t->mem,t->L.size);
+            uint64_t stamp=0;if(track){nvn_dirty_protect(t->mem,t->L.size);stamp=nvn_dirty_now();}
+            uint64_t hash=hash_memory(t->mem,t->L.size);if(hash!=im.cpu_hash){im.uploaded=false;im.stable_checks=0;}else{++im.stable_checks;if(track){im.dirty_stamp=im.dirty_seen=stamp;++tex_dirty_tracked;}}}
         im.checked_submission=stats.submissions;}
     // Diagnostic: CPU writes into textures whose contents the GPU produced (copies) are invisible to us.
     if(upload && im.gpu_written && im.decoded && t->mem && ((stats.submissions+t->serial)&63)==0 && im.checked_submission!=stats.submissions){im.checked_submission=stats.submissions;uint64_t hash=hash_memory(t->mem,t->L.size);if(im.cpu_hash && hash!=im.cpu_hash){static unsigned n=0;if(n++<40)xbg_logf("NVN CPUGPU texture changed by CPU after GPU write serial=%llu fmt=%#x %ux%u layers=%u levels=%u target=%d",(unsigned long long)t->serial,t->d.format,im.width,im.height,im.layers,im.levels,t->d.target);}im.cpu_hash=hash;}
     if(upload && !im.uploaded && !im.gpu_written){
-        // Write-protect before the content is read, then stamp: any later guest write to these pages is newer than the stamp.
-        im.dirty_stamp=0;
-        if(tex_dirty && nvn_dirty_tracked && nvn_dirty_protect && nvn_dirty_now && nvn_dirty_since && t->mem && nvn_dirty_tracked(t->mem,t->L.size)){
-            nvn_dirty_protect(t->mem,t->L.size);im.dirty_stamp=nvn_dirty_now();im.dirty_seen=im.dirty_stamp;++tex_dirty_uploads;}
+        im.dirty_stamp=0;   // a new upload starts on the hash checks again
         need(im.samples==VK_SAMPLE_COUNT_1_BIT,"Cannot upload uninitialized multisample image from CPU storage");
         need(t->mem && t->pool && t->off>=0 && uint64_t(t->off)<=t->pool->size && t->L.size<=t->pool->size-uint64_t(t->off),"Texture storage outside memory pool");
         if(im.aspects!=VK_IMAGE_ASPECT_COLOR_BIT)xbg_logf("NVN depth initial upload serial=%llu format=%#x vkFormat=%u target=%d extent=%ux%ux%u levels=%u layers=%u source=%p bytes=%llu",(unsigned long long)t->serial,t->d.format,unsigned(im.fmt),t->d.target,im.width,im.height,im.depth,im.levels,im.layers,t->mem,(unsigned long long)t->L.size);
