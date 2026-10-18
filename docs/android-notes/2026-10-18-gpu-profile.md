@@ -31,6 +31,10 @@ Measured 17:40–18:40 NZDT on the Redmi K50 Ultra (Adreno 730, Vulkan 1.1, Andr
 
 - **`spirv-opt -O` on the five heaviest shaders** (loaded through the diagnostic `files/dm/spv-override/<key>.spv`): the translator stores each Maxwell register in its own variable (about 2,800 variables, 5,000 loads, 3,000 stores per shader), and `spirv-opt` removes almost all of them (37 variables left, a third of the size). The driver's output does not change: registers and invocations equal, instructions within 1%, main pass 6.71–6.79 ms against 6.78. The Adreno compiler already does this work.
 - The translated shaders contain no half-float emulation and no function-local arrays.
+- **128-wide fragment waves** (`VK_EXT_subgroup_size_control`): the driver allows a required subgroup size (64 or 128) only for compute shaders (`requiredSubgroupSizeStages` = compute).
+- **Without `robustBufferAccess`** (diagnostic `gfx-no-robust`): the same compiled code, 89,662 instructions over 108 shaders against 89,663, the same registers. Bounds checks are free here, so the engine keeps relying on them.
+- **Transient command pools** (`VK_COMMAND_POOL_CREATE_TRANSIENT_BIT`): resetting a slot's pool still takes 404–415 µs a frame and ending its command buffer 268–290 µs, the same as without the flag.
+- **Buffer-to-texture copies** happen while loading (136 a frame at first, none in the camp), so skipping repeated ones would not help play.
 
 ## 120 Hz
 
