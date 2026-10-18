@@ -155,6 +155,10 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // engine's gfx-defer-events = 2; a marker file still wins). With the presenter's gfx-present-overlap the Redmi K50 Ultra
     // camp went from 7.7 to 19.5 fps (PR #9).
     setenv("DM_GFX_DEFER_EVENTS", "2", 0);
+    // 命令池在另一线程上重置（引擎的 gfx-async-pool-reset；标记文件仍优先）：Redmi K50 Ultra 上 vkResetCommandPool 每帧约占渲染线程 0.4 ms。
+    // Command pools reset on another thread (the engine's gfx-async-pool-reset; a marker file still wins): vkResetCommandPool
+    // took about 0.4 ms of every frame on the Redmi K50 Ultra's render thread.
+    setenv("DM_GFX_ASYNC_POOL_RESET", "1", 0);
     if (!getenv("DM_LANG") && *lg) setenv("DM_LANG", lg, 0);   // 首次安装的语言按系统首选（同 iOS CFLocaleCopyPreferredLanguages，见 dm_i18n.c） | first-install language follows the system preference (as iOS CFLocaleCopyPreferredLanguages, see dm_i18n.c)
     if (chdir(g_files)) LOG("【红】chdir %s 失败 errno %d", g_files, errno);
     (*env)->ReleaseStringUTFChars(env, files, f); (*env)->ReleaseStringUTFChars(env, ext, x); (*env)->ReleaseStringUTFChars(env, src, s); (*env)->ReleaseStringUTFChars(env, lang, lg);
