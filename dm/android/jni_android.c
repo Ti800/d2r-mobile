@@ -162,6 +162,11 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     setenv("DM_3D_SCALE_DYN","1",0);
     // PR23: marker gfx-async-pool-reset=1 enables device A/B; default remains off.
     setenv("DM_GFX_ASYNC_POOL_RESET","0",0);
+    // 新增压缩、写回和管线memo仅显式开启后参与设备对照，默认关闭。
+    // Native BC, writeback skipping and pipeline memo require explicit opt-in for device comparisons and default off.
+    setenv("DM_GFX_NATIVE_BC","0",0);
+    setenv("DM_GFX_WB_SKIP","0",0);
+    setenv("DM_GFX_PIPE_MEMO","0",0);
     setenv("DM_3D_SCALE_FLOOR","0.60",0);
     // Vulkan 适配器先沿用同步提交；上游新增翻译线程需独立验证对象生命周期。
     // Keep synchronous submission until the new upstream translation thread's object lifetimes are verified with Vulkan.
