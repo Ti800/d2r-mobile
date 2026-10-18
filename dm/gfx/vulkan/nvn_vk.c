@@ -29,6 +29,7 @@ static direct_record *g_direct;
 static double g_times[1024];
 static uint64_t g_time_ids[1024];
 static uint64_t g_cnt_report[32],g_cnt_reset[32];
+int xbg_evguard_fault(void *addr,int is_write,void *uc);   // xbg_game.cpp: diagnostic marker gfx-event-guard
 static int vk_wtrack_fault(void *addr,int is_write,void *uc){(void)is_write;(void)uc;return xbg_wtrack_fault(addr);}
 static uint64_t vk_now_ns(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+t.tv_nsec;}
 int dm_vk_initialize(const dm_vk_config *config,char *error,size_t bytes){
@@ -37,7 +38,7 @@ int dm_vk_initialize(const dm_vk_config *config,char *error,size_t bytes){
     int r=xbg_game_initialize(&config->game,error,bytes);if(r)return r;
     // 写跟踪的存储快照（xbg_game.cpp wtrack，gfx-wtrack 开启）：缺页与宿主写客体内存都走 crash.c 的钩子，引擎不另装信号处理
     // Write-tracked storage snapshots (xbg_game.cpp wtrack, opt-in gfx-wtrack): faults and host writes into guest memory go through crash.c's hooks; the engine installs no handler of its own
-    static int hooked;if(!hooked){hooked=1;xbg_wtrack_use_host_hooks();dm_fault_hook_register(vk_wtrack_fault);dm_guest_write_prep_register(xbg_wtrack_prepare);}
+    static int hooked;if(!hooked){hooked=1;xbg_wtrack_use_host_hooks();dm_fault_hook_register(vk_wtrack_fault);dm_guest_write_prep_register(xbg_wtrack_prepare);dm_fault_hook_register(xbg_evguard_fault);}
     r=xbg_game_set_sampler_mirror_clamp_to_edge(config->sampler_mirror_clamp_to_edge);
     if(r){xbg_game_shutdown();return r;}g_config=*config;g_ready=1;return 0;
 }

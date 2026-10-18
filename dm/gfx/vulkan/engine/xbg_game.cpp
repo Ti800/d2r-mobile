@@ -35,6 +35,9 @@ __attribute__((weak)) void nvn_dirty_slot_stats(int *live,int *used_slots,uint64
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <signal.h>
+#if defined(__ANDROID__)
+#include <ucontext.h>
+#endif
 #include <cerrno>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -540,8 +543,52 @@ struct Perf {
 void snapshot_reset();void last_pass_reset();
 void release_descriptors(Slot &s);
 void snapshot_invalidate(uint64_t address,uint64_t bytes);
+// Diagnostic (marker gfx-event-guard): while a SignalEvent's value is deferred (gfx-defer-events), the page holding the event
+// word is made inaccessible, so a read of it that bypasses nvnEventGetValue faults and is counted (NVN PERF evguard), then
+// the page is opened again. Applying the event opens it first. Pages the dirty tracker or wtrack protect would conflict:
+// run it with gfx-vcache=0, gfx-tex-dirty=0 and gfx-wtrack=0.
+namespace evguard {
+bool enabled=false;constexpr int slots_n=64;
+std::atomic<uintptr_t> page[slots_n],word[slots_n];   // guarded page; the pending event word in it (one per slot)
+std::atomic<uint64_t> exact{0},other{0},writes{0},guards{0};std::atomic<uintptr_t> last_pc{0},last_addr{0};
+// The first faulting access of a guarded page and who made it: the caller (LR; bionic's memcpy is a leaf), x0-x5 at the fault,
+// and the pending event word on that page, so a bulk copy that crosses the word can be told from one that stops before it.
+std::atomic<uintptr_t> last_lr{0},last_word{0},last_x[6];std::atomic<uintptr_t> callers[8];std::atomic<uint64_t> caller_hits[8];
+inline uintptr_t pg(uintptr_t a){return a&~uintptr_t(4095);}
+void reclose();
+void guard(uint64_t addr){if(!enabled)return;uintptr_t p=pg(uintptr_t(addr));
+    for(int i=0;i<slots_n;i++)if(page[i].load()==p && word[i].load()==uintptr_t(addr))return;
+    bool shut=false;for(int i=0;i<slots_n;i++)if(page[i].load()==p)shut=true;
+    for(int i=0;i<slots_n;i++){uintptr_t z=0;if(word[i].compare_exchange_strong(z,uintptr_t(addr))){page[i]=p;break;}}
+    if(!shut){mprotect(reinterpret_cast<void*>(p),4096,PROT_NONE);++guards;}reclose();}
+void open(uintptr_t p){mprotect(reinterpret_cast<void*>(p),4096,PROT_READ|PROT_WRITE);for(int i=0;i<slots_n;i++)if(page[i].load()==p){page[i]=0;word[i]=0;}}
+// A faulting access opens its page but keeps the pending words; reclose() shuts such pages again (at every guard(), and
+// after each engine copy), so later reads of a word that is still pending fault too.
+std::atomic<bool> reopened[slots_n];std::atomic<uint64_t> engine_opens{0},recloses{0};
+void reclose(){for(int i=0;i<slots_n;i++)if(reopened[i].exchange(false)){uintptr_t p=page[i].load();if(p){mprotect(reinterpret_cast<void*>(p),4096,PROT_NONE);++recloses;}}}
+// The engine's own copies of guest memory (stream_buffer) open the guarded pages they cover for the copy and shut them
+// after, so the guard stays on for guest reads; they are counted (engine_opens), not reported as faults.
+struct EngineRead{uintptr_t pages[8];int n=0;
+    EngineRead(const void *src,size_t bytes){if(!enabled || !bytes)return;uintptr_t lo=pg(uintptr_t(src)),hi=pg(uintptr_t(src)+bytes-1);
+        for(int i=0;i<slots_n && n<8;i++){uintptr_t q=page[i].load();if(!q || q<lo || q>hi)continue;bool dup=false;for(int k=0;k<n;k++)if(pages[k]==q)dup=true;
+            if(!dup){mprotect(reinterpret_cast<void*>(q),4096,PROT_READ|PROT_WRITE);pages[n++]=q;++engine_opens;}}}
+    ~EngineRead(){for(int k=0;k<n;k++){bool still=false;for(int i=0;i<slots_n;i++)if(page[i].load()==pages[k])still=true;if(still)mprotect(reinterpret_cast<void*>(pages[k]),4096,PROT_NONE);}}
+};
+void unguard(uint64_t addr){if(!enabled)return;uintptr_t p=pg(uintptr_t(addr));for(int i=0;i<slots_n;i++)if(page[i].load()==p){open(p);return;}}
+int fault(void *a,int w,void *uc){uintptr_t x=uintptr_t(a),p=pg(x);bool mine=false,hit=false;
+    uintptr_t near=0;
+    for(int i=0;i<slots_n;i++)if(page[i].load()==p){mine=true;uintptr_t e=word[i].load();near=e;if(x>=e && x<e+4)hit=true;}
+    if(!mine)return 0;
+    ++(hit?exact:other);if(w)++writes;last_addr=x;last_word=near;
+#if defined(__aarch64__) && defined(__ANDROID__)
+    if(uc){auto &mc=static_cast<ucontext_t*>(uc)->uc_mcontext;last_pc=uintptr_t(mc.pc);uintptr_t lr=uintptr_t(mc.regs[30]);last_lr=lr;
+        for(int i=0;i<6;i++)last_x[i]=uintptr_t(mc.regs[i]);
+        for(int i=0;i<8;i++){uintptr_t z=0;if(callers[i].load()==lr || callers[i].compare_exchange_strong(z,lr) || callers[i].load()==lr){++caller_hits[i];break;}}}
+#endif
+    mprotect(reinterpret_cast<void*>(p),4096,PROT_READ|PROT_WRITE);for(int i=0;i<slots_n;i++)if(page[i].load()==p)reopened[i]=true;return 1;}
+}
 void apply_event(uint64_t addr,uint32_t mode,uint32_t v){
-    snapshot_invalidate(addr,4);auto ptr=reinterpret_cast<uint32_t*>(addr);
+    evguard::unguard(addr);snapshot_invalidate(addr,4);auto ptr=reinterpret_cast<uint32_t*>(addr);
     if(mode==NVN_EVENT_SIGNAL_MODE_ADD)__atomic_fetch_add(ptr,v,__ATOMIC_SEQ_CST);else{need(mode==NVN_EVENT_SIGNAL_MODE_WRITE,"Unknown event mode");__atomic_store_n(ptr,v,__ATOMIC_SEQ_CST);}
 }
 // Deferred events in recording order; stop at the first whose slot is still in flight (slots retire in submission order).
@@ -704,7 +751,12 @@ void perf_frame(){
     {static uint64_t pm=0,pe=0;xbg_logf("NVN PERF pipelines_new=%llu evicted=%llu warm_hits=%llu created=%llu create_ms=%.1f create_max_ms=%.1f warm_built=%llu warm_failed=%llu warm_ms=%.0f",(unsigned long long)(pipeline_counts.misses-pm),(unsigned long long)(pipeline_counts.evictions-pe),(unsigned long long)warm::hits,(unsigned long long)warm::creates,warm::create_ns/1e6,warm::create_max_ns/1e6,(unsigned long long)warm::built.load(),(unsigned long long)warm::failed.load(),warm::build_ns.load()/1e6);warm::hits=warm::creates=warm::create_ns=warm::create_max_ns=0;pm=pipeline_counts.misses;pe=pipeline_counts.evictions;}
     xbg_logf("NVN PERF setcache ab=%d hits=%.1f misses=%.1f template=%.1f plain=%.1f memo_hits=%.1f memo_misses=%.1f why=texel%.1f/simg%.1f/sw%.1f/dynbuf%.1f/store%.1f",int(ab_frame_on),set_cache_hits/f,set_cache_misses/f,template_updates/f,plain_updates/f,desc_memo_hits/f,desc_memo_misses/f,desc_memo_why[0]/f,desc_memo_why[1]/f,desc_memo_why[2]/f,desc_memo_why[3]/f,desc_memo_why[4]/f);desc_memo_hits=desc_memo_misses=0;for(auto &w:desc_memo_why)w=0;xbg_logf("NVN PERF keydiff shader%.0f pool%.0f ubo%.0f uaddr%.0f size%.0f vp%.0f alpha%.0f drv%.0f tex%.0f samp%.0f saddr%.0f same%.0f new%.0f len%.0f",key_diff[0]/tf,key_diff[1]/tf,key_diff[2]/tf,key_diff[3]/tf,key_diff[4]/tf,key_diff[5]/tf,key_diff[6]/tf,key_diff[7]/tf,key_diff[8]/tf,key_diff[9]/tf,key_diff[10]/tf,key_diff[11]/tf,key_diff[12]/tf,key_diff[13]/tf);for(auto &k:key_diff)k=0;   // per timed frame
     xbg_logf("NVN PERF binds_skipped_per_frame=%.1f xmemo_hits=%.1f drops=%llu bumps=%llu/%llu/%llu/%llu/%llu pinned=%zu/%zu",binds_skipped/f,xmemo_hits/f,(unsigned long long)xmemo_drops,(unsigned long long)memo_bump[0],(unsigned long long)memo_bump[1],(unsigned long long)memo_bump[2],(unsigned long long)memo_bump[3],(unsigned long long)memo_bump[4],memo_pinned[0].size(),memo_pinned[1].size());binds_skipped=0;xmemo_hits=0;xbg_logf("NVN PERF noload_passes_per_frame=%.2f img_cache_hits=%.1f misses=%.1f why=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f",noload_passes/f,img_cache_hits/f,img_cache_misses/f,noload_why[0]/f,noload_why[1]/f,noload_why[2]/f,noload_why[3]/f,noload_why[4]/f,noload_why[5]/f,noload_why[6]/f,noload_why[7]/f);for(auto &w:noload_why)w=0;noload_passes=0;img_cache_hits=img_cache_misses=0;xbg_logf("NVN PERF desc_ns_per_frame memo_key=%.2f tmpl_update=%.2f alloc=%.2f setkey=%.2f build=%.2f hit_total=%.2f",desc_ns[0]/1e6/tf,desc_ns[1]/1e6/tf,desc_ns[2]/1e6/tf,desc_ns[3]/1e6/tf,desc_ns[4]/1e6/tf,desc_ns[5]/1e6/tf);for(auto &x:desc_ns)x=0;template_updates=plain_updates=0;set_cache_hits=set_cache_misses=0;
-    xbg_logf("NVN PERF async=%d drains=%.2f drain_ms=%.2f pace_ms=%.2f waits=%.2f",int(gfx_async),gfx_drain_calls.exchange(0)/f,gfx_drain_ns.exchange(0)/1e6/f,gfx_pace_ns.exchange(0)/1e6/f,gfx_wait_calls.exchange(0)/f);xbg_logf("NVN PERF events defer=%d deferred=%.2f cpu_reads_pending=%llu epochs=%zu reports=%zu",int(defer_events),events_deferred/f,(unsigned long long)event_reads,epochs.size(),pending_reports.size());events_deferred=0;
+    xbg_logf("NVN PERF async=%d drains=%.2f drain_ms=%.2f pace_ms=%.2f waits=%.2f",int(gfx_async),gfx_drain_calls.exchange(0)/f,gfx_drain_ns.exchange(0)/1e6/f,gfx_pace_ns.exchange(0)/1e6/f,gfx_wait_calls.exchange(0)/f);xbg_logf("NVN PERF events defer=%d deferred=%.2f cpu_reads_pending=%llu epochs=%zu reports=%zu",int(defer_events),events_deferred/f,(unsigned long long)event_reads,epochs.size(),pending_reports.size());if(evguard::enabled){Dl_info di{};uintptr_t pc=evguard::last_pc.load();const char *mod=pc && dladdr(reinterpret_cast<void*>(pc),&di) && di.dli_fname?di.dli_fname:"?";xbg_logf("NVN PERF evguard guards=%llu exact=%llu other=%llu writes=%llu last_addr=%#llx last_pc=%#llx in %s",(unsigned long long)evguard::guards.load(),(unsigned long long)evguard::exact.load(),(unsigned long long)evguard::other.load(),(unsigned long long)evguard::writes.load(),(unsigned long long)evguard::last_addr.load(),(unsigned long long)pc,mod);
+     xbg_logf("NVN PERF evguard engine_opens=%llu recloses=%llu",(unsigned long long)evguard::engine_opens.load(),(unsigned long long)evguard::recloses.load());
+     xbg_logf("NVN PERF evguard last word=%#llx x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx",(unsigned long long)evguard::last_word.load(),(unsigned long long)evguard::last_x[0].load(),(unsigned long long)evguard::last_x[1].load(),(unsigned long long)evguard::last_x[2].load(),(unsigned long long)evguard::last_x[3].load(),(unsigned long long)evguard::last_x[4].load(),(unsigned long long)evguard::last_x[5].load());
+     for(int i=0;i<8;i++){uintptr_t lr=evguard::callers[i].load();if(!lr)break;Dl_info li{};const char *lm="?",*ls="?";uintptr_t base=0,sym=0;
+         if(dladdr(reinterpret_cast<void*>(lr),&li)){if(li.dli_fname)lm=li.dli_fname;if(li.dli_sname)ls=li.dli_sname;base=uintptr_t(li.dli_fbase);sym=uintptr_t(li.dli_saddr);}
+         xbg_logf("NVN PERF evguard caller lr=%#llx %s+%#llx (%s+%#llx) hits=%llu",(unsigned long long)lr,lm,(unsigned long long)(lr-base),ls,(unsigned long long)(sym?lr-sym:0),(unsigned long long)evguard::caller_hits[i].load());}}events_deferred=0;
     {static const char *site_names[SITE_COUNT]={"other","ring","present","event","arena","gpu_sync","complete","poll","legacy_wait"};
      char line[768];int at=snprintf(line,sizeof(line),"NVN PERF block_ms");
      for(int i=0;i<SITE_COUNT && at<int(sizeof(line))-40;i++)if(block_calls[i])at+=snprintf(line+at,sizeof(line)-at," %s=%.2f/%.2f",site_names[i],block_ns[i]/1e6/f,block_calls[i]/f);
@@ -737,7 +789,7 @@ void retire_handle(std::function<void()> f){recording_slot().retire.handles.push
 template<class T>void retire_object(std::shared_ptr<T> p){recording_slot().retire.objects.push_back(std::move(p));}
 Buffer stream_buffer(size_t n,const void *data=nullptr,size_t copy=0,bool zero=true){
     Buffer b=recording_slot().stream.alloc(n);
-    if(data && copy){need(copy<=n,"Buffer copy overflow");memcpy(b.mapped,data,copy);}
+    if(data && copy){need(copy<=n,"Buffer copy overflow");evguard::EngineRead er(data,copy);memcpy(b.mapped,data,copy);}
     if(zero && copy<n)memset(static_cast<uint8_t*>(b.mapped)+copy,0,n-copy);
     b.flush();return b;
 }
@@ -1229,7 +1281,7 @@ void write_report(const PendingReport &r){
     uint64_t value=r.ts_value;if(timestamp_bits<64)value&=(uint64_t(1)<<timestamp_bits)-1;
     if(r.type==NVN_COUNTER_TYPE_SAMPLES_PASSED){++samples_reports;samples_reported+=samples;}
     NVNcounterData result{};result.counter=r.type==NVN_COUNTER_TYPE_SAMPLES_PASSED?samples:0;result.timestamp=uint64_t(double(value)*properties.limits.timestampPeriod*12.0/625.0);
-    snapshot_invalidate(r.addr,sizeof(result));memcpy(reinterpret_cast<void*>(r.addr),&result,sizeof(result));
+    snapshot_invalidate(r.addr,sizeof(result));evguard::EngineRead er(reinterpret_cast<void*>(r.addr),sizeof(result));memcpy(reinterpret_cast<void*>(r.addr),&result,sizeof(result));
 }
 // Reports whose timestamp and samples are all known are written in order.
 void resolve_known_reports(){
@@ -2830,10 +2882,10 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_SIGNAL_EVENT:{need(n>=16,"Truncated event");uint64_t addr;uint32_t mode,v;memcpy(&addr,p,8);memcpy(&mode,p+8,4);memcpy(&v,p+12,4);need(addr,"Null event address");SiteScope site(SITE_EVENT);
             if(defer_events){   // hand the work so far to the GPU without waiting; publish when that submission retires
                 Slot &cur=slots[slot_index];
-                if(defer_events==2 && cur.recording && cur.ops){recording_events.push_back({addr,mode,v,&cur});++events_deferred;break;}
+                if(defer_events==2 && cur.recording && cur.ops){recording_events.push_back({addr,mode,v,&cur});++events_deferred;evguard::guard(addr);break;}
                 if(cur.recording && cur.ops)submit_slots(false);
                 Slot &last=slots[slot_index^1];   // most recent submission (just made, or the previous one)
-                if(last.pending){pending_events.push_back({addr,mode,v,&last});++events_deferred;}else apply_event(addr,mode,v);
+                if(last.pending){pending_events.push_back({addr,mode,v,&last});++events_deferred;evguard::guard(addr);}else apply_event(addr,mode,v);
                 break;}
             complete_all();cpu_access(addr,4,10);snapshot_invalidate(addr,4);auto ptr=reinterpret_cast<uint32_t*>(addr);if(mode==NVN_EVENT_SIGNAL_MODE_ADD)__atomic_fetch_add(ptr,v,__ATOMIC_SEQ_CST);else{need(mode==NVN_EVENT_SIGNAL_MODE_WRITE,"Unknown event mode");__atomic_store_n(ptr,v,__ATOMIC_SEQ_CST);}break;}
         case OP_COPY_B2B:{need(n>=24,"Truncated buffer copy");uint64_t a[3];memcpy(a,p,24);need(a[0]&&a[1]&&a[2]<=256ull*1024*1024,"Invalid buffer copy");if(gpu_buffer_copy(a[0],a[1],a[2]))break;cpu_access(a[0],a[2],11);invalidate_cpu_range(a[1],a[2]);memmove(reinterpret_cast<void*>(a[1]),reinterpret_cast<void*>(a[0]),a[2]);break;}
@@ -2948,7 +3000,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     timestamp_bits=queues[cfg.queue_family].timestampValidBits;
     {const auto &l=properties.limits;VkDeviceSize a=256;for(VkDeviceSize x:{l.minUniformBufferOffsetAlignment,l.minStorageBufferOffsetAlignment,l.minTexelBufferOffsetAlignment,l.optimalBufferCopyOffsetAlignment,l.nonCoherentAtomSize,VkDeviceSize(16)})while(a<x)a<<=1;arena_alignment=a;}
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-mode";FILE *m=fopen(marker.c_str(),"rb");sync_mode=false;if(m){sync_mode=fgetc(m)=='1';fclose(m);}}
-     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}else if(const char *e=getenv("DM_GFX_DEFER_EVENTS")){int v=atoi(e);defer_events=v==1?1:v==2?2:0;}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-vcache").c_str(),"rb");vcache::enabled=false;if(v){vcache::enabled=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_VCACHE"))vcache::enabled=atoi(e)!=0;xbg_logf("NVN vertex/index cross-frame cache=%d tracker=%d (marker gfx-vcache)",int(vcache::enabled),int(nvn_dirty_since!=nullptr));}
+     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}else if(const char *e=getenv("DM_GFX_DEFER_EVENTS")){int v=atoi(e);defer_events=v==1?1:v==2?2:0;}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *eg=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-event-guard").c_str(),"rb");evguard::enabled=eg!=nullptr;if(eg)fclose(eg);if(evguard::enabled)xbg_logf("NVN event guard on (marker gfx-event-guard)");}{FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-vcache").c_str(),"rb");vcache::enabled=false;if(v){vcache::enabled=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_VCACHE"))vcache::enabled=atoi(e)!=0;xbg_logf("NVN vertex/index cross-frame cache=%d tracker=%d (marker gfx-vcache)",int(vcache::enabled),int(nvn_dirty_since!=nullptr));}
      {FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-tex-dirty").c_str(),"rb");tex_dirty=false;if(v){tex_dirty=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_TEX_DIRTY"))tex_dirty=atoi(e)!=0;
       xbg_logf("NVN texture checks through the dirty tracker=%d (marker gfx-tex-dirty)",int(tex_dirty));}{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc)",int(native_bc));}{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=32;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=32;fclose(m);}else if(const char *e=getenv("DM_GFX_PERF_SAMPLE"))perf_sample=unsigned(atoi(e));perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
     for(auto &sl:slots)sl=Slot{};slot_index=0;pass_prof_enabled=false;pass_prof_next=300;pass_prof_frame=UINT64_MAX;pass_prof_draws=0;pass_prof_queries=pass_prof_slots=pass_prof_skipped_slots=0;perf=Perf{};for(auto &c:perf_timing_before)c=XbgCpuTiming::Counter{};static_arena.cached=false;support_static.clear();format_property_cache.clear();for(auto &k:format_flat_known)k=false;
@@ -2983,6 +3035,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     return 0;
 }
 // nvnEventGetValue on a deferred event: finish the GPU work the signal covers, then the value is published (apply_ready_events).
+extern "C" int xbg_evguard_fault(void *addr,int is_write,void *uc){return evguard::enabled?evguard::fault(addr,is_write,uc):0;}
 extern "C" void xbg_game_event_read(const void *addr){
     std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized || failed)return;
     for(auto *list:{&pending_events,&recording_events})for(auto &e:*list)if(e.addr==uint64_t(reinterpret_cast<uintptr_t>(addr))){++event_reads;complete_all();return;}
