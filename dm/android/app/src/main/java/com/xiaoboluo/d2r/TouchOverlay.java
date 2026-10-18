@@ -19,6 +19,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import java.io.File;
 import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Locale;
@@ -89,7 +90,7 @@ public final class TouchOverlay extends View {
         if (enabled) {
             images.clear();
             for(int i=0;i<skillAtlases.length;i++) skillAtlases[i]=image("touchart/dm_native_skill_"+i+".png");
-            try { hudUi=new JSONObject(Files.readString(new File(overlayRoot,"hud_v4_ui/ui.json").toPath())); }
+            try { hudUi=new JSONObject(new String(Files.readAllBytes(new File(overlayRoot,"hud_v4_ui/ui.json").toPath()),StandardCharsets.UTF_8)); }
             catch(Exception ignored) { hudUi=null; }
             resizeNative();
         }
