@@ -62,6 +62,24 @@ Den of Evil fight, in-process A/B (target `poolreset`), steady windows:
 
 No retirement had to wait for a reset (`NVN PERF poolreset waits=0`). The fight is at the 60 fps pacing cap, so the 0.22 ms comes off the render thread's frame (where the long frames are) rather than showing in fps.
 
+## Why the camp is not perfectly even
+
+Every scene measured runs at the 60 fps pacing cap at scale 0.75: camp 60.0 fps (GPU 15.8 ms), Blood Moor 59.8 (GPU 13.9), Spider Forest 59.4 (GPU 13.9), Bloody Foothills 59.3 (GPU 13.8), Den of Evil fight 60.0 (GPU 14.7–15.3). In the camp, SurfaceFlinger showed 90% of frames on screen for 16.7 ms, 6% for 25 ms and 4% for 8.3 ms (a late frame, then a catch-up).
+
+The per-frame TSV (`DM_NVN_TSV`) shows the camp's game thread is nearly saturated: work 15.3 ms median (16.5 ms at p90) of the 16.7 ms frame. The frames over 18 ms are CPU-side; translation takes about 2 ms longer on them for the same draws, and they mostly stand alone.
+
+- **The timed frames (PR #25).** Frames numbered 0 mod 32 took 13.7 ms of submit CPU against about 9.5 ms on the others. That is the NVN PERF parts breakdown timing one frame in 32 with clock reads around every scope. The Android app now turns it off (`DM_GFX_PERF_SAMPLE=0`; the `gfx-perf-sample` marker still turns it on for measurements):
+
+| Camp | Timed 1 in 32 | Off |
+|---|---|---|
+| Frames over 18 ms | 12.6% | 7.2% |
+| Frame time p99 | 21.8 ms | 20.0 ms |
+| On screen for 16.7 / 25 / 8.3 ms | 90.2 / 5.9 / 3.9% | 93.9 / 4.0 / 2.1% |
+
+- **Snapshot reset (PRs #20, #24).** Each submission walked the slot's 600–800 persistent descriptor memo entries to erase none, and walked both snapshot maps' trees (about 3k nodes) to free them. A count of frame-local memo entries now skips the sweep, and the maps' nodes come from an arena that is rewound wholesale. In the camp's render thread profile, `snapshot_reset`, the tree destroy and the map inserts went from 3.3% to under 1%.
+
+**Tried, no gain:** `LOAD_OP_DONT_CARE` for the color attachments of depth-less passes (diagnostic only). The 49 small post-processing passes, about 4 ms at scale 0.75, took the same GPU time, so the driver does not reload those attachments. **Not a candidate:** the resident texel copies (about 1 MB) are rewritten by the game every frame, so write-protecting them would fault on every page. They keep the hash check.
+
 ## Pinning the game thread to the A710 cores: cooler, but slower
 
 Soaks in the camp with the production defaults, from a cool phone until 40 °C or 12 minutes:
