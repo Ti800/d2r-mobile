@@ -21,7 +21,7 @@ namespace {
 enum : uint32_t {
     OpEntryPoint = 15, OpCapability = 17, OpTypeBool = 20, OpTypeInt = 21, OpTypeVector = 23, OpTypePointer = 32,
     OpConstantTrue = 41, OpConstant = 43, OpFunction = 54, OpVariable = 59, OpLoad = 61, OpAccessChain = 65,
-    OpInBoundsAccessChain = 66, OpDecorate = 71, OpVectorExtractDynamic = 77, OpCompositeExtract = 81, OpBitcast = 124,
+    OpInBoundsAccessChain = 66, OpDecorate = 71, OpCompositeExtract = 81, OpBitcast = 124, OpSelect = 169,
     OpIEqual = 170, OpINotEqual = 171, OpShiftRightLogical = 194, OpBitwiseOr = 197, OpBitwiseAnd = 199,
     OpGroupNonUniformFirst = 333, OpGroupNonUniformAll = 334, OpGroupNonUniformAny = 335, OpGroupNonUniformBallot = 339,
     OpGroupNonUniformShuffle = 345, OpGroupNonUniformLast = 366, OpSubgroupKHRFirst = 4421, OpSubgroupKHRLast = 4432,
@@ -54,9 +54,10 @@ bool literal_at(uint32_t op, uint32_t w) {
 }
 }
 
-size_t xbg_spirv_warp32(const uint32_t *in, size_t n, std::vector<uint32_t> &out) {
+size_t xbg_spirv_warp32(const uint32_t *in, size_t n, uint32_t subgroup_size, std::vector<uint32_t> &out) {
     out.clear();
-    if (n < 5 || in[0] != 0x07230203u) return 0;
+    if (n < 5 || in[0] != 0x07230203u || subgroup_size <= 32 || subgroup_size > 128) return 0;
+    const uint32_t words = (subgroup_size + 31) / 32;   // ballot / mask words that hold lanes
     uint32_t bound = in[3];
     // Pass 1: declarations.
     struct Type { uint32_t op, a, b; };
@@ -67,6 +68,7 @@ size_t xbg_spirv_warp32(const uint32_t *in, size_t n, std::vector<uint32_t> &out
     size_t first_cap = 0, entry = 0, first_type = 0, first_func = 0;
     bool has_ballot_cap = false;
     uint32_t lane_var = 0, t_bool = 0, t_uint = 0, t_v4u = 0, t_ptr_in_uint = 0, c_true = 0, c_u0 = 0, c_u5 = 0, c_u31 = 0, c_u96 = 0;
+    uint32_t c_word[4] = {};   // uint constants 1-3: the word index a lane's warp reads
     for (size_t i = 5; i < n;) {
         uint32_t wc = in[i] >> 16, op = in[i] & 0xffff;
         if (!wc || i + wc > n) return 0;
@@ -89,7 +91,7 @@ size_t xbg_spirv_warp32(const uint32_t *in, size_t n, std::vector<uint32_t> &out
             else if (op == OpConstant && wc == 4 && in[i + 1] < bound && in[i + 2] < bound && types[in[i + 1]].op == OpTypeInt && types[in[i + 1]].a == 32) {
                 uint32_t id = in[i + 2], v = in[i + 3];
                 if (!v) zero[id] = 1;
-                if (in[i + 1] == t_uint) { if (v == 0 && !c_u0) c_u0 = id; if (v == 5 && !c_u5) c_u5 = id; if (v == 31 && !c_u31) c_u31 = id; if (v == 96 && !c_u96) c_u96 = id; }
+                if (in[i + 1] == t_uint) { if (v >= 1 && v <= 3 && !c_word[v]) c_word[v] = id; if (v == 0 && !c_u0) c_u0 = id; if (v == 5 && !c_u5) c_u5 = id; if (v == 31 && !c_u31) c_u31 = id; if (v == 96 && !c_u96) c_u96 = id; }
             }
             else if (op == OpVariable && wc >= 4 && in[i + 2] < bound) var_type[in[i + 2]] = in[i + 1];
         }
@@ -154,9 +156,10 @@ size_t xbg_spirv_warp32(const uint32_t *in, size_t n, std::vector<uint32_t> &out
     auto fresh = [&] { return bound++; };
     auto constant = [&](uint32_t &id, uint32_t v) { if (!id) { id = fresh(); decl.insert(decl.end(), {inst(OpConstant, 4), t_uint, id, v}); } };
     constant(c_u5, 5); constant(c_u31, 31); constant(c_u96, 96);
+    for (uint32_t k = 1; k < words; k++) constant(c_word[k], k);
+    if (!t_bool) { t_bool = fresh(); decl.insert(decl.end(), {inst(OpTypeBool, 2), t_bool}); }
     if (votes) {
         constant(c_u0, 0);
-        if (!t_bool) { t_bool = fresh(); decl.insert(decl.end(), {inst(OpTypeBool, 2), t_bool}); }
         if (!c_true) { c_true = fresh(); decl.insert(decl.end(), {inst(OpConstantTrue, 3), t_bool, c_true}); }
         if (!t_v4u) { t_v4u = fresh(); decl.insert(decl.end(), {inst(OpTypeVector, 4), t_v4u, t_uint, 4}); }
     }
@@ -175,6 +178,17 @@ size_t xbg_spirv_warp32(const uint32_t *in, size_t n, std::vector<uint32_t> &out
         uint32_t u = fresh(); out.insert(out.end(), {inst(OpBitcast, 4), t_uint, u, r}); return u;
     };
     auto warp_word = [&]() -> uint32_t { uint32_t r = raw_lane(), w = fresh(); out.insert(out.end(), {inst(OpShiftRightLogical, 5), t_uint, w, r, c_u5}); return w; };
+    // Word w of a ballot or mask vector into res: constant extracts and selects, as the Ryujinx translator emits (a dynamic
+    // index into a ballot made the Adreno 730 compiler fail the pipeline with VK_ERROR_UNKNOWN).
+    auto pick = [&](uint32_t rt, uint32_t res, uint32_t vec, uint32_t w) {
+        uint32_t r = words > 1 ? fresh() : res; out.insert(out.end(), {inst(OpCompositeExtract, 5), words > 1 ? t_uint : rt, r, vec, 0});
+        for (uint32_t k = 1; k < words; k++) {
+            uint32_t x = fresh(), c = fresh(), s = k + 1 == words ? res : fresh();
+            out.insert(out.end(), {inst(OpCompositeExtract, 5), t_uint, x, vec, k});
+            out.insert(out.end(), {inst(OpIEqual, 5), t_bool, c, w, c_word[k]});
+            out.insert(out.end(), {inst(OpSelect, 6), k + 1 == words ? rt : t_uint, s, c, x, r}); r = s;
+        }
+    };
     size_t next = 0;
     for (size_t i = 5; i < n;) {
         uint32_t wc = in[i] >> 16;
@@ -189,19 +203,19 @@ size_t xbg_spirv_warp32(const uint32_t *in, size_t n, std::vector<uint32_t> &out
                 uint32_t raw = fresh(); out.push_back(inst(OpLoad, wc)); out.insert(out.end(), {rt, raw}); out.insert(out.end(), in + i + 3, in + i + wc);
                 out.insert(out.end(), {inst(OpBitwiseAnd, 5), rt, res, raw, c_u31});
             } else if (k == WordExtract) {   // word id >> 5 of the ballot or mask
-                uint32_t w = warp_word(); out.insert(out.end(), {inst(OpVectorExtractDynamic, 5), rt, res, in[i + 3], w});
+                uint32_t w = warp_word(); pick(rt, res, in[i + 3], w);
             } else if (k == ChainLoad) {   // the whole mask, then word id >> 5
                 uint32_t mask = chain_mask[in[i + 3]], mp = var_type[mask], mt = types[mp].b, m = fresh();
                 out.insert(out.end(), {inst(OpLoad, 4), mt, m, mask});
-                uint32_t w = warp_word(); out.insert(out.end(), {inst(OpVectorExtractDynamic, 5), rt, res, m, w});
+                uint32_t w = warp_word(); pick(rt, res, m, w);
             } else if (k == VoteAll || k == VoteAny) {   // all: ballot(pred) == ballot(true); any: ballot(pred) != 0 (this warp's word)
                 uint32_t scope = in[i + 3], pred = in[i + 4], b1 = fresh(), x1 = fresh();
                 out.insert(out.end(), {inst(OpGroupNonUniformBallot, 5), t_v4u, b1, scope, pred});
-                uint32_t w = warp_word(); out.insert(out.end(), {inst(OpVectorExtractDynamic, 5), t_uint, x1, b1, w});
+                uint32_t w = warp_word(); pick(t_uint, x1, b1, w);
                 if (k == VoteAll) {
                     uint32_t b2 = fresh(), x2 = fresh();
                     out.insert(out.end(), {inst(OpGroupNonUniformBallot, 5), t_v4u, b2, scope, c_true});
-                    out.insert(out.end(), {inst(OpVectorExtractDynamic, 5), t_uint, x2, b2, w});
+                    pick(t_uint, x2, b2, w);
                     out.insert(out.end(), {inst(OpIEqual, 5), rt, res, x1, x2});
                 } else out.insert(out.end(), {inst(OpINotEqual, 5), rt, res, x1, c_u0});
             } else if (k == Shuffle) {   // the source lane inside this warp
