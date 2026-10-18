@@ -18,6 +18,9 @@ typedef enum {
 dm_overlay_result dm_overlay_validate(const char *directory,
                                       const char *expected_source_sha256,
                                       char *reason, size_t reason_capacity);
+/* 完整manifest验证通过后检查安卓绘制所需的固定资源；只读，不补写文件。
+ * After full manifest verification, require Android's fixed drawing assets; read-only, never repairs files. */
+dm_overlay_result dm_overlay_require_touch_art(const char *directory, char *reason, size_t reason_capacity);
 
 #ifdef __cplusplus
 }

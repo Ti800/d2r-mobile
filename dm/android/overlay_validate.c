@@ -238,6 +238,32 @@ static int ov_has_entry(const ov_check *v, const char *path) {
     return 0;
 }
 
+dm_overlay_result dm_overlay_require_touch_art(const char *directory, char *reason, size_t reason_capacity) {
+    ov_check v={.reason=reason,.reason_capacity=reason_capacity};
+    int rootfd=open(directory,O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
+    if (rootfd<0) return ov_fail(&v,DM_OVERLAY_INVALID,"touch art: unreadable overlay");
+    /* 原版图集和HUD只接受外部导入；旧版只含CASC的overlay不能静默失去技能图标和数值。
+       Native atlases and HUD are externally imported; old CASC-only overlays must not silently lose icons and numbers. */
+    static const char *const names[]={
+        "touchart/dm_native_skill_0.png","touchart/dm_native_skill_1.png","touchart/dm_native_skill_2.png",
+        "touchart/dm_native_skill_3.png","touchart/dm_native_skill_4.png","touchart/dm_native_skill_5.png",
+        "touchart/dm_native_skill_6.png","touchart/dm_native_skill_7.png","touchart/dm_native_skill_8.png",
+        "hud_v4_ui/ui.json","hud_v4_ui/base_full.png","hud_v4_ui/lvl_0.png","hud_v4_ui/lvl_1.png",
+        "hud_v4_ui/lvl_d0.png","hud_v4_ui/lvl_d1.png","hud_v4_ui/slot.png",
+        "hud_v4_ui/diff_1.png","hud_v4_ui/diff_2.png","hud_v4_ui/diff_3.png","hud_v4_ui/diff_4.png",
+        "hud_v4_ui/diff_5.png","hud_v4_ui/diff_6.png","hud_v4_ui/diff_7.png","hud_v4_ui/diff_8.png"};
+    dm_overlay_result status=DM_OVERLAY_OK;
+    for (size_t i=0;i<sizeof names/sizeof names[0];++i) {
+        int fd=ov_open_file(rootfd,names[i]); struct stat info;
+        if (fd<0 || fstat(fd,&info) || !S_ISREG(info.st_mode) || info.st_size<=0) {
+            if(fd>=0)close(fd);
+            status=ov_fail(&v,DM_OVERLAY_INVALID,"touch art: missing or invalid: %s",names[i]); break;
+        }
+        close(fd);
+    }
+    close(rootfd);return status;
+}
+
 static dm_overlay_result ov_inventory(ov_check *v, int dirfd_value, const char *prefix, unsigned depth, size_t *seen) {
     if (depth > OV_DEPTH_MAX) return ov_fail(v, DM_OVERLAY_INVALID, "overlay: directory depth exceeded");
     int copy = dup(dirfd_value);
