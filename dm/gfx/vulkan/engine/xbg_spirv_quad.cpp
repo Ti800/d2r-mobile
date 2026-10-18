@@ -225,6 +225,10 @@ size_t xbg_spirv_quad_derivatives(const uint32_t *in,size_t n,std::vector<uint32
         if(i.fn!=m.entry_fn || std::find(m.unsafe_functions.begin(),m.unsafe_functions.end(),i.fn)!=m.unsafe_functions.end()) {skip(xbg_quad_skip::control_flow);continue;}
         xbg_quad_skip reason=xbg_quad_skip::unknown_source;std::vector<uint8_t> visited(m.bound);
         if(!source_safe(m,p[4],visited,reason)) {skip(reason);continue;}
+        // 来源同时被当作位模式/整数/私有存储使用时也不能推定为纯数值。
+        // A source also consumed as bits, integers or private storage is not proven purely numeric.
+        std::fill(visited.begin(),visited.end(),0);
+        if(!uses_safe(m,p[4],visited,reason)) {skip(reason);continue;}
         std::fill(visited.begin(),visited.end(),0);
         if(!uses_safe(m,p[2],visited,reason)) {skip(reason);continue;}
         uint32_t scope=0,mask=0;const auto *idx=m.def(p[5]);bool index_ok=false;

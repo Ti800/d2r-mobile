@@ -19,7 +19,7 @@
 namespace fs=std::filesystem;
 using Words=std::vector<uint32_t>;
 using Quad=std::array<float,4>;
-enum class Mode { numeric,source_bits,source_bits_copy,result_bits,result_bits_copy,integer_use,memory_use,branch,scope,xor4,index,existing_coord };
+enum class Mode { numeric,source_bits,source_bits_copy,result_bits,result_bits_copy,integer_use,memory_use,branch,scope,xor4,index,existing_coord,source_bits_use,source_integer_use,source_memory_use };
 static void add(Words &v,uint32_t op,std::initializer_list<uint32_t> args) {
     v.push_back((uint32_t(args.size()+1)<<16)|op);v.insert(v.end(),args.begin(),args.end());
 }
@@ -35,13 +35,13 @@ static Words fixture(unsigned mask,Mode mode=Mode::numeric) {
     add(w,19,{1});add(w,21,{2,32,0});add(w,22,{3,32});add(w,23,{4,3,4});add(w,20,{5});
     add(w,32,{6,1,2});add(w,32,{7,1,3});add(w,32,{8,3,3});add(w,33,{9,1});
     if(mode==Mode::existing_coord)add(w,32,{16,1,4});
-    if(mode==Mode::memory_use)add(w,32,{16,7,3});
+    if((mode==Mode::memory_use || mode==Mode::source_memory_use))add(w,32,{16,7,3});
     add(w,59,{6,10,1});add(w,59,{7,11,1});add(w,59,{8,12,3});
     if(mode==Mode::existing_coord)add(w,59,{16,19,1});
     if(mode==Mode::source_bits || mode==Mode::source_bits_copy)add(w,59,{6,19,1});
     add(w,43,{2,13,mode==Mode::scope?2u:3u});add(w,43,{2,14,mode==Mode::xor4?4u:mask});add(w,41,{5,20});
     add(w,54,{1,100,0,9});add(w,248,{101});
-    if(mode==Mode::memory_use)add(w,59,{16,19,7});
+    if((mode==Mode::memory_use || mode==Mode::source_memory_use))add(w,59,{16,19,7});
     add(w,61,{2,102,10});add(w,198,{2,103,102,14});
     if(mode==Mode::source_bits || mode==Mode::source_bits_copy) {
         add(w,61,{2,116,19});add(w,124,{3,mode==Mode::source_bits?104u:117u,116});
@@ -50,10 +50,12 @@ static Words fixture(unsigned mask,Mode mode=Mode::numeric) {
     if(mode==Mode::branch) {add(w,247,{111,0});add(w,250,{20,112,113});add(w,248,{112});}
     add(w,345,{3,105,13,104,mode==Mode::index?102u:103u});
     add(w,62,{12,105});
+    if(mode==Mode::source_bits_use)add(w,124,{2,118,104});
+    if(mode==Mode::source_integer_use)add(w,109,{2,118,104});
     if(mode==Mode::result_bits)add(w,124,{2,118,105});
     if(mode==Mode::result_bits_copy) {add(w,83,{3,117,105});add(w,124,{2,118,117});}
     if(mode==Mode::integer_use)add(w,109,{2,118,105});
-    if(mode==Mode::memory_use)add(w,62,{19,105});
+    if((mode==Mode::memory_use || mode==Mode::source_memory_use))add(w,62,{19,mode==Mode::source_memory_use?104u:105u});
     if(mode==Mode::branch) {add(w,249,{111});add(w,248,{113});add(w,249,{111});add(w,248,{111});}
     add(w,253,{});add(w,56,{});return w;
 }
@@ -124,6 +126,9 @@ static void run_tests(const fs::path &output={}) {
         {Mode::result_bits_copy,xbg_quad_skip::bit_pattern,"transitive_result_bits"},
         {Mode::integer_use,xbg_quad_skip::integer_flow,"integer_use"},
         {Mode::memory_use,xbg_quad_skip::memory_flow,"private_memory"},
+        {Mode::source_bits_use,xbg_quad_skip::bit_pattern,"source_downstream_bits"},
+        {Mode::source_integer_use,xbg_quad_skip::integer_flow,"source_downstream_integer"},
+        {Mode::source_memory_use,xbg_quad_skip::memory_flow,"source_downstream_private_memory"},
         {Mode::branch,xbg_quad_skip::control_flow,"conditional_branch"},
         {Mode::scope,xbg_quad_skip::lane_index,"wrong_scope"},
         {Mode::xor4,xbg_quad_skip::lane_index,"cross_quad"},
