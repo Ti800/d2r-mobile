@@ -117,3 +117,17 @@ python dm/android/tools/stage_touch_assets.py --native-art <external-native-art>
 ```
 
 Import the complete finalized candidate overlay. Skill PNGs and HUD images stay in the external resource payload; do not add them to Git or APK assets. The renderer reads them from the validated imported `files/dm/overlay` directory. `DM_NATIVE_ART_DIR=<external-native-art>` lets the native-art capture test verify the external index and pixels. The five navigation buttons remain enabled until the complete replacement inventory flow passes device validation.
+
+## Debug performance controls
+
+Only CMake's Debug configuration reads `<files>/dm/android-debug.env`; Release contains no reader or call. This file is separate from the game's general `env`. It accepts only `DM_3D_SCALE`, `DM_3D_SCALE_DYN` and `DM_3D_SCALE_FLOOR`, one `KEY=VALUE` per line. Blank lines, `#` comments and CRLF are accepted. Unknown or repeated keys, files over 4096 bytes, lines over 127 characters, non-finite or malformed numbers, invalid switches and a floor above the starting scale reject the whole file. Scale and floor range from 0.50 through 1.00; DYN is exactly 0 or 1. The log reports acceptance/rejection without values.
+
+Defaults are scale 0.75, dynamic scaling enabled, floor 0.60. For a fixed-scale A/B comparison, use:
+
+```
+DM_3D_SCALE=0.75
+DM_3D_SCALE_DYN=0
+DM_3D_SCALE_FLOOR=0.60
+```
+
+Synchronization stays enabled. The file cannot override synchronization, frame overlap or any other setting. The parser regression is `dm/android/tests/test_debug_env.c`; build and run it independently from the game.

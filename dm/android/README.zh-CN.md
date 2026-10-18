@@ -81,3 +81,17 @@ python dm/android/tools/stage_touch_assets.py --native-art <仓外native-art>/To
 ```
 
 导入完整且已生成最终manifest的候选overlay。技能PNG和HUD图像留在外部资源载荷，不加Git或APK assets；绘制层从已校验导入的`files/dm/overlay`读取。设置`DM_NATIVE_ART_DIR=<仓外native-art>`可让素材采图测试核验仓外索引和像素。五个导航键保留，等完整替代背包流程通过真机验证后再调整。
+
+## Debug性能参数
+
+仅CMake的Debug配置读取`<files>/dm/android-debug.env`，Release不包含读取函数或调用。它与游戏通用`env`不同，只接受`DM_3D_SCALE`、`DM_3D_SCALE_DYN`、`DM_3D_SCALE_FLOOR`，每行一个`KEY=VALUE`。支持空行、`#`注释及CRLF；未知/重复键、文件超过4096字节、行超过127字符、非有限值/错误数字、非法开关、下限高于起点均整份拒绝。起点和下限范围为0.50至1.00，DYN只允许0或1。日志仅记录接受/拒绝，不输出数值。
+
+默认起点0.75、动态比例开启、下限0.60。固定比例A/B对照示例：
+
+```
+DM_3D_SCALE=0.75
+DM_3D_SCALE_DYN=0
+DM_3D_SCALE_FLOOR=0.60
+```
+
+同步仍开启；此文件不能覆盖同步、帧重叠或其他设置。解析器回归位于`dm/android/tests/test_debug_env.c`，可独立于游戏构建运行。

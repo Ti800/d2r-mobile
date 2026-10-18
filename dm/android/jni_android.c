@@ -36,6 +36,21 @@ void front_android_boot_failed(int code);
 static char g_files[1024], g_ext[1024], g_src[1024], g_runtime[1100];
 static FILE *g_logf;
 
+#ifdef DM_ANDROID_DEBUG_ENV
+#include "debug_env.h"
+/* 专用调试文件只供性能A/B，不读取游戏通用env，也不开放同步等危险键。
+ * This dedicated performance A/B file is separate from the game's general env and never exposes synchronization keys. */
+static void debug_environment(void) {
+    char path[1200];snprintf(path,sizeof path,"%s/dm/android-debug.env",g_files);
+    dm_android_debug_values values;
+    int result=dm_android_debug_load(path,&values);
+    if(result<0) { LOG("boot: debug environment rejected");return; }
+    if(!result)return;
+    for(unsigned i=0;i<3;++i)if(values.present&(1u<<i))setenv(dm_android_debug_keys[i],values.value[i],1);
+    LOG("boot: debug environment allowlist applied");
+}
+#endif
+
 // 挂起只能在原生pthread栈上执行；UI只登记最新状态，不能等正在等待Surface的呈现调用。
 // Suspend only on a native pthread stack; UI posts latest state without waiting for a present that needs a Surface.
 static dm_lifecycle_dispatch g_lifecycle;
@@ -138,6 +153,14 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     int n = link_romfs(romfs);
     LOG("boot: 资源链接 %d 个文件", n);
     setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
+#ifdef DM_ANDROID_DEBUG_ENV
+    debug_environment();
+#endif
+    /* 默认动态3D开启，起点0.75、下限0.60；Debug对照文件先应用，缺省值不覆盖它。
+       Enable dynamic 3D by default, starting at 0.75 with a 0.60 floor; apply Debug overrides before non-overwriting defaults. */
+    setenv("DM_3D_SCALE","0.75",0);
+    setenv("DM_3D_SCALE_DYN","1",0);
+    setenv("DM_3D_SCALE_FLOOR","0.60",0);
     // Vulkan 适配器先沿用同步提交；上游新增翻译线程需独立验证对象生命周期。
     // Keep synchronous submission until the new upstream translation thread's object lifetimes are verified with Vulkan.
     setenv("DM_NVN_SYNC", "1", 0);
