@@ -8,6 +8,7 @@
 #include "xbg_draw_timing.h"
 #include "xbg_provenance.h"
 #include "xbg_pipeline_key.h"
+#include "xbg_pipeline_memo.h"
 #include "xbg_vulkan.h"
 #include "xbg_depth.h"
 #include "xbg_sampler.h"
@@ -1335,11 +1336,12 @@ const RegisteredTexture &null_texture(const xbg_shader_binding &b){
 
 /* SHA-256 over the original NVN 0x880-byte control segment. */
 std::string control_key(const void *data){char key[17];need(xbg_shader_control_key(data,key)==0,"Missing shader control segment");return key;}
-struct Shader {std::string key;uint32_t stage;VkShaderModule module{};std::vector<xbg_shader_binding> bindings;std::vector<uint32_t> inputs,input_classes;std::vector<uint8_t> c1;
+void pipe_memo_invalidate();
+struct Shader {XbgPipelineGeneration lifetime;std::string key;uint32_t stage;VkShaderModule module{};std::vector<xbg_shader_binding> bindings;std::vector<uint32_t> inputs,input_classes;std::vector<uint8_t> c1;
     std::set<uint32_t> storage_writes; // Vulkan bindings of storage buffers the SPIR-V may write
     bool discards=true; // fragment shader may kill/demote (conservative default)
     Buffer c1_buffer{};bool c1_ready=false;
-    ~Shader(){if(module)vkDestroyShaderModule(cfg.device,module,nullptr);}};
+    ~Shader(){if(initialized)pipe_memo_invalidate();if(module)vkDestroyShaderModule(cfg.device,module,nullptr);}};
 // Storage buffers written by a shader. Pointers rooted at a storage-buffer
 // variable that reach OpStore/OpCopyMemory/atomics, function calls, phis or
 // selects mark that binding written; anything unprovable marks all written.
@@ -1401,30 +1403,17 @@ std::set<uint32_t> spirv_storage_writes(const std::vector<uint32_t> &w,bool &unk
 }
 std::map<std::string,std::unique_ptr<Shader>> shaders;
 const uint32_t nvn_stage[6]={0,3,4,2,1,5};
-struct State {
-    p_set_rt rt{};Shader *shader[6]{};NVNbufferRange ub[6][16]{},sb[6][16]{},vb[16]{};
-    uint64_t tex[6][128]{},samp[6][128]{},img[6][16]{};dpool_t texture_pool{},sampler_pool{};
-    uint32_t attrib[16]{};vs_st stream[16]{};blend_st blend[8]{};color_st color{};chmask_st mask{0xffffffff};ms_st ms{};poly_st poly{0,1,2,0};ds_st ds{0,1,2,0,8,8,1,1,1,1,1,1};
-    VkViewport viewport{0,0,1,1,0,1};VkRect2D scissor{{0,0},{UINT32_MAX,UINT32_MAX}};float blend_color[4]{},bias[3]{};uint32_t stencil_compare[2]{~0u,~0u},stencil_write[2]{~0u,~0u},stencil_ref[2]{};int64_t copy_stride=0,copy_image_stride=0;uint32_t patch_size=3;
-    xbg_depth_bounds bounds{0,0,1};bool count_samples=false;uint64_t samples_passed=0;
-} state;
-// 管线memo复用前一次draw的创建输入；仅移植PR16，不依赖PR10指针fast缓存，默认关。
-// Pipeline memo (gfx-pipe-memo): every input the draw's VkGraphicsPipelineCreateInfo is built from. When a draw's inputs
-// equal the previous draw's, it gets the previous draw's pipeline without serializing the create info into a key and
-// looking it up (xbg_graphics_pipeline_key with its module-id lookups was ~6% of the game thread on Adreno 730). Raw
-// copies of the state fields, so differing padding can only cost a miss. Off unless the host asks (DM_GFX_PIPE_MEMO, which
-// the Android app sets to 1); marker gfx-pipe-memo = 1 / 0; A/B target pipememo.
-struct PipeMemoKey{const void *shader[5];const void *layout,*pass_def;VkRenderPass pass;VkPipelineLayout pipeline_layout;int32_t prim;uint32_t samples,rt_n,colors,depth,depth_format;
-    uint8_t fixed[offsetof(State,viewport)-offsetof(State,attrib)];               // 顶点及固定状态 | Vertex and fixed state
-    uint8_t stencil[offsetof(State,copy_stride)-offsetof(State,blend_color)];      // 混合常量、偏移及模板 | Blend constants, bias and stencil
-    uint8_t tail[offsetof(State,count_samples)-offsetof(State,patch_size)];};      // 曲面patch大小及深度范围 | Tessellation patch size and depth bounds
-bool pipe_memo_valid=false;
-PipeMemoKey pipe_memo_key,pipe_memo_next;VkPipeline pipe_memo_pipeline=VK_NULL_HANDLE;bool pipe_memo=false;uint64_t pipe_memo_hits=0,pipe_memo_misses=0;
-void pipe_memo_fill(PipeMemoKey &k,const void *layout,const void *pass_def,VkRenderPass pass,VkPipelineLayout pipeline_layout,int prim,VkSampleCountFlagBits samples,uint32_t colors){
-    memset(&k,0,sizeof k);for(unsigned i=0;i<5;i++)k.shader[i]=state.shader[i];k.layout=layout;k.pass_def=pass_def;k.pass=pass;k.pipeline_layout=pipeline_layout;k.prim=prim;k.samples=uint32_t(samples);
-    k.rt_n=uint32_t(state.rt.n);k.colors=colors;k.depth=state.rt.depth!=nullptr;k.depth_format=state.rt.depth?uint32_t(state.rt.depth->d.format):0;
-    const uint8_t *b=reinterpret_cast<const uint8_t*>(&state);memcpy(k.fixed,b+offsetof(State,attrib),sizeof k.fixed);memcpy(k.stencil,b+offsetof(State,blend_color),sizeof k.stencil);memcpy(k.tail,b+offsetof(State,patch_size),sizeof k.tail);
-}
+using State=XbgPipelineDrawState<Shader>;
+State state;
+// 只复用同一生命周期/同一管线状态的前一draw；默认关，支持gfx-pipe-memo与pipememo A/B。
+// Reuse the previous draw only with matching lifetimes and pipeline state; off by default, with gfx-pipe-memo and pipememo A/B.
+using PipeMemoKey=XbgPipelineMemoKey<State>;
+struct PipelineEntry;struct LayoutEntry;struct PipelineDefinition;
+struct PipeMemoValue{VkPipeline pipeline{};PipelineEntry *entry=nullptr;};
+XbgPreviousPipelineMemo<PipeMemoKey,PipeMemoValue> pipe_memo_cache;
+PipeMemoKey pipe_memo_next;bool pipe_memo=false;uint64_t pipe_memo_hits=0,pipe_memo_misses=0;
+void pipe_memo_invalidate(){pipe_memo_cache.invalidate();}
+void pipe_memo_fill(PipeMemoKey &k,const LayoutEntry *layout,const PipelineDefinition *pass_def,VkRenderPass pass,VkPipelineLayout pipeline_layout,int prim,VkSampleCountFlagBits samples,uint32_t colors);
 void validate_capabilities(const std::vector<uint32_t> &w,uint32_t stage){
     need(w.size()>=5 && w[0]==0x07230203,"Invalid packaged SPIR-V");bool group_operations=false;VkSubgroupFeatureFlags groups=0;
     for(size_t i=5;i<w.size();){uint32_t count=w[i]>>16,op=w[i]&65535;need(count && i+count<=w.size(),"Invalid SPIR-V instruction bounds");if(op>=333 && op<=366)group_operations=true;
@@ -1529,7 +1518,7 @@ std::map<std::string,PipelineEntry> pipeline_objects;
 uint64_t pipeline_tick=0;
 constexpr size_t pipeline_object_limit=4096; // field scenes exceed 256 live pipelines; eviction+rebuild caused 100ms+ hitches
 struct PipelineLease {
-    VkPipeline pipeline{};bool transient=false;
+    VkPipeline pipeline{};PipelineEntry *entry=nullptr;bool transient=false;
     ~PipelineLease(){if(transient && pipeline){VkPipeline p=pipeline;retire_handle([p]{vkDestroyPipeline(cfg.device,p,nullptr);});}}
     PipelineLease()=default;
     PipelineLease(const PipelineLease&)=delete;
@@ -1653,7 +1642,7 @@ void pipeline_lookup(PipelineLease &out,const XbgPipelineKey &key,bool cacheable
     if(cacheable){
         bytes.assign(reinterpret_cast<const char*>(key.words),size_t(key.count)*4);
         auto found=pipeline_objects.find(bytes);
-        if(found!=pipeline_objects.end()){++pipeline_counts.hits;found->second.last_used=++pipeline_tick;out.pipeline=found->second.pipeline;return;}
+        if(found!=pipeline_objects.end()){++pipeline_counts.hits;found->second.last_used=++pipeline_tick;out.pipeline=found->second.pipeline;out.entry=&found->second;return;}
         ++pipeline_counts.misses;++pipelines_unsaved;
     }else ++pipeline_counts.bypass;
     if(graphics && cacheable && warm::take(bytes,out.pipeline)){++warm::hits;}
@@ -1664,20 +1653,23 @@ void pipeline_lookup(PipelineLease &out,const XbgPipelineKey &key,bool cacheable
         // All prior draws/dispatches waited their fence. This lookup occurs
         // before binding the current pipeline; no retained entry is in flight.
         auto oldest=std::min_element(pipeline_objects.begin(),pipeline_objects.end(),[](const auto &a,const auto &b){return a.second.last_used<b.second.last_used;});
-        {VkPipeline old=oldest->second.pipeline;retire_handle([old]{vkDestroyPipeline(cfg.device,old,nullptr);});pipe_memo_valid=false;}pipeline_objects.erase(oldest);++pipeline_counts.evictions;
+        {VkPipeline old=oldest->second.pipeline;pipe_memo_invalidate();retire_handle([old]{vkDestroyPipeline(cfg.device,old,nullptr);});}pipeline_objects.erase(oldest);++pipeline_counts.evictions;
     }
-    pipeline_objects.emplace(std::string(bytes),PipelineEntry{out.pipeline,++pipeline_tick});
+    out.entry=&pipeline_objects.emplace(std::string(bytes),PipelineEntry{out.pipeline,++pipeline_tick}).first->second;
 }
-void clear_pipeline_objects(){for(auto &p:pipeline_objects)vkDestroyPipeline(cfg.device,p.second.pipeline,nullptr);pipeline_objects.clear();pipe_memo_valid=false;}
+void clear_pipeline_objects(){pipe_memo_invalidate();for(auto &p:pipeline_objects)vkDestroyPipeline(cfg.device,p.second.pipeline,nullptr);pipeline_objects.clear();}
 struct PipelineDefinition {
-    std::vector<uint32_t> words;bool valid=false;
-    void assign(const XbgPipelineKey &k,bool ok){valid=ok && k.valid;if(valid)words.assign(k.words,k.words+k.count);}
+    XbgPipelineGeneration lifetime;std::vector<uint32_t> words;bool valid=false;
+    void assign(const XbgPipelineKey &k,bool ok){lifetime.refresh();valid=ok && k.valid;if(valid)words.assign(k.words,k.words+k.count);}
     XbgPipelineKeyView view()const{return {words.data(),uint32_t(words.size()),valid};}
 };
 // Descriptor set layouts, pipeline layouts and samplers are immutable for a
 // given binding list / sampler state, so they are created once and cached.
 // Descriptor sets come from per-slot pools that are reset after the slot fence.
-struct LayoutEntry {VkDescriptorSetLayout layout{};VkPipelineLayout pipeline_layout{};PipelineDefinition definition;VkDescriptorUpdateTemplate tmpl{};std::vector<uint64_t> tmpl_sig;};
+struct LayoutEntry {XbgPipelineGeneration lifetime;VkDescriptorSetLayout layout{};VkPipelineLayout pipeline_layout{};PipelineDefinition definition;VkDescriptorUpdateTemplate tmpl{};std::vector<uint64_t> tmpl_sig;};
+void pipe_memo_fill(PipeMemoKey &k,const LayoutEntry *layout,const PipelineDefinition *pass_def,VkRenderPass pass,VkPipelineLayout pipeline_layout,int prim,VkSampleCountFlagBits samples,uint32_t colors){
+    xbg_fill_pipeline_memo_key(k,state,layout,layout->lifetime.value,layout->definition.lifetime.value,pass_def,pass_def->lifetime.value,pass,pipeline_layout,prim,samples,colors);
+}
 // One descriptor payload slot for update templates (image/buffer info or texel view).
 union DescEntry{VkDescriptorImageInfo image;VkDescriptorBufferInfo buffer;VkBufferView view;};
 
@@ -1689,7 +1681,7 @@ std::map<std::pair<float,float>,Buffer> support_static; // support block per vie
 struct SamplerFastKey{std::array<uint32_t,11> w;bool operator==(const SamplerFastKey &o)const{return w==o.w;}};
 struct SamplerFastHash{size_t operator()(const SamplerFastKey &k)const{uint64_t h=1469598103934665603ull;for(uint32_t v:k.w){h^=v;h*=1099511628211ull;}return size_t(h);}};
 std::unordered_map<SamplerFastKey,VkSampler,SamplerFastHash> sampler_fast;
-void clear_descriptor_caches(){sampler_fast.clear();pipe_memo_valid=false;
+void clear_descriptor_caches(){sampler_fast.clear();pipe_memo_invalidate();
     for(auto &l:layout_cache){if(l.second.tmpl)vkDestroyDescriptorUpdateTemplate(cfg.device,l.second.tmpl,nullptr);vkDestroyPipelineLayout(cfg.device,l.second.pipeline_layout,nullptr);vkDestroyDescriptorSetLayout(cfg.device,l.second.layout,nullptr);}layout_cache.clear();shader_layouts.clear();
     for(auto &x:sampler_cache)vkDestroySampler(cfg.device,x.second,nullptr);sampler_cache.clear();
     static_arena.release();support_static.clear();
@@ -2149,7 +2141,7 @@ struct Pass {
 uint64_t noload_passes=0;
 struct RenderPassEntry {VkRenderPass pass{};PipelineDefinition definition;};
 std::map<std::vector<uint32_t>,RenderPassEntry> render_pass_cache;
-void clear_render_pass_cache(){for(auto &r:render_pass_cache)vkDestroyRenderPass(cfg.device,r.second.pass,nullptr);render_pass_cache.clear();pipe_memo_valid=false;}
+void clear_render_pass_cache(){pipe_memo_invalidate();for(auto &r:render_pass_cache)vkDestroyRenderPass(cfg.device,r.second.pass,nullptr);render_pass_cache.clear();}
 bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,bool soft=false){CPU_SCOPE(Pass);
     // 仅显式设置DM_VK_TRACE_ATTACHMENTS=1时输出成功诊断；首次调用读取，错误始终记录。
     // Read once: opt in with DM_VK_TRACE_ATTACHMENTS=1; errors are always logged.
@@ -2311,10 +2303,10 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.stageCount=stages.size();ci.pStages=stages.data();ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&ms;ci.pDepthStencilState=&ds;ci.pColorBlendState=&blend;ci.pDynamicState=&dy;ci.pTessellationState=state.shader[1]?&tess:nullptr;ci.layout=d.pipeline_layout;ci.renderPass=p.pass;
     PipelineLease pipeline;{CPU_SCOPE(Pipeline);
         bool memo=pipe_memo && !ab_off("pipememo") && d.entry->definition.valid && p.definition->valid;
-        if(memo){pipe_memo_fill(pipe_memo_next,&d.entry->definition,p.definition,p.pass,d.pipeline_layout,prim,p.samples,active_colors);
-            if(pipe_memo_valid && !memcmp(&pipe_memo_next,&pipe_memo_key,sizeof pipe_memo_next)){pipeline.pipeline=pipe_memo_pipeline;++pipe_memo_hits;}else ++pipe_memo_misses;}
+        if(memo){pipe_memo_fill(pipe_memo_next,d.entry,p.definition,p.pass,d.pipeline_layout,prim,p.samples,active_colors);
+            if(const PipeMemoValue *hit=pipe_memo_cache.find(pipe_memo_next)){pipeline.pipeline=hit->pipeline;pipeline.entry=hit->entry;pipeline.entry->last_used=++pipeline_tick;++pipeline_counts.hits;++pipe_memo_hits;}else ++pipe_memo_misses;}
         if(!pipeline.pipeline){XbgPipelineKey key;bool cacheable=xbg_graphics_pipeline_key(key,ci,d.entry->definition.view(),p.definition->view());pipeline_lookup(pipeline,key,cacheable,&ci,nullptr);}
-        if(memo && pipeline.pipeline && !pipeline.transient){pipe_memo_key=pipe_memo_next;pipe_memo_pipeline=pipeline.pipeline;pipe_memo_valid=true;}}
+        if(memo && pipeline.pipeline && pipeline.entry && !pipeline.transient)pipe_memo_cache.store(pipe_memo_next,{pipeline.pipeline,pipeline.entry});}
 
     // Buffer copies precede the draw; original guest layout remains unchanged.
     static std::vector<std::pair<uint32_t,Buffer*>> vertex_buffers;vertex_buffers.clear();
@@ -2940,7 +2932,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
       for(size_t at=0;at<list.size();at+=900)xbg_logf("NVN caps extensions[%zu] %s",at/900,list.substr(at,900).c_str());
       xbg_logf("NVN caps api=%u.%u.%u driver=%u maxUBdyn=%u maxPerStageUB=%u minUBAlign=%llu maxBoundSets=%u",VK_API_VERSION_MAJOR(properties.apiVersion),VK_API_VERSION_MINOR(properties.apiVersion),VK_API_VERSION_PATCH(properties.apiVersion),properties.driverVersion,properties.limits.maxDescriptorSetUniformBuffersDynamic,properties.limits.maxPerStageDescriptorUniformBuffers,(unsigned long long)properties.limits.minUniformBufferOffsetAlignment,properties.limits.maxBoundDescriptorSets);}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-ab-toggle").c_str(),"rb");ab_period=0;if(m){if(fscanf(m,"%d",&ab_period)!=1)ab_period=0;fclose(m);}{FILE *t=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-ab-target").c_str(),"rb");memset(ab_target,0,sizeof ab_target);if(t){if(fscanf(t,"%15s",ab_target)!=1)ab_target[0]=0;fclose(t);}}xbg_logf("NVN PERF ab_period=%d target=%s",ab_period,ab_target);}
-     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-memo").c_str(),"rb");pipe_memo=false;pipe_memo_valid=false;if(m){pipe_memo=fgetc(m)=='1';fclose(m);}else if(const char *e=getenv("DM_GFX_PIPE_MEMO"))pipe_memo=atoi(e)!=0;
+     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-memo").c_str(),"rb");pipe_memo=false;pipe_memo_invalidate();if(m){pipe_memo=fgetc(m)=='1';fclose(m);}else if(const char *e=getenv("DM_GFX_PIPE_MEMO"))pipe_memo=atoi(e)!=0;
       xbg_logf("NVN pipeline memo for repeated draw state=%d (marker gfx-pipe-memo)",int(pipe_memo));}
      ++slot_serial;gfx_enqueued=0;gfx_executed=0;gfx_presents_queued=0;gfx_async=false; /* Android game command memory remains guest-owned. */if(gfx_async)gfx_worker=std::thread(gfx_worker_loop);xbg_logf("NVN async translation=%d",int(gfx_async));}
     return 0;
