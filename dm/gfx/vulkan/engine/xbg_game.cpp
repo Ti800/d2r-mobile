@@ -1488,7 +1488,7 @@ void quad_rewrite(std::vector<uint32_t> &words,uint32_t stage){
 // wider than 32 lanes.
 bool warp32=false;std::atomic<uint64_t> warp_rewrites{0};
 void warp_rewrite(std::vector<uint32_t> &words,uint32_t stage){
-    if(!warp32 || stage!=5 || subgroup.subgroupSize<=32)return;std::vector<uint32_t> out;size_t k=xbg_spirv_warp32(words.data(),words.size(),out);
+    if(!warp32 || stage!=5 || subgroup.subgroupSize<=32)return;std::vector<uint32_t> out;size_t k=xbg_spirv_warp32(words.data(),words.size(),subgroup.subgroupSize,out);
     if(k){words.swap(out);warp_rewrites.fetch_add(k,std::memory_order_relaxed);}
 }
 Shader *load_shader(const void *control){
