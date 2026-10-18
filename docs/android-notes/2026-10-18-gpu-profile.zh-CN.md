@@ -49,6 +49,17 @@ English: [2026-10-18-gpu-profile.md](2026-10-18-gpu-profile.md)
 
 标记 `gfx-frame-rate` = N（Hz）改投票值；0 = 不投票。
 
+## 按游戏输出尺寸出图（PR #18）
+
+呈现端原来的交换链是 2712×1220：每帧先清整幅，再把游戏 2000×900 的输出用最近邻放大上去；随后显示引擎把这一层转进竖屏（`DEVICE` 合成、`ROT_90`，从没走 GPU 合成）。现在窗口缓冲取游戏输出的尺寸（`ANativeWindow_setBuffersGeometry`），呈现端 1:1 拷贝、不再清屏，由显示引擎在旋转的同时放大。
+
+| | 交换链 | 呈现端每帧 GPU |
+|---|---|---|
+| 之前 | 2712×1220 | 230 µs |
+| 之后 | 2000×900 | 163 µs |
+
+每帧少约 13 MB 内存流量，放大比最近邻平滑，其余画面不变。标记 `gfx-present-native` = 0 保留原来的交换链；`gfx-present-timing` 记下呈现端的 GPU 时间。
+
 ## MIUI 游戏加速：最大的一步
 
 App 不在 MIUI 的游戏加速列表里（安全中心 → 游戏加速 / 游戏空间 → +）时，MIUI 会压着它的 CPU 和 GPU 频率；清单里的 `appCategory="game"` 不够。把 D2R Mobile 加进去后，游戏运行时 `settings get secure gb_boosting` 为 1，上限放开：

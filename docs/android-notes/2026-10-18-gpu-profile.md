@@ -49,6 +49,17 @@ At the same frame rate, no frame now stays on screen for two whole 60 Hz refresh
 
 Marker `gfx-frame-rate` = N (Hz) changes the vote; 0 casts none.
 
+## Presenting at the game's output size (PR #18)
+
+The presenter's swapchain was 2712×1220. Every frame it cleared the whole image and scaled the game's 2000×900 output up with a nearest blit; the display engine then rotated the layer into the portrait panel (`DEVICE` composition, `ROT_90`; never GPU composition). Now the window's buffers take the game's output size (`ANativeWindow_setBuffersGeometry`), the presenter copies 1:1 without a clear, and the display engine scales the layer along with the rotation.
+
+| | Swapchain | Presenter GPU per frame |
+|---|---|---|
+| Before | 2712×1220 | 230 µs |
+| After | 2000×900 | 163 µs |
+
+About 13 MB less memory traffic per frame, a smoother upscale than nearest, the same picture otherwise. Marker `gfx-present-native` = 0 keeps the old swapchain; `gfx-present-timing` logs the presenter's GPU time.
+
 ## MIUI Game Turbo: the biggest single step
 
 MIUI keeps an app's CPU and GPU clocks capped unless the app is in its Game Turbo list (Security → Game Turbo / Game Space → +). The manifest's `appCategory="game"` is not enough. With D2R Mobile added, `settings get secure gb_boosting` reads 1 while the game runs and the caps lift:
