@@ -20,6 +20,7 @@
 // Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
 #include "../../host/hle.h"
 #include "nvn_protos.h"
+#include "nvn_pool_flags_registry.h"
 #include "nvn_count.h"
 #include "nvn_tex.h"
 #include "nvn_mtl.h"
@@ -175,43 +176,40 @@ NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) 
 NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
 // 池标志表：图形后端可查询一段客体内存所在池的标志（Vulkan 引擎据 CPU_NO_ACCESS 省掉被更新的 GPU 结果覆盖的存储写回）。
-// 建池、销池在客体线程，查询在渲染线程；用互斥量即可（不在信号处理里用）。表满时多出的池查不到，后端按未知处理。
+// 建池、销池在客体线程，查询在渲染线程；用互斥量（不在信号处理里用）。按池对象删除，重叠alias不证明CPU_NO_ACCESS。
+// 表满或非法范围后全表持续返回未知，避免未登记的可读alias被忽略。
 // Pool flags: a graphics backend may ask for the flags of the pool that holds a guest range (the Vulkan engine drops storage
 // writebacks into CPU_NO_ACCESS pools that newer GPU results supersede). Pools are created and destroyed on guest threads
-// and queried from the render thread, so a mutex is enough (never used in signal context). Pools past a full table are
-// simply unknown to the query.
-enum { POOL_FLAGS_MAX = 4096 };
-typedef struct { uintptr_t lo, hi; int flags; } pool_flags_t;
-static pool_flags_t g_pool_flags[POOL_FLAGS_MAX];
-static int g_npool_flags;
+// and queried from the render thread, so use a mutex (never in signal context). Remove by pool identity; overlapping aliases cannot prove CPU_NO_ACCESS.
+// A full table or invalid range makes all later queries unknown, so an untracked CPU-readable alias cannot be ignored.
+static nvn_pool_flags_registry g_pool_flags;
 static pthread_mutex_t g_pool_flags_mu = PTHREAD_MUTEX_INITIALIZER;
-static void pool_flags_add(const void *mem, uint64_t size, int flags) {
+static void pool_flags_add(const void *owner,const void *mem, uint64_t size, int flags) {
     pthread_mutex_lock(&g_pool_flags_mu);
-    if (g_npool_flags < POOL_FLAGS_MAX) g_pool_flags[g_npool_flags++] = (pool_flags_t){(uintptr_t)mem, (uintptr_t)mem + size, flags};
+    nvn_pool_flags_registry_add(&g_pool_flags,owner,mem,size,flags);
     pthread_mutex_unlock(&g_pool_flags_mu);
 }
-static void pool_flags_del(const void *mem) {
+static void pool_flags_del(const void *owner) {
     pthread_mutex_lock(&g_pool_flags_mu);
-    for (int i = 0; i < g_npool_flags; i++) if (g_pool_flags[i].lo == (uintptr_t)mem) { g_pool_flags[i] = g_pool_flags[--g_npool_flags]; break; }
+    nvn_pool_flags_registry_del(&g_pool_flags,owner);
     pthread_mutex_unlock(&g_pool_flags_mu);
 }
 // [addr, addr+len) 所在池的标志；不在任何登记的池里 → -1 | Flags of the pool holding [addr, addr+len); -1 when no registered pool holds it
 int nvn_pool_flags(const void *addr, size_t len) {
-    uintptr_t a = (uintptr_t)addr; int f = -1;
     pthread_mutex_lock(&g_pool_flags_mu);
-    for (int i = 0; i < g_npool_flags; i++) if (a >= g_pool_flags[i].lo && a + len <= g_pool_flags[i].hi) { f = g_pool_flags[i].flags; break; }
+    int f=nvn_pool_flags_registry_get(&g_pool_flags,addr,len);
     pthread_mutex_unlock(&g_pool_flags_mu);
     return f;
 }
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
-    if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pool_flags_add(o->mem, o->size, o->flags); }
+    if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pool_flags_add(p,o->mem, o->size, o->flags); }
     if (!o->mem && !(o->flags & 0x200)) LOG("【红】MemoryPoolInitialize 非虚拟池没有存储 flags=%#x size=%#llx", o->flags, o->size);
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
     return 1;
 }
-NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { if (((pool_t *)p)->mem) { pool_flags_del(((pool_t *)p)->mem); nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
+NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pool_flags_del(p); if (((pool_t *)p)->mem) { nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
 

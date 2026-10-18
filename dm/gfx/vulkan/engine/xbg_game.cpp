@@ -18,6 +18,7 @@
 #include "xbg_clear_spv.h"
 #include "xbg_spirv_quad.h"
 #include "xbg_spirv_warp.h"
+#include "xbg_writeback_policy.h"
 extern "C" {
 #include "../../tex/nvn_deswizzle.h"
 }
@@ -49,8 +50,8 @@ extern "C" {
 #include <condition_variable>
 #include <set>
 
-// Flags of the NVN memory pool that holds a guest range (dm/gfx/nvn/hle_nvn.c), or -1. Weak: hosts without it keep every
-// storage writeback.
+// 查询客体范围的NVN池标志，未知返回-1；弱接口缺失时不省略写回。
+// Query NVN pool flags for a guest range, or -1 when unknown; without the weak interface retain every writeback.
 extern "C" __attribute__((weak)) int nvn_pool_flags(const void *addr,size_t len);
 namespace {
 xbg_game_config cfg{};
@@ -374,15 +375,15 @@ std::vector<PendingEvent> pending_events,recording_events;   // 模式2当前槽
 int defer_events=0;uint64_t events_deferred=0,event_reads=0;
 struct PendingWriteback {uint64_t addr,bytes;Buffer buffer;const void *slot;};
 std::vector<PendingWriteback> pending_writebacks;
-// Storage writebacks superseded by a newer GPU result (gfx-wb-skip). In the D2R camp five compute outputs, 1.37 MB a frame
-// (1.25 MB of it a buffer that changes by a few KB), were written back at every retire although nothing read them from guest
-// memory: the next frame's dispatches and draws take them from the pending GPU copy (pending_view), and by the time a slot
-// retires the next frame has recorded a newer writeback of the same ranges. Reading them back took ~1 ms a frame on Adreno
-// 730, whose host-visible memory reads at 1.3 GB/s. A writeback is dropped when a newer pending writeback covers its range,
-// the range lies in a pool the game's CPU never reads (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) and no image aliases it (image
-// uploads read guest memory directly). Engine reads still get the newest result: the newer pending writeback until its slot
-// retires, guest memory after. Off unless the host asks (DM_GFX_WB_SKIP, which the Android app sets to 1); marker
-// gfx-wb-skip = 1 / 0; A/B target wbskip.
+// 被更新GPU结果覆盖的写回（gfx-wb-skip）。原PR在K50营地报告5个compute输出共1.37MB/帧，
+// 其中1.25MB缓冲只改少量字节，读回约1ms/帧；这是来源报告，本机尚未验证。
+// 仅完整新写回覆盖、CPU_NO_ACCESS且无图像alias时省略旧写回；GPU读用新pending_view，落地后用客体内存。
+// 建图/上传前先cpu_access，保证跳过后新alias也读最新数据。默认关闭，marker仅精确'1'开启，A/B目标wbskip。
+// Storage writebacks superseded by a newer GPU result (gfx-wb-skip). The original PR reports five compute outputs, 1.37 MB/frame,
+// including a 1.25 MB sparsely changed buffer, costing roughly 1 ms/frame in the K50 camp; this source report is not locally verified.
+// Skip only fully covered old writebacks in CPU_NO_ACCESS pools without image aliases; GPU reads use the newer pending_view, then guest memory after resolution.
+// Creation/upload calls cpu_access first so new aliases also see fresh data. Default off; only an exact '1' marker enables it; A/B target wbskip.
+
 bool wb_skip=false;uint64_t wb_skipped=0,wb_skipped_bytes=0;
 void cpu_access(uint64_t address,uint64_t bytes,unsigned why=0);   // resolve pending GPU results overlapping a CPU access
 void resolve_pending();
@@ -1114,14 +1115,13 @@ void invalidate_cpu_range(uint64_t address,uint64_t bytes){CPU_SCOPE(CpuWrite);
 }
 
 bool resolving_pending=false;
-// gfx-wb-skip (see wb_skip): a later pending writeback covers this one's range, which only the GPU reads.
+// 仅后续写回完整覆盖、池明确不允许CPU读且无图像alias时跳过；半开范围溢出不成立。
+// Skip only when a later writeback fully covers a known CPU_NO_ACCESS range with no image alias; overflowing half-open ranges never qualify.
 bool writeback_superseded(size_t i){
-    if(!wb_skip || !nvn_pool_flags || ab_off("wbskip"))return false;
-    const PendingWriteback &w=pending_writebacks[i];bool newer=false;
-    for(size_t k=i+1;k<pending_writebacks.size() && !newer;k++){const PendingWriteback &n=pending_writebacks[k];newer=n.addr<=w.addr && n.addr+n.bytes>=w.addr+w.bytes;}
-    if(!newer)return false;
-    int flags=nvn_pool_flags(reinterpret_cast<const void*>(uintptr_t(w.addr)),size_t(w.bytes));if(flags<0 || !(flags&NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS))return false;
-    bool image=false;for_images_overlapping(w.addr,w.bytes,[&](Image &){image=true;});return !image;
+    static_assert(NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS==1,"Writeback pool flag contract changed");
+    return xbg_wb_superseded(pending_writebacks,i,wb_skip && nvn_pool_flags && !ab_off("wbskip"),
+        [](uint64_t address,uint64_t bytes){return nvn_pool_flags(reinterpret_cast<const void*>(uintptr_t(address)),size_t(bytes));},
+        [](uint64_t address,uint64_t bytes){bool image=false;for_images_overlapping(address,bytes,[&](Image &){image=true;});return image;});
 }
 // Writebacks of a slot whose fence has signalled can be applied without waiting.
 void resolve_slot_writebacks(const void *slot){
@@ -1163,12 +1163,14 @@ void resolve_pending(){
     resolving_pending=false;
 }
 void cpu_access(uint64_t address,uint64_t bytes,unsigned why){
+    if(!bytes)return;
+    need(xbg_wb_range_valid(address,bytes),"CPU access range overflow");
     if(resolving_pending)return;
-    for(auto &w:pending_writebacks)if(address<w.addr+w.bytes && address+bytes>w.addr){++perf.why_access;if(why<12)++perf.access_by[why];resolve_pending();return;}
+    for(auto &w:pending_writebacks)if(xbg_wb_overlaps(address,bytes,w.addr,w.bytes)){++perf.why_access;if(why<12)++perf.access_by[why];resolve_pending();return;}
     // GPU reads of counter memory (snapshots) see the last resolved report, i.e.
     // one frame of latency for occlusion-driven effects instead of a full stall.
     if(why==1 || why==2)return;
-    for(auto &r:pending_reports)if(address<r.addr+sizeof(NVNcounterData) && address+bytes>r.addr){++perf.why_access;++perf.access_by[7];resolve_pending();return;}
+    for(auto &r:pending_reports)if(xbg_wb_overlaps(address,bytes,r.addr,sizeof(NVNcounterData))){++perf.why_access;++perf.access_by[7];resolve_pending();return;}
 }
 // Guest fence completion. Work recorded for submitted guest command buffers is
 // complete when every frame slot is retired; deferred results are then resolved.
@@ -1212,7 +1214,7 @@ void forget_framebuffers(Image &im,std::vector<VkFramebuffer> *deferred){
 // 图像直接缓存以 serial 与 images_epoch 为键；删除或清空映射推进代际。
 // Key the image front cache by serial and images_epoch; erasing or clearing the map advances its epoch.
 struct ImgFront{uint64_t serial=0,epoch=0;Image *im=nullptr;};ImgFront img_front[1024];uint64_t images_epoch=1;
-Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
+Image &get_image_after_access(const tex_t *t,bool upload){CPU_SCOPE(Image);
     need(t && t->serial && t->magic==MAGIC('T','E','X',0),"Invalid NVN texture");
     ImgFront &front=img_front[(t->serial*0x9E3779B97F4A7C15ull)>>54];Image *hit=front.epoch==images_epoch && front.serial==t->serial?front.im:nullptr;
     auto it=hit?images.end():images.find(t->serial);
@@ -1303,6 +1305,14 @@ Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
         Buffer staging=stream_buffer(linear.size(),linear.data(),linear.size(),false);for(auto &copy:copies)copy.bufferOffset+=staging.offset;Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,copies.size(),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();im.uploaded=true;provenance_write(im,__LINE__);im.cpu_hash=hash_memory(t->mem,t->L.size);im.checked_submission=stats.submissions;
     }
     provenance_image(upload?"GET_UPLOAD":"GET",t,im);return im;
+}
+Image &get_image(const tex_t *t,bool upload){
+    need(t && t->serial && t->magic==MAGIC('T','E','X',0),"Invalid NVN texture");
+    need(!t->mem || xbg_wb_range_valid(uint64_t(uintptr_t(t->mem)),t->L.size),"Texture CPU read range overflow or empty");
+    bool read=upload || images.find(t->serial)==images.end();
+    return xbg_image_after_cpu_access(*t,read,
+        [](uint64_t address,uint64_t bytes){cpu_access(address,bytes,9);},
+        [upload](const tex_t &stable)->Image &{return get_image_after_access(&stable,upload);});
 }
 const RegisteredTexture &null_texture(const xbg_shader_binding &b){
     // Original host evidence: main+0x1746820 explicitly binds descriptor 0xFFFFF
@@ -2428,7 +2438,19 @@ bool guest_texture_write(const tex_t *t,unsigned level,unsigned layer,const NVNc
     }
     return true;
 }
-void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
+void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){
+    need(request.tex,"Null buffer image texture");
+    tex_t stable=*request.tex;p_copy_b2t p=request;p.tex=&stable;
+    // 同步必须先于Image映射/引用；深度拆平面、BC解码和颜色复制随后才可读源字节。
+    // Synchronize before acquiring any Image mapping/reference; depth-plane splitting, BC decoding and color copying may read source bytes only afterwards.
+    if(p.tex->mem && p.tex->L.size)cpu_access(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size,9);
+    if(!to_buffer){
+        int bw=1,bh=1;int bpb=nvn_fmt_bpb(p.tex->d.format,&bw,&bh);xbg_depth_format depth;
+        if(xbg_depth_format_info(p.tex->d.format,&depth)==0){bw=bh=1;bpb=int(depth.packed_bytes);}
+        size_t row,image,bytes;
+        need(bpb>0 && nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,bw,bh,bpb,state.copy_stride,state.copy_image_stride,&row,&image,&bytes) && bytes<=256ull*1024*1024,"Invalid buffer image CPU read range");
+        cpu_access(p.src,bytes,9);
+    }
     Image &im=get_image(p.tex,to_buffer);
     if(p.has_view && p.view.set_format)(void)im.view_format(&p.view);
     if(im.samples!=VK_SAMPLE_COUNT_1_BIT || (im.decoded&&to_buffer))   // 原生BC在下方独立读回 | Native BC reads back in its own branch below
@@ -2496,7 +2518,7 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
         need(nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,bw,bh,bpb,state.copy_stride,state.copy_image_stride,&row,&image,&source_bytes) && row%bpb==0 && source_bytes<=256ull*1024*1024,"Invalid BC copy row stride/extent");
         need(p.src<=UINT64_MAX-source_bytes,"BC copy address overflow");
         size_t bytes=size_t(p.r.width)*p.r.height*p.r.depth*im.bpp;
-        if(!im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,source_bytes,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
+        if(!im.gpu_written && !(p.tex->d.flags&0x10)){invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
             if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
         need(bytes<=256ull*1024*1024,"Decoded BC staging exceeds memory bound");std::vector<uint8_t> decoded(bytes);
         int result=xbg_decode_bc_linear(p.tex->d.format,p.r.width,p.r.height,p.r.depth,reinterpret_cast<const void*>(p.src),source_bytes,row,image,decoded.data(),decoded.size());
@@ -2509,14 +2531,14 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
     size_t row,image,n;
     need(nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,1,1,im.bpp,state.copy_stride,state.copy_image_stride,&row,&image,&n) && n<=256ull*1024*1024,"Invalid or oversized color copy stride/extent");
     need(p.src<=UINT64_MAX-n,"Color copy address overflow");
-    if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,n,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
+    if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
         if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
     size_t slice_alignment=4;while(slice_alignment%im.bpp)slice_alignment+=4;
     size_t staging_row=size_t(p.r.width)*im.bpp;
     size_t staging_image=((staging_row*size_t(p.r.height)+slice_alignment-1)/slice_alignment)*slice_alignment,staging_bytes=staging_image*size_t(p.r.depth);
     need(staging_bytes<=256ull*1024*1024,"Color staging exceeds memory bound");
     std::vector<uint8_t> upload;
-    if(!to_buffer){cpu_access(p.src,n,9);upload.resize(staging_bytes);
+    if(!to_buffer){upload.resize(staging_bytes);
         for(int k=0;k<p.r.depth;k++)for(int y=0;y<p.r.height;y++)
             memcpy(upload.data()+size_t(k)*staging_image+size_t(y)*staging_row,reinterpret_cast<const uint8_t*>(p.src)+size_t(k)*image+size_t(y)*row,size_t(p.r.width)*im.bpp);
     }
@@ -2878,7 +2900,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wtrack").c_str(),"rb");if(w){wtrack::enabled=fgetc(w)=='1';fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;fclose(w);}xbg_logf("NVN wtrack enabled=%d",int(wtrack::enabled));{auto marker=[&](const char *name){FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");int c=-1;if(w){c=fgetc(w);fclose(w);}return c;};persistent_fb_enabled=marker("/gfx-no-persistent-fb")<0;slot_pools_enabled=marker("/gfx-no-slot-pools")<0;readback_cached=marker("/gfx-readback-cached")=='1';texel_memo_enabled=marker("/gfx-texel-memo")=='1';no_mutable_images=marker("/gfx-mutable-images")!='1';{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-test").c_str(),"rb");mutable_test=0;if(w){if(fscanf(w,"%u",&mutable_test)!=1)mutable_test=0;fclose(w);}}xbg_logf("NVN persistent framebuffers=%d slot command pools=%d cached readback=%d",int(persistent_fb_enabled),int(slot_pools_enabled),int(readback_cached));}}
      /* Android: no guest memory remapping probe. */
-     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wb-skip").c_str(),"rb");wb_skip=false;if(m){wb_skip=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_WB_SKIP"))wb_skip=atoi(e)!=0;
+     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wb-skip").c_str(),"rb");wb_skip=false;wb_skipped=wb_skipped_bytes=0;if(m){wb_skip=fgetc(m)=='1';fclose(m);}else if(const char *e=getenv("DM_GFX_WB_SKIP"))wb_skip=!strcmp(e,"1");
       xbg_logf("NVN superseded storage writebacks skipped=%d pool_flags=%d (marker gfx-wb-skip)",int(wb_skip),int(nvn_pool_flags!=nullptr));}
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}
