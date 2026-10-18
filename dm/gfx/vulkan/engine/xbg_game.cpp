@@ -1428,7 +1428,9 @@ void validate_capabilities(const std::vector<uint32_t> &w,uint32_t stage){
     need((subgroup.supportedOperations&groups)==groups,"Required subgroup operations unavailable");if(group_operations)need(subgroup.supportedStages&(1u<<stage),"Actual subgroup operation unsupported in shader stage");
 }
 // Fragment-shader quad-neighbour shuffles rewritten to fine derivatives (xbg_spirv_quad.cpp): on Adreno the shuffles read
-// garbage in helper invocations. The conservative correction skips bit patterns and unproved control/index flows. Both module
+// garbage in helper invocations. The conservative correction skips bit patterns and unproved control/index flows; the
+// translator's SHFL helper calls are rewritten at the call site when they are proven quad swaps of float values in uniform
+// control flow (D2R's form: 271 of its 278 calls). Both module
 // loaders apply it, so the warm-up builds the same modules the game binds. Off unless the host asks
 // (DM_GFX_QUAD_DERIVATIVES, which the Android app sets to 1; marker gfx-quad-derivatives = 1 / 0).
 bool quad_derivatives=false;std::atomic<uint64_t> quad_rewrites{0};
@@ -1437,9 +1439,10 @@ void quad_rewrite(std::vector<uint32_t> &words,uint32_t stage,const char *key,co
     std::vector<uint32_t> out;xbg_spirv_quad_stats counts;
     size_t k=xbg_spirv_quad_derivatives(words.data(),words.size(),out,&counts);
     if(k){words.swap(out);quad_rewrites.fetch_add(k,std::memory_order_relaxed);}
-    if(counts.candidates){
-        char line[768];int at=snprintf(line,sizeof(line),"NVN quad shader=%s loader=%s candidates=%zu rewritten=%zu guarded_nonfinite=%zu",key,loader,counts.candidates,k,counts.guarded_nonfinite);
+    if(counts.candidates || counts.calls){
+        char line[768];int at=snprintf(line,sizeof(line),"NVN quad shader=%s loader=%s candidates=%zu rewritten=%zu guarded_nonfinite=%zu calls=%zu calls_rewritten=%zu",key,loader,counts.candidates,counts.rewritten,counts.guarded_nonfinite,counts.calls,counts.calls_rewritten);
         for(size_t r=0;r<size_t(xbg_quad_skip::count) && at<int(sizeof(line))-64;++r)if(counts.skipped[r])at+=snprintf(line+at,sizeof(line)-at," skip_%s=%zu",xbg_spirv_quad_skip_name(xbg_quad_skip(r)),counts.skipped[r]);
+        for(size_t r=0;r<size_t(xbg_quad_call_skip::count) && at<int(sizeof(line))-64;++r)if(counts.call_skipped[r])at+=snprintf(line+at,sizeof(line)-at," call_skip_%s=%zu",xbg_spirv_quad_call_skip_name(xbg_quad_call_skip(r)),counts.call_skipped[r]);
         xbg_logf("%s",line);
     }
 }
