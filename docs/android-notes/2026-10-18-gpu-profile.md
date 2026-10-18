@@ -1,0 +1,56 @@
+# GPU profiling on the Redmi K50 Ultra, and 120 Hz (2026-10-18)
+
+中文：[2026-10-18-gpu-profile.zh-CN.md](2026-10-18-gpu-profile.zh-CN.md)
+
+Measured 17:40–18:40 NZDT on the Redmi K50 Ultra (Adreno 730, Vulkan 1.1, Android 15). Build `android/linux-build` with the Android defaults, camp, 3D scale held at 0.6 unless noted. The diagnostics are on branch `android/pipe-stats`, which is not for merging. The 120 Hz change is PR #17 (branch `android/frame-rate`).
+
+## Which GPU profilers can work here
+
+- **Perfetto** on this phone offers only `android.gpu.memory` for the GPU: no `gpu.counters` and no `gpu.renderstages`. So Android GPU Inspector's system profile gets no GPU counters or render stages.
+- **KGSL performance counters**, which AGI and Snapdragon Profiler read: a probe run as the shell and inside the app (`run-as`) opens `/dev/kgsl-3d0`, lists the counter groups (SP 24 counters, UCHE 12, TP 12, RB 8, LRZ 4 and others) and reserves counters. Every read fails with `EPERM`: the kernel does not let apps or the shell read them on this unrooted phone.
+- **Vulkan:** no `VK_KHR_performance_query`. The driver does offer `VK_KHR_pipeline_executable_properties`: per-pipeline compile statistics. That is the profiler used below.
+
+## What the driver says about the shaders
+
+`gfx-pipe-stats` (with `gfx-no-warm`, so every pipeline is created on demand) logs the statistics of every pipeline and the draws per frame of each one.
+
+| Fragment shader (main 3D pass) | Draws per frame | Instructions (ALU) | Registers | Max active invocations |
+|---|---|---|---|---|
+| `5c1ca4e7c3e4657c` | 284 | 3,710 (1,800) | 22 | 1 |
+| `38f344adf801b153` | 119 | 3,938 (1,959) | 25 | 1 |
+| `358197ac3db59cbc` | 72 | 3,393 (1,685) | 22 | 1 |
+| `acd655d88042767c` | 18 | 4,163 (2,135) | 25 | 1 |
+| Simple shaders (UI, depth, shadow) | | 1–400 | 0–5 | 3 |
+
+- The heavy lighting shaders run at the lowest occupancy the driver reports (1 against 3 for simple shaders), so they hide little texture latency.
+- No shader uses 16-bit ALU. Only one compute shader uses scratch memory.
+- The heaviest vertex shaders are 545–983 instructions; the shadow pass's 910.
+- The main-pass shaders do not discard, so early depth rejection works after the depth pre-pass.
+
+## Tried, no gain
+
+- **`spirv-opt -O` on the five heaviest shaders** (loaded through the diagnostic `files/dm/spv-override/<key>.spv`): the translator stores each Maxwell register in its own variable (about 2,800 variables, 5,000 loads, 3,000 stores per shader), and `spirv-opt` removes almost all of them (37 variables left, a third of the size). The driver's output does not change: registers and invocations equal, instructions within 1%, main pass 6.71–6.79 ms against 6.78. The Adreno compiler already does this work.
+- The translated shaders contain no half-float emulation and no function-local arrays.
+
+## 120 Hz
+
+The panel does 60, 90 and 120 Hz, and the system setting is 120 (`user_refresh_rate=120`; the launcher runs at 120 Hz). While the game runs, the display drops to 60 Hz: the game's surface casts no frame-rate vote, and Android then picks the lowest rate that fits.
+
+The presenter now votes 120 Hz for the game surface (`ANativeWindow_setFrameRate`, from `libnativewindow` looked up at run time), and the display stays at 120 Hz in the game. The game still paces to 60 fps (`nvn_pace_hz` takes the largest whole fraction of the refresh rate at or above 60). The difference is a frame that misses 16.7 ms: it now stays on screen for 25 ms instead of 33.3 ms.
+
+SurfaceFlinger timestats (present-to-present) in the camp, scale held at 0.75, the same build, 47.9 fps in both runs:
+
+| Display | Frames on screen for 16.7 ms | 25 ms | 33.3 ms | 50 ms |
+|---|---|---|---|---|
+| No vote: 60 Hz | 71% | — | 28% | a few |
+| 120 Hz vote | 39% | 61% | 0 | 0 |
+
+At the same frame rate, no frame now stays on screen for two whole 60 Hz refreshes: the steps are 1.5× instead of 2×, and the longest hold drops from 33–50 ms to 25 ms. No dropped frames in either run.
+
+Marker `gfx-frame-rate` = N (Hz) changes the vote; 0 casts none.
+
+## A correctness bug found on the way
+
+Four compute shaders (`098a126f92bf533a`, `7c16e695919ffc6e`, `fc85981c8d9148c9` with 8×8 workgroups, `fbc4a0eb955f5960` with 128×1) build per-tile lists with the warp-aggregated append. The highest active lane reserves `bitCount(ballot)` entries with one atomic add, and every lane writes at `base + bitCount(ballot & lanes below it)`.
+
+The translation takes only `subgroupBallot(...).x`, the 32 lanes of a Maxwell warp. Adreno runs 64-wide subgroups, so lanes 32–63 are missing from the count and all compute the same offset past the reserved range: their entries overwrite each other. The fix is a SPIR-V rewrite that emulates 32-wide warps inside the 64-wide subgroup (the virtual lane `id & 31`, the ballot word `id >> 5`, shuffles kept inside the half). Not done yet.
