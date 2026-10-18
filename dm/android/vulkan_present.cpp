@@ -2,6 +2,8 @@
 #include "vulkan_present.h"
 #include "../gfx/vulkan/nvn_vk.h"
 #include <android/log.h>
+#include <android/native_window.h>
+#include <dlfcn.h>
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -84,9 +86,18 @@ void cleanup_initialization(){
     destroy_swap();if(device)vkDestroyDevice(device,nullptr);device=VK_NULL_HANDLE;queue=VK_NULL_HANDLE;
     if(instance)vkDestroyInstance(instance,nullptr);instance=VK_NULL_HANDLE;physical=VK_NULL_HANDLE;
 }
+// 刷新率投票：App 不投票时，安卓（MIUI）让这个表面跑 60 Hz，尽管屏和系统设置都允许 120。投 120 Hz 不改 60 帧的出图节奏（nvn_pace_hz），
+// 但赶不上 16.7 ms 的那一帧在屏上停 25 ms 而不是 33.3 ms。标记 gfx-frame-rate = N（Hz；0 = 不投票）。
+// Frame-rate vote: without a vote from the app, Android (MIUI) runs this surface at 60 Hz although the panel and the system
+// setting allow 120. A 120 Hz vote keeps the 60 fps present pacing (nvn_pace_hz), but a frame that misses 16.7 ms stays on
+// screen for 25 ms instead of 33.3. Marker gfx-frame-rate = N (Hz; 0 = no vote).
+float frame_rate_vote=120;
 int create_surface(){
     destroy_swap();
     {std::lock_guard<std::mutex> lock(window_mutex);if(!desired)return VK_NOT_READY;active=desired;ANativeWindow_acquire(active);active_generation=generation;}
+    if(frame_rate_vote>0){   // libnativewindow, API 30+: looked up at run time, so older systems just keep their rate
+        static auto set_rate=[]{void *lib=dlopen("libnativewindow.so",RTLD_NOW);return reinterpret_cast<int32_t(*)(ANativeWindow*,float,int8_t)>(lib?dlsym(lib,"ANativeWindow_setFrameRate"):nullptr);}();
+        int fr=set_rate?set_rate(active,frame_rate_vote,ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT):-1;__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Frame rate vote %.0f Hz result=%d (marker gfx-frame-rate)",double(frame_rate_vote),fr);}
     VkAndroidSurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};ci.window=active;
     VkResult r=vkCreateAndroidSurfaceKHR(instance,&ci,nullptr,&surface);if(r)return r;
     if(!device)return 0;VkBool32 supported=VK_FALSE;r=vkGetPhysicalDeviceSurfaceSupportKHR(physical,family,surface,&supported);if(r||!supported)return r?r:VK_ERROR_FEATURE_NOT_PRESENT;return 0;
@@ -213,6 +224,7 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
 extern "C" void dm_android_vk_set_window(ANativeWindow *window){if(window)ANativeWindow_acquire(window);{std::lock_guard<std::mutex> l(window_mutex);if(desired)ANativeWindow_release(desired);desired=window;++generation;}window_cv.notify_all();}
 extern "C" int dm_android_vk_has_window(){return has_window(nullptr);}
 extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t bytes){
+    if(path){std::string dir=path;size_t cut=dir.find_last_of('/');if(FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-frame-rate").c_str(),"rb")){float v=0;frame_rate_vote=fscanf(m,"%f",&v)==1 && v>=0 && v<=240?v:0;fclose(m);}}
     std::lock_guard<std::mutex> render_lock(render_mutex);
     auto fail=[&](const char *what,VkResult r)->int{if(error&&bytes)snprintf(error,bytes,"%s: VkResult %d",what,int(r));if(!ready)cleanup_initialization();return int(r?r:VK_ERROR_INITIALIZATION_FAILED);};
     if(ready||!path||!*path)return fail("Initialization requires an external shader directory and an uninitialized renderer",VK_ERROR_INITIALIZATION_FAILED);
