@@ -2032,7 +2032,8 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                 // Every cached entry checks registration revision (including view) and live image identity.
                 // Repeated only when memo_check_gen moved since this entry's last pass: re-reading every record was ~12% of
                 // descriptors() in the D2R camp (a scattered load per image per draw), and in play no registration changes.
-                if(same && m.checked_gen!=memo_check_gen){
+                // A/B target hitgen repeats them on every hit, as before.
+                if(same && (m.checked_gen!=memo_check_gen || ab_off("hitgen"))){
                     for(size_t k=0;k<m.images.size();k++){const auto &cached=m.images[k];const tex_t *t=cached.first;
                         if(cached.record->revision!=cached.revision){same=false;break;}
                         if(t->serial!=m.tex_ids[k].first || t->mem!=m.tex_ids[k].second){same=false;break;}
