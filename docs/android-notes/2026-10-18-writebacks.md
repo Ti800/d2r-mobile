@@ -60,6 +60,19 @@ In-process A/B (`gfx-ab-toggle` 10 s, `gfx-ab-target` `wbskip`), battery at 29�
 - Screenshots from both phases of the fight look the same, including torch light, fire bolt, floor and units. The log shows no errors.
 - With the pin, the camp frame now waits on the GPU for longer (present 1.55 ms instead of 1.17).
 
+## Also: the previous draw's pipeline (PR #16)
+
+After the writebacks, the next single item was pipeline selection. Every draw serialized its `VkGraphicsPipelineCreateInfo` into a key (`xbg_graphics_pipeline_key`, with a module-id lookup per stage) and looked it up in a hash map: about 6% of the game thread.
+
+A draw now copies the inputs that create info is built from and compares them with the previous draw's. The inputs are the shader pointers, the layout and pass definitions, the primitive, the sample count, the targets, and the `State` fields from `attrib` to `ds`, `blend_color` to the stencil reference, the patch size and the bounds. When they are equal, the draw takes the previous pipeline. The memo is dropped wherever `pipeline_fast` drops entries (eviction and the cache clears).
+
+| Scene (in-process A/B, target `pipememo`) | Memo on | Memo off | Draws that hit |
+|---|---|---|---|
+| Camp, scale 0.6 (48 / 45 windows) | 53.36 fps, CPU 11.62 ms, GPU 17.69 ms | 52.93 fps, CPU 12.60 ms, GPU 17.65 ms | 80% |
+| Den fight, `DM_GAME_SEED=12345`, scale 0.75 (24 / 33 windows) | 49.39 fps, CPU 8.97 ms, GPU 19.14 ms | 48.70 fps, CPU 9.47 ms, GPU 19.32 ms | 74% |
+
+With both changes the camp at scale 0.6 is GPU bound: the CPU needs 11.6 ms of an 18.7 ms frame, and the present waits 2.2 ms for the GPU.
+
 ## Markers
 
 | Marker | Without it | With it |
@@ -67,7 +80,9 @@ In-process A/B (`gfx-ab-toggle` 10 s, `gfx-ab-target` `wbskip`), battery at 29�
 | `gfx-wb-skip` = 0 / 1 | on on Android (`DM_GFX_WB_SKIP`), off elsewhere | off / on (A/B target `wbskip`; `NVN PERF wbskip` counts the drops) |
 | `gfx-wb-census` (branch `android/wb-census`) | | diagnostic: writebacks per shader, changed bytes, read time, readers, bind and retire order |
 | `DM_POOL_LOG` in `env` (branch `android/wb-census`) | | one log line per memory pool with its flags |
+| `gfx-pipe-memo` = 0 / 1 | on on Android (`DM_GFX_PIPE_MEMO`), off elsewhere | off / on (A/B target `pipememo`; `NVN PERF pipememo` counts hits and misses) |
 
 ## Next
 
-The CPU frame in the camp is now mostly descriptors (4.1–4.4 ms per frame in the sampled part breakdown, which its own clock reads inflate), draw setup (3.8–4.1 ms) and snapshots (3.3–3.5 ms for about 15,000 lookups).
+- The camp at scale 0.6 and the Den fight at 0.75 are GPU bound now, so more CPU savings would not show in their fps. The GPU per pass is the next thing to look at.
+- On the CPU side, descriptors remain the biggest item (4.1–4.4 ms per frame in the sampled part breakdown, which its own clock reads inflate). Within them, uniform copies and per-image checks dominate.
