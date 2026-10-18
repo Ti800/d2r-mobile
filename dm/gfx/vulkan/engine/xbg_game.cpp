@@ -2677,6 +2677,7 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
         xbg_depth_format f;need(xbg_depth_format_info(p.tex->d.format,&f)==0,"Unknown NVN depth copy format");
         size_t row,image,bytes;
         need(nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,1,1,f.packed_bytes,state.copy_stride,state.copy_image_stride,&row,&image,&bytes) && row%f.packed_bytes==0 && bytes<=256ull*1024*1024,"Invalid packed depth copy stride/extent");
+        need(p.src<=UINT64_MAX-bytes,"Depth copy address overflow");
         std::vector<uint8_t> planes;std::vector<VkBufferImageCopy> copies;VkBufferImageCopy region{};
         region.imageSubresource=copy_layers(im,level,layer,p.r);region.imageOffset=copy_offset(im,p.r);region.imageExtent=copy_extent(im,p.r);
         append_depth_planes(planes,copies,p.tex->d.format,p.r.width,p.r.height,p.r.depth,
@@ -2722,6 +2723,7 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
         need(p.r.height%4==0 || uint32_t(p.r.yoffset+p.r.height)==std::max(1u,im.height>>level),"BC upload height must reach a block or mip edge");
         size_t row,image,source_bytes;
         need(nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,bw,bh,bpb,state.copy_stride,state.copy_image_stride,&row,&image,&source_bytes) && row%bpb==0 && source_bytes<=256ull*1024*1024,"Invalid BC copy row stride/extent");
+        need(p.src<=UINT64_MAX-source_bytes,"BC copy address overflow");
         size_t bytes=size_t(p.r.width)*p.r.height*p.r.depth*im.bpp;
         if(!im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,source_bytes,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
             if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
@@ -2738,7 +2740,8 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
     need(p.src<=UINT64_MAX-n,"Color copy address overflow");
     if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,n,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
         if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
-    size_t staging_image=(row*size_t(p.r.height)+3)&~size_t(3),staging_bytes=staging_image*size_t(p.r.depth);
+    size_t slice_alignment=4;while(slice_alignment%im.bpp)slice_alignment+=4;
+    size_t staging_image=((row*size_t(p.r.height)+slice_alignment-1)/slice_alignment)*slice_alignment,staging_bytes=staging_image*size_t(p.r.depth);
     need(staging_bytes<=256ull*1024*1024,"Color staging exceeds memory bound");
     std::vector<uint8_t> upload;
     if(!to_buffer){cpu_access(p.src,n,9);upload.resize(staging_bytes);
