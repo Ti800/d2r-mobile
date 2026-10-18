@@ -204,6 +204,10 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // No NVN PERF parts timing (the engine's gfx-perf-sample; a marker file still wins): a timed frame took ~4 ms more of the
     // render thread and missed its vsync in the camp, one hitch every 32 frames. Measurement runs turn it on with the marker.
     setenv("DM_GFX_PERF_SAMPLE", "0", 0);
+    // 客体主线程的短等待先自旋至多 30 µs 再睡（HLE 的 DM_HLE_SPIN_US）：D2R 主线程每帧约 45 次短暂地等工作线程持有的锁。
+    // The guest main thread spins up to 30 us before a wait sleeps (the HLE's DM_HLE_SPIN_US): D2R's main thread waits ~45
+    // times a frame, briefly, on locks its job workers hold.
+    setenv("DM_HLE_SPIN_US", "30", 0);
     if (!getenv("DM_LANG") && *lg) setenv("DM_LANG", lg, 0);   // 首次安装的语言按系统首选（同 iOS CFLocaleCopyPreferredLanguages，见 dm_i18n.c） | first-install language follows the system preference (as iOS CFLocaleCopyPreferredLanguages, see dm_i18n.c)
     if (chdir(g_files)) LOG("【红】chdir %s 失败 errno %d", g_files, errno);
     (*env)->ReleaseStringUTFChars(env, files, f); (*env)->ReleaseStringUTFChars(env, ext, x); (*env)->ReleaseStringUTFChars(env, src, s); (*env)->ReleaseStringUTFChars(env, lang, lg);
