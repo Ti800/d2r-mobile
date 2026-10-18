@@ -16,7 +16,7 @@ English: [README.md](README.md)
 
 ## 本地构建
 
-当前配置使用 JDK 17 或更新版本、Gradle 9.8.1、Android SDK 36、NDK 29.0.14206865、CMake 3.31.6 和 Python 3。ARM64 设备要求 Android 12/API 31 或更新系统及 Vulkan 1.3。这些是构建和清单要求，不代表符合条件的机型都已验证。首台目标是 vivo X200 Ultra（Android 16/API 36、Adreno 830）。
+当前配置使用 JDK 17 或更新版本、Gradle 9.8.1、Android SDK 36、NDK 29.0.14206865、CMake 3.31.6 和 Python 3。ARM64 设备要求 Android 12/API 31 或更新系统及具备所需设备能力的 Vulkan 1.1。这些是构建和清单要求，不代表符合条件的机型都已验证。首台目标是 vivo X200 Ultra（Android 16/API 36、Adreno 830）。
 
 按根目录准备说明提供自己的游戏文件。参考 `dm/host/Makefile` 的规则，在仓外生成 `dm_vault_tab.h`、`dm_hud_exp.h`、`dm_bright_levels.inc`。`ANDROID_HOME` 与 `ANDROID_SDK_ROOT` 必须指向同一个 SDK，`JAVA_HOME` 指向 JDK。在仓库根目录执行：
 
@@ -64,3 +64,5 @@ Vulkan 当前每次全画，并使用同步宿主翻译（`DM_NVN_SYNC=1`）；�
 覆盖层生成器将源码指纹和逐文件哈希写入 `overlay.manifest`，APK 编入同一生成器输入指纹。缺失、不完整或不匹配时，启动界面提示并在宿主线程启动前退出启动流程。须部署完整生成目录，不可把新清单贴到旧资源上，也不可在手机启动时补清单；生成器或布局修改后应重新生成。这项校验不负责认证第三方下载来源。
 
 `gen_romfs_overlay.py` 显式请求只生成 overlay 所需资产，跳过 iOS 技能图集及未使用的技能剪影；完整 `gen_assets.ensure()` 仍要求这些产物。技能图集改核尺寸和解码 RGBA 像素，保留原 sprite SHA256/MD5。生成子进程显式使用 UTF-8/LF，并保留已有只读资源适配器；Windows/Linux 的字节一致性仍须以同一游戏输入和工具版本实测。
+
+Vulkan 兼容路径按实际格式能力选择，不根据 Android 版本推断。启动日志记录 `format_feature_flags2` 与 `depth16_as_d24`；仅 D16 缺线性过滤且 X8_D24 满足全部用途时拓宽深度格式。Vulkan 1.1 版本号本身不等于兼容通过；vivo 应保持 `1 / 0`，Redmi K50 Ultra 仍需单独真机验证。
