@@ -49,6 +49,19 @@ At the same frame rate, no frame now stays on screen for two whole 60 Hz refresh
 
 Marker `gfx-frame-rate` = N (Hz) changes the vote; 0 casts none.
 
+## MIUI Game Turbo: the biggest single step
+
+MIUI keeps an app's CPU and GPU clocks capped unless the app is in its Game Turbo list (Security → Game Turbo / Game Space → +). The manifest's `appCategory="game"` is not enough. With D2R Mobile added, `settings get secure gb_boosting` reads 1 while the game runs and the caps lift:
+
+| Camp | Not in Game Turbo | In Game Turbo |
+|---|---|---|
+| X2 core cap | 2.25 GHz | 3.19 GHz (runs at it) |
+| A710 core cap | 2.57 GHz | 2.75 GHz |
+| Scale held at 0.6 | 53 fps, GPU 17.7 ms, CPU 11.6 ms | **60.0 fps** (the pacing cap), GPU 13.8 ms, CPU 10.6 ms |
+| Production defaults (dynamic scale) | settles at 0.65, 50–51 fps | **stays at 0.75**, 58–60 fps, GPU 15.6 ms; median frame interval 16.6 ms |
+
+The GPU is about 28% faster, so its clock was capped too. The catch is heat: the battery went from 32.4 to 38.0 °C in about 4 minutes, and the X2 cap had already dropped to 3.00 GHz. Players on MIUI should add the game to Game Turbo; sustained play will run warmer, and the dynamic scale lowers the resolution if the clocks fall.
+
 ## A correctness bug found on the way
 
 Four compute shaders (`098a126f92bf533a`, `7c16e695919ffc6e`, `fc85981c8d9148c9` with 8×8 workgroups, `fbc4a0eb955f5960` with 128×1) build per-tile lists with the warp-aggregated append. The highest active lane reserves `bitCount(ballot)` entries with one atomic add, and every lane writes at `base + bitCount(ballot & lanes below it)`.
