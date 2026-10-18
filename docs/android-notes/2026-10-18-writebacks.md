@@ -73,6 +73,28 @@ A draw now copies the inputs that create info is built from and compares them wi
 
 With both changes the camp at scale 0.6 is GPU bound: the CPU needs 11.6 ms of an 18.7 ms frame, and the present waits 2.2 ms for the GPU.
 
+## Where the frame goes now
+
+**Production defaults (dynamic scale), camp, 3 minutes:** the scale starts at 0.75 (46–47.6 fps, GPU 20.1 ms) and steps down to 0.70 (48.5 fps), then 0.65 (50–51 fps, GPU 18.6 ms). Each step comes from about 2.5% of frames over 25 ms. Before today's work it settled on the 0.6 floor at about 45.5 fps. GPU savings go to resolution first: the controller only stays at the configured 0.75 once frames there stay under 25 ms.
+
+**GPU per pass, camp at scale 0.6 (17.7 ms, 64 passes):**
+
+| Pass | Size | Draws | µs |
+|---|---|---|---|
+| Main 3D (B10G11R11 color + depth) | 1200×540 | 547 | 6,778 |
+| Shadow map (D16 kept as X8_D24: this device lacks linear filtering for D16) | 1024×1024 | 92 | 2,055 |
+| Depth pre-pass | 1200×540 | 547 | 1,754 |
+| UI | 2000×900 | 871 | 1,365 |
+| Compute (10 dispatches) | — | — | 1,200 |
+| Effects (3 RGBA16F targets) | 1200×540 | 19 | 811 |
+| Second shadow map | 1024×1024 | 119 | 387 |
+| 57 small passes (blur chains, final passes) | — | mostly 1 | 3,676 |
+
+**Tried, no gain:**
+- **Clear on load** (branch `android/clear-load`, not pushed): a whole-attachment clear that opens a pass became the attachment's `LOAD_OP_CLEAR` in a compatible render pass, instead of `LOAD` followed by `vkCmdClearAttachments`. 15 clears per frame converted, GPU 17.69 ms in both phases of an in-process A/B. The driver evidently skips the load itself.
+- **No occlusion queries** (diagnostic `gfx-no-occlusion`): GPU 17.99 ms against 17.69 ms. The 48 queries per frame cost nothing measurable.
+- **Main-pass fragment shader** (`358197ac3db59cbc`, 14K lines of SPIR-V): no function-local arrays (no scratch memory), no other subgroup operation. It is simply a large lighting shader (5 loops, 35 texture operations).
+
 ## Markers
 
 | Marker | Without it | With it |
