@@ -171,7 +171,7 @@ xbg_game_stats timing_before{};
 bool timing_active=false;
 // 默认颜色图不带 MUTABLE_FORMAT；异格式 view 触发原地升级，gfx-mutable-images=1 回退原创建路径。
 // Color images omit MUTABLE_FORMAT by default; differing view formats trigger an in-place upgrade, and gfx-mutable-images=1 restores the original creation path.
-bool no_mutable_images=true;uint64_t mutable_upgrades=0;unsigned mutable_test=0; // mutable_test (marker gfx-mutable-test = N): force the upgrade on every Nth color image when first sampled (test)
+bool no_mutable_images=true;uint64_t mutable_upgrades=0;unsigned mutable_test=0; // gfx-mutable-test=N首次采样时强制每第N张颜色图升级 | gfx-mutable-test=N forces upgrade on first sampling of every Nth color image
 struct Image;void upgrade_mutable(Image &im);
 bool perf_timing=true; // always-on wall-time breakdown for NVN PERF (exclusive deltas)
 // 按 gfx-perf-sample 指定的帧间隔采样 CPU 细项；0 关闭，细项均值只统计已采样帧。
@@ -617,7 +617,7 @@ void save_pipeline_cache(){
     warm::flush();xbg_logf("NVN pipeline cache save bytes=%zu new=%zu ok=%d",n,pipelines_unsaved,int(ok));if(ok)pipelines_unsaved=0;
 }
 void perf_frame(){
-    if(perf_frame_timed)++perf_timed_frames;perf_frame_timed=perf_sample && stats.presents.load()%perf_sample==0;   // the next frame
+    if(perf_frame_timed)++perf_timed_frames;perf_frame_timed=perf_sample && stats.presents.load()%perf_sample==0;   // 下一帧 | The next frame
     {bool was=ab_frame_on;ab_frame_on=ab_enabled();if(was!=ab_frame_on && ab_period>0){perf=Perf{};perf.window_start=timing_clock();set_cache_hits=set_cache_misses=0;return;}}
     if(pipelines_unsaved && stats.presents.load()>=pipeline_save_frame+300){pipeline_save_frame=stats.presents.load();save_pipeline_cache();}
     uint64_t now=timing_clock();if(!perf.window_start){perf.window_start=now;perf.frames=0;return;}
@@ -896,7 +896,7 @@ struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;VkImageCreateInfo create{}; // 保存无pNext的创建参数供升级 | Saved creation info without pNext for upgrade
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;
-    std::map<std::array<uint32_t,8>,VkImageView> views;std::vector<std::vector<uint64_t>> fb_keys; // fb_keys: persistent framebuffers using these views
+    std::map<std::array<uint32_t,8>,VkImageView> views;std::vector<std::vector<uint64_t>> fb_keys; // 使用这些view的驻留framebuffer键 | Persistent framebuffer keys using these views
     ~Image(){forget_framebuffers(*this);for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
     void transition(VkCommandBuffer cmd,VkImageLayout next){
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.oldLayout=layout;b.newLayout=next;b.image=image;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
@@ -1080,9 +1080,8 @@ void resolve_known_reports(){
     if(done)pending_reports.erase(pending_reports.begin(),pending_reports.begin()+done);
     // Fold known queries into the running sum up to the earliest count still needed by a pending report, then drop them.
     for(auto &e:epochs){uint64_t limit=e.second.known_upto;for(auto &r:pending_reports)if(r.epoch==e.first)limit=std::min<uint64_t>(limit,r.count);e.second.prefix(limit);e.second.trim();}
-    // A report only ever names the epoch current when it was recorded, so an older epoch that no pending report names is
-    // dead (retire skips query refs to erased epochs). Waiting for no pending report at all never happens once frames
-    // overlap, and the map then grew by every counter reset (~13 per D2R frame).
+    // 报告只引用录制时的epoch；无待报告引用的旧epoch可删，不能等待所有报告同时清空。
+    // Reports name their recording epoch; erase old epochs with no pending references without waiting for every report to clear.
     for(auto it=epochs.begin();it!=epochs.end();){bool used=it->first==counter_epoch;for(auto &r:pending_reports)if(r.epoch==it->first){used=true;break;}
         if(used)++it;else it=epochs.erase(it);}
 }
