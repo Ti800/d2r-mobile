@@ -10,6 +10,7 @@
 #include "../host/front.h"
 #include "../host/dm_input.h"
 #include "touch_android.h"
+#include "../ios/Sources/dm_touch_game_state.h"
 #include <math.h>
 #include <stdatomic.h>
 
@@ -37,6 +38,8 @@ void front_run(void (*guest)(void)) {
         void uimsg_subscribe(void (*)(const char *, const char *, const char *));
         uimsg_subscribe(dm_android_touch_uimsg);
         dm_pad_hook = dm_android_touch_step;
+        dm_touch_game_attach();
+        dm_touch_game_live_check(1);
     }
     guest();   // 两种形态都在调用线程上跑：App 形态由 JNI 侧先起好客体线程再进 dm_main | Both forms run on the calling thread: in the App form the JNI side starts the guest thread first and then enters dm_main
 }

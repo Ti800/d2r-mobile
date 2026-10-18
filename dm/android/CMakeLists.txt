@@ -73,9 +73,21 @@ set(ANDROID_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/compat/mach_symbols.c
   ${DM}/gfx/vulkan/nvn_vk.c)
 
+# 技能索引由玩家资源在仓外生成；公共只读桥复用同一套身份与过期校验。
+# Generate the skill index outside the repository from the player's files; share identity and freshness checks.
+if(NOT EXISTS ${DM_GEN_DIR}/dm_touch_native_art.c)
+  message(FATAL_ERROR "Generate native_art/generate.py <romfs> --output-dir <DM_GEN_DIR> first")
+endif()
+list(APPEND ANDROID_SRCS
+  ${DM}/ios/Sources/dm_touch_game_state.c
+  ${DM}/ios/Sources/dm_touch_game_identity.c
+  ${DM}/ios/Sources/dm_touch_game_bridge.c
+  ${DM_GEN_DIR}/dm_touch_native_art.c)
+
 add_library(dmcore STATIC ${HOST_SRCS} ${HLE_SRCS} ${GFX_SRCS} ${LIBDEFLATE_SRCS} ${ASM_SRCS} ${ANDROID_SRCS})
 list(REMOVE_DUPLICATES HOST_SRCS)
 target_include_directories(dmcore PUBLIC ${HOST} ${DM}/gfx/nvn/include ${CMAKE_CURRENT_SOURCE_DIR}/compat/include ${DM_GEN_DIR})
+target_include_directories(dmcore PUBLIC ${DM}/ios/Sources)
 # 与 Makefile 同档优化（-O1 -g）；dm_android_compat.h 强制包含；-fno-strict-aliasing 同苹果 clang 缺省行为下宿主对客体内存的读写习惯
 # Same optimization level as the Makefile (-O1 -g); dm_android_compat.h force-included; -fno-strict-aliasing matches the host's habit of reading and writing guest memory under Apple clang's default behaviour
 set(DM_CFLAGS -O1 -g -Wall -Wno-unused-function -fno-strict-aliasing -include ${CMAKE_CURRENT_SOURCE_DIR}/compat/include/dm_android_compat.h)

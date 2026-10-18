@@ -47,6 +47,7 @@ _RESERVED = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\Z", re.I)
 # a new code/layout input; --inputs exposes exactly this list to CMake.
 SOURCE_INPUTS = tuple(sorted((
     "dm/ios/tools/overlay_contract.py",
+    "dm/android/tools/stage_touch_assets.py",
     "dm/ios/tools/gen_romfs_overlay.py", "dm/ios/tools/gen_assets.py",
     "dm/ios/tools/gen_paths.py", "dm/ios/tools/gen_hud_v4.py",
     "dm/ios/tools/hud_v4_design.py", "dm/ios/tools/layout_patch.py",

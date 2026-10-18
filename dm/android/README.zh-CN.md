@@ -66,3 +66,18 @@ Vulkan 当前每次全画，并使用同步宿主翻译（`DM_NVN_SYNC=1`）；�
 `gen_romfs_overlay.py` 显式请求只生成 overlay 所需资产，跳过 iOS 技能图集及未使用的技能剪影；完整 `gen_assets.ensure()` 仍要求这些产物。技能图集改核尺寸和解码 RGBA 像素，保留原 sprite SHA256/MD5。生成子进程显式使用 UTF-8/LF，并保留已有只读资源适配器；Windows/Linux 的字节一致性仍须以同一游戏输入和工具版本实测。
 
 Vulkan 兼容路径按实际格式能力选择，不根据 Android 版本推断。启动日志记录 `format_feature_flags2` 与 `depth16_as_d24`；仅 D16 缺线性过滤且 X8_D24 满足全部用途时拓宽深度格式。Vulkan 1.1 版本号本身不等于兼容通过；vivo 应保持 `1 / 0`，Redmi K50 Ultra 仍需单独真机验证。
+# 当期iOS触控
+
+安卓复用上游触控状态机及只读技能绑定观测桥。用自己的匹配RomFS在仓外生成绑定索引和图集PNG：
+
+```
+python dm/ios/tools/native_art/generate.py <RomFS> --output-dir <仓外native-art>
+```
+
+只把`dm_touch_native_art.c`复制到现有`DM_GEN_DIR`。CMake要求该仓外索引与原有宿主生成头同时存在。生成新的overlay和HUD后执行：
+
+```
+python dm/android/tools/stage_touch_assets.py --native-art <仓外native-art>/TouchArt --hud <assets>/NativeHUD/v4/hud_v4_ui --overlay <候选overlay>
+```
+
+导入完整且已生成最终manifest的候选overlay。技能PNG和HUD图像留在外部资源载荷，不加Git或APK assets；绘制层从已校验导入的`files/dm/overlay`读取。设置`DM_NATIVE_ART_DIR=<仓外native-art>`可让素材采图测试核验仓外索引和像素。五个导航键保留，等完整替代背包流程通过真机验证后再调整。
