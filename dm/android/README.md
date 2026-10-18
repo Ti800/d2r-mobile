@@ -66,7 +66,7 @@ screen is not implemented.
 | --- | --- |
 | App internal `files/dm/out/` | `main` and `sdk` rewriter products generated with `DM_TARGET=android`, including patched modules, fixups, and gates |
 | App internal `files/dm/shaders/` | External `.xgs` bundles matching the game and Vulkan backend |
-| App internal `files/dm/overlay/` | Optional CASC touch overlay generated from the current source and the user's resources |
+| App internal `files/dm/overlay/` | Required CASC touch overlay, including `overlay.manifest`, generated from the matching source and the user's resources |
 | App internal `files/dm/overlay/touchart/` | Optional locally generated `dm_touch_joy.png`; otherwise the UI draws a fallback joystick |
 | Shared `Download/data/` | User's resource archives and `.build.config`; requires Android's all-files-access setting |
 | App internal `files/save/` | Saves; preserve during upgrades |
@@ -109,3 +109,5 @@ Advanced iOS skill artwork, empty-slot skill menus, specialized quantity/stat
 popovers, and shop drag-follow visuals are incomplete. Generic controls and text
 input do not establish complete iOS parity. macOS/iOS regressions must be run on
 an Apple build host before upstream integration.
+
+The overlay generator writes a source fingerprint and exact file hashes to `overlay.manifest`. The APK embeds the same generator-input fingerprint. Missing, incomplete, or mismatched overlays stop startup with a localized message before the host thread starts. Deploy the complete generated directory; do not copy a manifest onto old resources or generate one on the phone. Regenerate after generator/layout changes. This contract does not authenticate third-party resource downloads.
