@@ -437,7 +437,7 @@ bool slot_pools_enabled=true,readback_cached=false;
 struct TexelKey{uint64_t base,bytes;uint32_t format;bool operator==(const TexelKey &o)const{return base==o.base&&bytes==o.bytes&&format==o.format;}};
 struct TexelKeyHash{size_t operator()(const TexelKey &k)const{uint64_t x=k.base*0x9E3779B97F4A7C15ull^k.bytes*0xC2B2AE3D27D4EB4Full^k.format;x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
 struct TexelResident{Buffer buffer;VkBufferView view{};uint64_t hash=0,used=0,gen=0,checked=0,check_epoch=0;};   // checked: verified in this submission
-std::unordered_map<TexelKey,TexelResident,TexelKeyHash> texel_resident[2];Arena texel_arena[2];uint64_t texel_hole_bytes[2]={};
+std::unordered_map<TexelKey,TexelResident,TexelKeyHash> texel_resident[2];Arena texel_arena[2];uint64_t texel_hole_bytes[2]={},texel_live_bytes[2]={};
 bool texel_memo_enabled=false;uint64_t texel_gen=0,texel_refreshes=0,texel_fallbacks=0,texel_evictions=0,texel_hits=0;
 // A copy verified earlier in this submission stays valid until an in-stream CPU write overlaps it (snapshot_invalidate
 // bumps texel_write_epoch), so a ~1 MB range bound by 558 draws is hashed once per frame, not per draw.
@@ -1667,18 +1667,23 @@ Buffer &driver_block(unsigned ns,unsigned bank){uint64_t gen=bank?tex_gen[ns]:bu
 // within the frame falls back to the per-frame snapshot. A memo entry checks the copy's generation, so an evicted and
 // recreated copy is never mistaken for the one its set holds. Opt-in: gfx-texel-memo = '1'.
 TexelResident *texel_acquire(uint64_t base,uint64_t bytes,VkFormat fmt){
-    unsigned si=slot_index;auto &map=texel_resident[si];TexelKey key{base,bytes,uint32_t(fmt)};
+    if(!bytes || base>UINT64_MAX-bytes || bytes>64ull*1024*1024){++texel_fallbacks;return nullptr;}
+    // 待写回的数据走原快照路径，不允许驻留命中绕过 GPU 写入或跨槽排空。
+    // Pending results use the original snapshot path; resident hits must not bypass GPU writes or drain across slots.
+    Buffer pending;if(pending_view(base,bytes,1,pending)){++texel_fallbacks;return nullptr;}
+    for(auto &r:pending_reports)if(base<r.addr+16 && base+bytes>r.addr){++texel_fallbacks;return nullptr;}
+    for(auto *list:{&pending_events,&recording_events})for(auto &e:*list)if(base<e.addr+4 && base+bytes>e.addr){++texel_fallbacks;return nullptr;}
+    unsigned si=slot_index;need(slots[si].recording && !slots[si].pending,"Texel resident requires a retired recording slot");auto &map=texel_resident[si];TexelKey key{base,bytes,uint32_t(fmt)};
     auto it=map.find(key);
     if(it!=map.end() && it->second.checked==slot_serial && it->second.check_epoch==texel_write_epoch){it->second.used=slot_serial;return &it->second;}
-    cpu_access(base,bytes,8);   // pending GPU results land in guest memory first, as for snapshot()
     uint64_t h=hash_memory(reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));
     if(it==map.end()){
-        if(map.size()>=8192){++texel_fallbacks;return nullptr;}
+        if(map.size()>=8192 || texel_live_bytes[si]+texel_hole_bytes[si]+bytes>64ull*1024*1024){++texel_fallbacks;return nullptr;}
         TexelResident r;r.buffer=texel_arena[si].alloc(size_t(bytes));
         VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=r.buffer.buffer;v.offset=r.buffer.offset;v.format=fmt;v.range=bytes;VK(vkCreateBufferView(cfg.device,&v,nullptr,&r.view));
         memcpy(r.buffer.mapped,reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));r.buffer.flush();r.hash=h;r.used=slot_serial;r.gen=++texel_gen;++texel_refreshes;
         r.checked=slot_serial;r.check_epoch=texel_write_epoch;texel_lo=std::min(texel_lo,base);texel_hi=std::max(texel_hi,base+bytes);
-        return &map.emplace(key,r).first->second;}
+        texel_live_bytes[si]+=bytes;return &map.emplace(key,r).first->second;}
     TexelResident &r=it->second;
     if(r.hash!=h){if(r.used==slot_serial){++texel_fallbacks;return nullptr;}   // this frame already reads the earlier content
         memcpy(r.buffer.mapped,reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));r.buffer.flush();r.hash=h;++texel_refreshes;}
@@ -1691,9 +1696,10 @@ void texel_touch(uint64_t address,uint64_t bytes){
 // While a slot starts recording (its previous submission retired): drop copies unused for ~128 submissions; when the holes they
 // leave in the slot's arena pass 8 MB, start the slot's store over (memo entries then fail their generation check).
 void texel_evict(unsigned si,bool all){
+    need(!slots[si].pending && (!slots[si].recording || !slots[si].ops),"Evict texel residents only after slot retirement");
     auto &map=texel_resident[si];
-    for(auto it=map.begin();it!=map.end();){if(all || it->second.used+128<slot_serial){vkDestroyBufferView(cfg.device,it->second.view,nullptr);texel_hole_bytes[si]+=it->first.bytes;it=map.erase(it);++texel_evictions;}else ++it;}
-    if(all || texel_hole_bytes[si]>8ull*1024*1024){for(auto &e:map)vkDestroyBufferView(cfg.device,e.second.view,nullptr);map.clear();texel_arena[si].release();texel_hole_bytes[si]=0;}
+    for(auto it=map.begin();it!=map.end();){if(all || it->second.used+128<slot_serial){vkDestroyBufferView(cfg.device,it->second.view,nullptr);texel_hole_bytes[si]+=it->first.bytes;texel_live_bytes[si]-=it->first.bytes;it=map.erase(it);++texel_evictions;}else ++it;}
+    if(all || texel_hole_bytes[si]>8ull*1024*1024){for(auto &e:map)vkDestroyBufferView(cfg.device,e.second.view,nullptr);map.clear();texel_arena[si].release();texel_hole_bytes[si]=texel_live_bytes[si]=0;}
 }
 void descriptors(Descriptors &out,Commands &commands,bool compute){
     uint64_t tm0=perf_clock();struct MemoClock{uint64_t t0;~MemoClock(){}} mc{tm0};
@@ -1707,8 +1713,8 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
         key.push_back(state.sampler_pool.pool?uint64_t(uintptr_t(state.sampler_pool.pool->mem)):0);key.push_back(uint64_t(state.sampler_pool.off));ktag.insert(ktag.end(),2,1);
         for(unsigned st=0;st<5 && ok;st++)if(state.shader[st]){Shader &shader=*state.shader[st];unsigned ns=nvn_stage[st];
             for(auto &b:shader.bindings){
-                // Texel view 属于 slot，退休时销毁；memo 不追踪其快照或生命周期，不能保留旧 set。
-                // Slot retirement destroys texel views; memo tracks neither their snapshots nor lifetime, so exclude both kinds.
+                // 临时 texel view 随 slot 退休销毁；storage 仍排除，uniform memo 必须走驻留路径。
+                // Slot retirement destroys transient texel views; storage stays excluded, uniform memo requires the resident path.
                 if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER || (b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER && !texel_memo_enabled)){ok=false;++desc_memo_why[0];break;}
                 if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE){ok=false;++desc_memo_why[1];break;}
                 if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && shader.storage_writes.count(b.binding)){ok=false;++desc_memo_why[2];break;}
