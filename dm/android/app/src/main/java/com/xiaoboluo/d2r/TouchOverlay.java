@@ -21,9 +21,9 @@ public final class TouchOverlay extends View {
     private final float density;
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final float[] layout = new float[119];
-    // 每个刷新周期只查一次原生布局；与上次画出的不同才重画（原先每帧都重画，120 Hz 下 RenderThread 占一个核的约 12%）。
+    // 每个刷新周期比较完整绘图快照；坐标、可见性、按下状态与技能组任一变化才重画。
     // The native layout is checked once per refresh; the view redraws only when it differs from what was last drawn
-    // (it used to redraw every frame: at 120 Hz about 12% of a core on RenderThread, plus GPU time).
+    // Coordinates, visibility, pressed state and skill set all participate in that snapshot.
     private final float[] probe = new float[119], drawn = new float[119];
     private boolean drawnValid;
     private final Choreographer.FrameCallback poll = new Choreographer.FrameCallback() {
@@ -120,7 +120,9 @@ public final class TouchOverlay extends View {
     private String label(int i,boolean navigation) {
         if (i>=15) return Integer.toString(i-14);
         String[] source=navigation && i<5?menuLabels:gameLabels;
-        return i<source.length && source[i]!=null?source[i]:"";
+        String text=i<source.length && source[i]!=null?source[i]:"";
+        // 换组字段同时决定文字，避免快照变了却仍画相同的组别。 | The skill-set field also changes the label so a changed snapshot displays the new group.
+        return i==13 ? text+" "+(layout[3]!=0?2:1) : text;
     }
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas); if (!inputEnabled) return; nativeLayout(layout); System.arraycopy(layout, 0, drawn, 0, layout.length); drawnValid=true;

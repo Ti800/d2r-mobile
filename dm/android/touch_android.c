@@ -258,7 +258,17 @@ void dm_android_touch_layout(float out[DM_ANDROID_TOUCH_DRAW_FLOATS]) {
         } else {
             p[0]=t.x; p[1]=t.y; p[2]=t.r;
             p[3]=i<DM_TC_COUNT?!!(tc.enabled_targets&(1u<<i)):!tc.navigation_mode && (i<15 || tc.diff_open);
-            for (int j=0;j<DM_TC_MAX_TOUCH;++j) if (tc.finger[j].active && tc.finger[j].target==(i==13?DM_TC_SWAP:i==14?DM_TC_DIFF:i)) p[4]=1;
+            /* 快照包含松手后仍在发出的脉冲；查询只读，probe和onDraw连续读取不能消费高亮。
+               Include pulses that remain active after release; reads are non-consuming so probe/onDraw see the same highlight. */
+            p[4]=t.button && (tc.buttons&t.button)==t.button;
+            for (int j=0;j<DM_TC_MAX_TOUCH;++j) {
+                const dm_tc_finger *f=&tc.finger[j];
+                if (!f->active || f->aim_cancelled) continue;
+                if ((i<DM_TC_COUNT && f->target==i) || (i==13 && f->target==DM_TC_SWAP)) p[4]=1;
+                /* 难度格与腰带消费共用负target；还要命中当前圆，不能把所有选项一起点亮。
+                   Difficulty and consumed belt touches share a negative target; hit-test this circle rather than lighting every choice. */
+                if (i>=14 && f->target==DM_TC_DIFF && hypotf(f->x-t.x,f->y-t.y)<=t.r) p[4]=1;
+            }
         }
         if (frontend) p[3]=0;   /* 前端页面不画控件（见 frontend） | No controls drawn on front-end pages (see frontend) */
     }
