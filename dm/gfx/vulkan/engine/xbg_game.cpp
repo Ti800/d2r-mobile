@@ -14,6 +14,7 @@
 #include "xbg_framebuffer.h"
 #include "xbg_clear.h"
 #include "xbg_blit.h"
+#include "xbg_bc_policy.h"
 #include "xbg_clear_spv.h"
 #include "xbg_spirv_quad.h"
 #include "xbg_spirv_warp.h"
@@ -174,11 +175,9 @@ bool timing_active=false;
 // 默认颜色图不带 MUTABLE_FORMAT；异格式 view 触发原地升级，gfx-mutable-images=1 回退原创建路径。
 // Color images omit MUTABLE_FORMAT by default; differing view formats trigger an in-place upgrade, and gfx-mutable-images=1 restores the original creation path.
 bool no_mutable_images=true;uint64_t mutable_upgrades=0;unsigned mutable_test=0; // gfx-mutable-test=N首次采样时强制每第N张颜色图升级 | gfx-mutable-test=N forces upgrade on first sampling of every Nth color image
-// Sample BC textures in their own formats where the device can (marker gfx-native-bc = 1 / 0, else DM_GFX_NATIVE_BC, which
-// the Android app sets to 1). Otherwise they are decoded on upload to RGBA8 / R16 / RG16 / RGBA16F (bcdec): 4-8x the bytes
-// in memory and in every texture fetch. Adreno 730 samples all of BC1-7. Exception kept: the iOS ASTC pack copies ASTC
-// blocks into the game's BC arrays, which needs a decoded destination.
-bool native_bc=false;uint64_t native_bc_images=0,decoded_bc_images=0;int64_t image_bytes_live=0,bc_image_bytes_live=0,bc_data_bytes_live=0;   // live image memory (driver sizes) and BC payload
+// 原生BC仅显式开启且通过设备门；保留全部RGBA BC解码以接收ASTC-pack拷贝。
+// Native BC requires explicit opt-in and device gates; retain decoded RGBA BC for ASTC-pack copies.
+bool native_bc=false;uint64_t native_bc_images=0,decoded_bc_images=0;int64_t image_bytes_live=0,bc_image_bytes_live=0,bc_data_bytes_live=0; // 驱动分配与原块字节 | Driver allocation and original block bytes
 struct Image;void upgrade_mutable(Image &im);
 bool perf_timing=true; // always-on wall-time breakdown for NVN PERF (exclusive deltas)
 // 按 gfx-perf-sample 指定的帧间隔采样 CPU 细项；0 关闭，细项均值只统计已采样帧。
@@ -885,11 +884,9 @@ VkFormat format(int f) {
     if(f>0 && f<int(sizeof(table)/sizeof(*table))) return table[f];
     // NVN ASTC 0x79-0x86 (LDR) / 0x87-0x94 (sRGB), order 4x4 5x4 5x5 6x5 6x6 8x5 8x6 8x8 10x5 10x6 10x8 10x10 12x10 12x12 = Vulkan order.
     if(f>=0x79 && f<=0x94){int k=(f-0x79)%14;return VkFormat(int(VK_FORMAT_ASTC_4x4_UNORM_BLOCK)+2*k+(f>=0x87?1:0));}
-    // NVN BC 0x41-0x50: DXT1 RGB/RGBA, DXT3, DXT5, the same four sRGB, RGTC1 U/S, RGTC2 U/S, BPTC unorm/sRGB, BPTC sfloat/ufloat
-    // (the decoder: 0x41 opaque BC1, 0x4f signed BC6H). Used as such only with native_bc; otherwise BC is decoded on upload.
-    if(f>=0x41 && f<=0x50){static const VkFormat bc[16]={VK_FORMAT_BC1_RGB_UNORM_BLOCK,VK_FORMAT_BC1_RGBA_UNORM_BLOCK,VK_FORMAT_BC2_UNORM_BLOCK,VK_FORMAT_BC3_UNORM_BLOCK,
-        VK_FORMAT_BC1_RGB_SRGB_BLOCK,VK_FORMAT_BC1_RGBA_SRGB_BLOCK,VK_FORMAT_BC2_SRGB_BLOCK,VK_FORMAT_BC3_SRGB_BLOCK,VK_FORMAT_BC4_UNORM_BLOCK,VK_FORMAT_BC4_SNORM_BLOCK,
-        VK_FORMAT_BC5_UNORM_BLOCK,VK_FORMAT_BC5_SNORM_BLOCK,VK_FORMAT_BC7_UNORM_BLOCK,VK_FORMAT_BC7_SRGB_BLOCK,VK_FORMAT_BC6H_SFLOAT_BLOCK,VK_FORMAT_BC6H_UFLOAT_BLOCK};return bc[f-0x41];}
+    // NVN BC1..7映射与生产选择策略共用，保留BC6H符号和BC1透明度区别。
+    // Share BC1..7 mapping with production policy, retaining BC6H signedness and BC1 alpha distinctions.
+    if(f>=0x41 && f<=0x50)return xbg_bc_native_format(uint32_t(f));
     switch(f){case 0x37:case 0x38:return VK_FORMAT_R8G8B8A8_SRGB;case 0x3d:return VK_FORMAT_A2B10G10R10_UNORM_PACK32;case 0x3e:return VK_FORMAT_A2B10G10R10_UINT_PACK32;case 0x3f:return VK_FORMAT_B10G11R11_UFLOAT_PACK32;case 0x40:return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;case 0x6d:return VK_FORMAT_R8G8B8A8_UNORM;case 0x9a:return VK_FORMAT_B8G8R8A8_UNORM;default:xbg_fatalf("Unsupported NVN format %#x",f);}
 }
 VkImageAspectFlags aspect(int f){if(f==0x31)return VK_IMAGE_ASPECT_STENCIL_BIT;if(f>=0x32 && f<=0x34)return VK_IMAGE_ASPECT_DEPTH_BIT;if(f==0x35 || f==0x36)return VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT;return VK_IMAGE_ASPECT_COLOR_BIT;}
@@ -952,7 +949,7 @@ struct Image {
             xbg_bc_format info;need(xbg_bc_format_info(v->format,&info)==0,"Invalid BC view format");
             return decoded_format(info.pixels);
         }
-        if(source.d.format>=0x41 && source.d.format<=0x50){need(xbg_bc_view_compatible(source.d.format,v->format),"BC texture view must retain compression and signedness");return format(v->format);}   // native BC
+        if(source.d.format>=0x41 && source.d.format<=0x50){need(xbg_bc_view_compatible(source.d.format,v->format),"BC texture view must retain compression and signedness");return format(v->format);}   // 原生BC | Native BC
         int bw,bh,bytes=nvn_fmt_bpb(v->format,&bw,&bh);
         need(aspects==VK_IMAGE_ASPECT_COLOR_BIT && aspect(v->format)==aspects && bw==1 && bh==1 && bytes==int(bpp),"Incompatible NVN texture view format class");
         return format(v->format);
@@ -1208,8 +1205,18 @@ Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
         auto p=std::make_shared<Image>();p->source=*t;p->provenance_epoch=provenance.epoch((t->mem && t->off>=0 && uint64_t(t->off)<=uint64_t(t->mem)?uint64_t(t->mem)-uint64_t(t->off):0));p->width=t->d.width;p->height=(t->d.target==0 || t->d.target==3)?1:t->d.height;p->depth=t->d.target==2?t->d.depth:1;p->levels=t->d.levels;p->layers=t->L.layers;p->aspects=aspect(t->d.format);p->samples=VkSampleCountFlagBits(std::max(1,t->d.samples));
         need(p->width && p->height && p->levels && p->levels<=16 && p->layers,"Invalid texture dimensions");
         xbg_bc_format info;p->decoded=xbg_bc_format_info(t->d.format,&info)==0;
-        if(p->decoded && native_bc && p->samples==VK_SAMPLE_COUNT_1_BIT){const VkFormatFeatureFlags need_bc=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-            VkFormatProperties np;vkGetPhysicalDeviceFormatProperties(cfg.physical,format(t->d.format),&np);if((np.optimalTilingFeatures&need_bc)==need_bc)p->decoded=false;}
+        if(p->decoded && native_bc){
+            VkFormat candidate=xbg_bc_native_format(t->d.format);const auto &np=format_properties(candidate);
+            if(xbg_native_bc_eligible(t->d.format,native_bc,cfg.enabled_core.textureCompressionBC!=0,np.optimalTilingFeatures,uint32_t(p->samples),t->d.target,t->d.flags)){
+                VkImageUsageFlags usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT;
+                if(np.optimalTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)usage|=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                VkImageCreateFlags flags=no_mutable_images?0:VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+                if(t->d.target==8 || t->d.target==9)flags|=VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+                VkImageFormatProperties supported{};
+                if(vkGetPhysicalDeviceImageFormatProperties(cfg.physical,candidate,VK_IMAGE_TYPE_2D,VK_IMAGE_TILING_OPTIMAL,usage,flags,&supported)==VK_SUCCESS &&
+                   xbg_native_bc_extent_fits(supported,p->width,p->height,p->levels,p->layers))p->decoded=false;
+            }
+        }
         if(xbg_bc_format_info(t->d.format,&info)==0)++(p->decoded?decoded_bc_images:native_bc_images);
         if(p->decoded){p->bpp=info.bytes_per_pixel;p->fmt=decoded_format(info.pixels);need(p->samples==VK_SAMPLE_COUNT_1_BIT,"BC texture cannot be multisampled");}
         else {p->fmt=format(t->d.format);p->bpp=t->L.bpb;if(t->d.format==0x32 && depth16_as_d24)p->fmt=VK_FORMAT_X8_D24_UNORM_PACK32;}
@@ -1751,6 +1758,8 @@ void upgrade_mutable(Image &im){
     VkImage old_image=im.image;VkDeviceMemory old_memory=im.memory;std::vector<VkImageView> old_views;for(auto &v:im.views)old_views.push_back(v.second);im.views.clear();
     std::vector<VkFramebuffer> old_fbs;forget_framebuffers(im,&old_fbs);
     retire_handle([old_image,old_memory,old_views,old_fbs]{for(auto f:old_fbs)vkDestroyFramebuffer(cfg.device,f,nullptr);for(auto v:old_views)vkDestroyImageView(cfg.device,v,nullptr);vkDestroyImage(cfg.device,old_image,nullptr);vkFreeMemory(cfg.device,old_memory,nullptr);});
+    image_bytes_live+=int64_t(r.size)-im.mem_bytes;im.mem_bytes=int64_t(r.size);
+    if(im.source.d.format>=0x41 && im.source.d.format<=0x50){bc_image_bytes_live+=im.mem_bytes-im.bc_bytes;im.bc_bytes=im.mem_bytes;}
     im.image=image;im.memory=memory;im.create=ci;im.mutable_format=true;im.layout=VK_IMAGE_LAYOUT_GENERAL;
     ++memo_epoch;img_cache.clear();++mutable_upgrades;
     xbg_logf("NVN mutable upgrade serial=%llu fmt=%d %ux%ux%u levels=%u layers=%u copied=%d total=%llu",(unsigned long long)im.source.serial,int(im.fmt),im.width,im.height,im.depth,im.levels,im.layers,int(copied),(unsigned long long)mutable_upgrades);
@@ -2397,7 +2406,7 @@ bool guest_texture_write(const tex_t *t,unsigned level,unsigned layer,const NVNc
 void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
     Image &im=get_image(p.tex,to_buffer);
     if(p.has_view && p.view.set_format)(void)im.view_format(&p.view);
-    if(im.samples!=VK_SAMPLE_COUNT_1_BIT || (im.decoded&&to_buffer))   // native BC reads back in its own branch below
+    if(im.samples!=VK_SAMPLE_COUNT_1_BIT || (im.decoded&&to_buffer))   // 原生BC在下方独立读回 | Native BC reads back in its own branch below
         xbg_fatalf("NVN %s format=%#x samples=%u region=%d,%d,%d:%dx%dx%d needs %s",to_buffer?"CopyTextureToBuffer":"CopyBufferToTexture",p.tex->d.format,uint32_t(im.samples),p.r.xoffset,p.r.yoffset,p.r.zoffset,p.r.width,p.r.height,p.r.depth,im.decoded?"compressed readback encoding":"depth/stencil or multisample packing");
     need((p.flags&~NVN_COPY_FLAGS_ENGINE_2D_BIT)==0,"Buffer/texture copy flags not implemented");
     uint32_t level=p.has_view&&p.view.set_levels?p.view.base_level:0,layer=p.has_view&&p.view.set_layers?p.view.min_layer:0;region_check(im,level,layer,p.r);need(p.src,"Null buffer image copy address");
@@ -2427,25 +2436,31 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
         }else im.gpu_written=true,provenance_write(im,__LINE__);
         xbg_logf("NVN depth %s serial=%llu format=%#x level=%u layer=%u region=%dx%dx%d planes=%zu",to_buffer?"readback":"upload",(unsigned long long)p.tex->serial,p.tex->d.format,level,layer,p.r.width,p.r.height,p.r.depth,copies.size());return;
     }
-    if(!im.decoded && p.tex->d.format>=0x41 && p.tex->d.format<=0x50){   // native BC: blocks as they are, both directions
+    if(!im.decoded && p.tex->d.format>=0x41 && p.tex->d.format<=0x50){ // 原生BC保持块编码 | Native BC retains block encoding
         int bw,bh,bpb=nvn_fmt_bpb(p.tex->d.format,&bw,&bh);need(bw==4 && bh==4 && !(p.r.xoffset%4) && !(p.r.yoffset%4),"BC copy origin must be block aligned");
         need(p.r.width%4==0 || uint32_t(p.r.xoffset+p.r.width)==std::max(1u,im.width>>level),"BC copy width must reach a block or mip edge");
         need(p.r.height%4==0 || uint32_t(p.r.yoffset+p.r.height)==std::max(1u,im.height>>level),"BC copy height must reach a block or mip edge");
-        size_t blocks=(size_t(p.r.width)+3)/4,rows=(size_t(p.r.height)+3)/4,tight=blocks*bpb,row=state.copy_stride?state.copy_stride:tight;
-        need(row>=tight && row%bpb==0 && row<=256ull*1024*1024/rows/p.r.depth,"Invalid BC copy row stride/extent");
-        size_t bytes=row*rows*(p.r.depth-1)+row*(rows-1)+tight;
-        if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,bytes,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
-            if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,row*rows)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
-        if(!to_buffer)cpu_access(p.src,bytes,9);
-        Buffer b=to_buffer?readback_buffer(bytes):stream_buffer(bytes,reinterpret_cast<void*>(p.src),bytes,false);
+        XbgBcCopyRows plan{};need(xbg_bc_copy_rows(p.r.width,p.r.height,p.r.depth,bpb,state.copy_stride,state.copy_image_stride,&plan)==0,"Invalid BC copy row/image stride/extent");
+        need(p.src<=UINT64_MAX-plan.guest_bytes,"BC copy address overflow");
+        if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,plan.guest_bytes,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
+            if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),plan.row,plan.image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
+        std::vector<uint8_t> packed;
+        if(!to_buffer){
+            cpu_access(p.src,plan.guest_bytes,9);
+            // 部分覆盖前上传初始全部mip/层；已有GPU内容沿用，不重建或转码。
+            // Upload initial mips/layers before partial writes; retain existing GPU contents without recreation or transcoding.
+            if(!xbg_copy_is_full({im.width,im.height,im.layers,im.levels,level,layer,p.r.xoffset,p.r.yoffset,p.r.zoffset,p.r.width,p.r.height,p.r.depth}))get_image(p.tex,true);
+            packed.resize(plan.packed_bytes);need(xbg_bc_copy_transfer(packed.data(),packed.size(),reinterpret_cast<const void*>(p.src),plan.guest_bytes,plan,false)==0,"BC upload packing failed");
+        }
+        Buffer b=to_buffer?readback_buffer(plan.packed_bytes):stream_buffer(plan.packed_bytes,packed.data(),plan.packed_bytes,false);
         Commands c;im.transition(c.command,to_buffer?VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkBufferImageCopy r{};r.bufferOffset=b.offset;r.bufferRowLength=uint32_t(row/bpb*4);r.bufferImageHeight=uint32_t(rows*4);r.imageSubresource=copy_layers(im,level,layer,p.r);r.imageOffset=copy_offset(im,p.r);r.imageExtent=copy_extent(im,p.r);
+        VkBufferImageCopy r{};r.bufferOffset=b.offset;r.imageSubresource=copy_layers(im,level,layer,p.r);r.imageOffset=copy_offset(im,p.r);r.imageExtent=copy_extent(im,p.r);
         if(to_buffer)vkCmdCopyImageToBuffer(c.command,im.image,im.layout,b.buffer,1,&r);else vkCmdCopyBufferToImage(c.command,b.buffer,im.image,im.layout,1,&r);
         im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();
-        if(to_buffer){gpu_sync(perf.sync_readback);b.invalidate();invalidate_cpu_range(p.src,bytes);   // only the block bytes of each row: the gaps of a wider stride are the guest's
-            for(size_t z=0;z<size_t(p.r.depth);z++)for(size_t y=0;y<rows;y++){size_t o=(z*rows+y)*row;memcpy(reinterpret_cast<uint8_t*>(p.src)+o,static_cast<const uint8_t*>(b.mapped)+o,tight);}}
+        if(to_buffer){gpu_sync(perf.sync_readback);b.invalidate();invalidate_cpu_range(p.src,plan.guest_bytes);
+            need(xbg_bc_copy_transfer(reinterpret_cast<void*>(p.src),plan.guest_bytes,b.mapped,plan.packed_bytes,plan,true)==0,"BC readback unpacking failed");}
         else im.gpu_written=true,provenance_write(im,__LINE__);
-        {static unsigned n=0;if(n++<20)xbg_logf("NVN BC native %s format=%#x level=%u layer=%u region=%dx%dx%d bytes=%zu",to_buffer?"readback":"upload",p.tex->d.format,level,layer,p.r.width,p.r.height,p.r.depth,bytes);}
+        {static unsigned n=0;if(n++<20)xbg_logf("NVN BC native %s format=%#x level=%u layer=%u region=%dx%dx%d bytes=%zu",to_buffer?"readback":"upload",p.tex->d.format,level,layer,p.r.width,p.r.height,p.r.depth,plan.packed_bytes);}
         return;
     }
     if(im.decoded){
@@ -2503,25 +2518,24 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
 void copy_texture(const p_copy_t2t &p){Image &s=get_image(p.src,true),&d=get_image(p.dst,false);{static unsigned n=0;if(n++<60)xbg_logf("NVN COPYT2T src=%llu fmt=%#x %ux%ux%u L%u lv%u -> dst=%llu fmt=%#x %ux%u L%u lv%u decoded=%d/%d region=%d,%d,%d %dx%dx%d -> %d,%d,%d sv=%d/%u/%u dv=%d/%u/%u",(unsigned long long)p.src->serial,p.src->d.format,s.width,s.height,s.depth,s.layers,s.levels,(unsigned long long)p.dst->serial,p.dst->d.format,d.width,d.height,d.layers,d.levels,int(s.decoded),int(d.decoded),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.has_sv?p.sv.base_level:0,p.has_sv?p.sv.min_layer:0,int(p.has_dv),p.has_dv?p.dv.base_level:0,p.has_dv?p.dv.min_layer:0);}
     if(p.has_sv && p.sv.set_format)(void)s.view_format(&p.sv);
     if(p.has_dv && p.dv.set_format)(void)d.view_format(&p.dv);
-    // No-BC + ASTC pack (iOS copy_t2t_astc): the game copies file textures (now ASTC 4x4) block-for-block into its own BC3 arrays,
-    // which we decode to RGBA8. Same-size NEAREST blit decodes ASTC exactly; sRGB-ness matches on both sides (BC3 sRGB <-> ASTC sRGB).
+    // 已知ASTC-pack源是ASTC4x4，目的BC3及既有RGBA BC目标从建图起解码，不迁移已有内容。
+    // Known ASTC-pack sources use ASTC4x4; BC3 and existing RGBA BC destinations are decoded at creation without migrating contents.
     if(!s.decoded && d.decoded && s.fmt>=VK_FORMAT_ASTC_4x4_UNORM_BLOCK && s.fmt<=VK_FORMAT_ASTC_4x4_SRGB_BLOCK && (d.fmt==VK_FORMAT_R8G8B8A8_UNORM || d.fmt==VK_FORMAT_R8G8B8A8_SRGB)
        && p.sr.width==p.dr.width && p.sr.height==p.dr.height && p.sr.depth==p.dr.depth && s.source.d.target!=2 && d.source.d.target!=2){
         VkFormatProperties sf{},df{};vkGetPhysicalDeviceFormatProperties(cfg.physical,s.fmt,&sf);vkGetPhysicalDeviceFormatProperties(cfg.physical,d.fmt,&df);
-        need((sf.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (df.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_DST_BIT),"ASTC to decoded-BC copy needs blit support");
         uint32_t sl=p.has_sv&&p.sv.set_levels?p.sv.base_level:0,dl=p.has_dv&&p.dv.set_levels?p.dv.base_level:0,sa=p.has_sv&&p.sv.set_layers?p.sv.min_layer:0,da=p.has_dv&&p.dv.set_layers?p.dv.min_layer:0;
         region_check(s,sl,sa,p.sr);region_check(d,dl,da,p.dr);need(&s!=&d,"Same-image copy needs overlap validation");
         bool full_destination=xbg_copy_is_full({d.width,d.height,d.layers,d.levels,dl,da,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,p.dr.width,p.dr.height,p.dr.depth})!=0;
         if(!full_destination)get_image(p.dst,true);
-        VkImageBlit blit{};blit.srcSubresource=copy_layers(s,sl,sa,p.sr);blit.dstSubresource=copy_layers(d,dl,da,p.dr);
-        VkOffset3D so=copy_offset(s,p.sr),dof=copy_offset(d,p.dr);VkExtent3D e=copy_extent(s,p.sr);
-        blit.srcOffsets[0]=so;blit.srcOffsets[1]={so.x+int32_t(e.width),so.y+int32_t(e.height),so.z+1};blit.dstOffsets[0]=dof;blit.dstOffsets[1]={dof.x+int32_t(e.width),dof.y+int32_t(e.height),dof.z+1};
-        Commands c;s.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);d.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdBlitImage(c.command,s.image,s.layout,d.image,d.layout,1,&blit,VK_FILTER_NEAREST);
+        XbgBlitRegion source{s.width,s.height,s.layers,s.levels,sl,sa,p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth};
+        XbgBlitRegion destination{d.width,d.height,d.layers,d.levels,dl,da,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,p.dr.width,p.dr.height,p.dr.depth};
+        VkImageBlit blit{};VkFilter filter{};
+        need(xbg_astc_bc_plan(s.fmt,d.fmt,source,destination,uint32_t(p.flags),sf.optimalTilingFeatures,df.optimalTilingFeatures,&blit,&filter)==0,"ASTC to decoded-BC copy requires matching sRGB, supported regions/flags and blit features");
+        Commands c;s.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);d.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdBlitImage(c.command,s.image,s.layout,d.image,d.layout,1,&blit,filter);
         s.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);d.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();d.gpu_written=true,provenance_write(d,__LINE__);
         {static unsigned n=0;if(n++<8)xbg_logf("NVN ASTC2BC blit src=%llu fmt=%#x -> dst=%llu fmt=%#x %dx%d lv%u/%u layer%u/%u",(unsigned long long)p.src->serial,p.src->d.format,(unsigned long long)p.dst->serial,p.dst->d.format,p.sr.width,p.sr.height,sl,dl,sa,da);}
         return;
     }
-    need(!(s.fmt>=VK_FORMAT_ASTC_4x4_UNORM_BLOCK && s.fmt<=VK_FORMAT_ASTC_12x12_SRGB_BLOCK && d.source.d.format>=0x41 && d.source.d.format<=0x50 && !d.decoded),"ASTC blocks into a native BC texture: the ASTC pack needs decoded BC (marker gfx-native-bc = 0)");
     if(s.decoded || d.decoded)need(s.decoded && d.decoded && xbg_bc_view_compatible(s.source.d.format,d.source.d.format),"BC texture copy must retain compression and signedness");
     need((uint32_t(p.flags)&~3u)==0 && s.fmt==d.fmt && s.aspects==d.aspects && s.samples==d.samples,"Texture copy requires matching formats/aspects and supported flags");
     uint32_t sl=p.has_sv&&p.sv.set_levels?p.sv.base_level:0,dl=p.has_dv&&p.dv.set_levels?p.dv.base_level:0,sa=p.has_sv&&p.sv.set_layers?p.sv.min_layer:0,da=p.has_dv&&p.dv.set_layers?p.dv.min_layer:0;
@@ -2819,7 +2833,9 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');early_submit_marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-early-submit";refresh_early_submit();}
     xbg_logf("NVN occlusion batch enabled=%d",int(occlusion_batch_enabled));
      {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=8;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=8;fclose(m);}perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
-    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc)",int(native_bc));}}
+    {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");
+     native_bc=xbg_native_bc_option(b!=nullptr,b?fgetc(b):EOF,getenv("DM_GFX_NATIVE_BC"));if(b)fclose(b);
+     native_bc_images=decoded_bc_images=0;xbg_logf("NVN native BC requested=%d enabledCoreBC=%u rgbaBC=decoded (marker gfx-native-bc; default off)",int(native_bc),cfg.enabled_core.textureCompressionBC);}
     for(auto &sl:slots)sl=Slot{};slot_index=0;pass_prof_enabled=false;pass_prof_next=300;pass_prof_frame=UINT64_MAX;pass_prof_draws=0;pass_prof_queries=pass_prof_slots=pass_prof_skipped_slots=0;perf=Perf{};for(auto &c:perf_timing_before)c=XbgCpuTiming::Counter{};static_arena.cached=false;support_static.clear();format_property_cache.clear();for(auto &k:format_flat_known)k=false;
     VkPhysicalDeviceShaderDrawParametersFeatures draw_parameters{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};features.pNext=&draw_parameters;vkGetPhysicalDeviceFeatures2(cfg.physical,&features);if(cfg.enabled_shader_draw_parameters && !draw_parameters.shaderDrawParameters){if(error&&bytes)snprintf(error,bytes,"shaderDrawParameters unsupported");return -1;}
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;VkResult r=vkCreateCommandPool(cfg.device,&cp,nullptr,&command_pool);if(r!=VK_SUCCESS){if(error&&bytes)snprintf(error,bytes,"vkCreateCommandPool=%d",r);return r;}
