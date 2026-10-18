@@ -80,6 +80,30 @@ void gfx_async_stop(){if(!gfx_worker.joinable())return;{std::lock_guard<std::mut
 char error_text[1024]{};
 bool initialized=false,failed=false;
 VkBool32 sampler_mirror_clamp_enabled=VK_FALSE;
+// Formatless storage access per format needs VK_KHR_format_feature_flags2 (core in Vulkan 1.3). Without it (Vulkan 1.1 drivers
+// such as Adreno 730 512.615) the spec's "Formats Without Shader Storage Format" rule applies: the shaderStorageImage{Read,Write}
+// WithoutFormat features cover exactly these formats, where the format also supports VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT.
+bool format_feature_flags2=false;
+// NVN DEPTH16 (0x32) is stored as X8_D24 when the driver cannot linearly filter D16_UNORM but can filter X8_D24: the game samples
+// shadow maps with linear depth comparison, and Adreno 730 512.615 reports no SAMPLED_IMAGE_FILTER_LINEAR for D16_UNORM (or
+// D32_SFLOAT). Transfers convert 16 <-> 24-bit depth with exact rounding; constant depth bias is rescaled to the finer depth unit.
+bool depth16_as_d24=false;
+uint32_t d16_to_d24(uint32_t k){return uint32_t((uint64_t(k)*2*16777215u+65535u)/(2*65535u));}
+uint32_t d24_to_d16(uint32_t v){return uint32_t((uint64_t(v&0xffffffu)*2*65535u+16777215u)/(2*16777215u));}
+bool storage_without_format_listed(VkFormat f){
+    switch(f){
+    case VK_FORMAT_R8G8B8A8_UNORM:case VK_FORMAT_R8G8B8A8_SNORM:case VK_FORMAT_R8G8B8A8_UINT:case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_R32_UINT:case VK_FORMAT_R32_SINT:case VK_FORMAT_R32_SFLOAT:case VK_FORMAT_R32G32_UINT:case VK_FORMAT_R32G32_SINT:
+    case VK_FORMAT_R32G32_SFLOAT:case VK_FORMAT_R32G32B32A32_UINT:case VK_FORMAT_R32G32B32A32_SINT:case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UINT:case VK_FORMAT_R16G16B16A16_SINT:case VK_FORMAT_R16G16B16A16_SFLOAT:case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:case VK_FORMAT_R16_SFLOAT:case VK_FORMAT_R16G16B16A16_UNORM:case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_R16G16_UNORM:case VK_FORMAT_R8G8_UNORM:case VK_FORMAT_R16_UNORM:case VK_FORMAT_R8_UNORM:case VK_FORMAT_R16G16B16A16_SNORM:
+    case VK_FORMAT_R16G16_SNORM:case VK_FORMAT_R8G8_SNORM:case VK_FORMAT_R16_SNORM:case VK_FORMAT_R8_SNORM:case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R8G8_SINT:case VK_FORMAT_R16_SINT:case VK_FORMAT_R8_SINT:case VK_FORMAT_A2B10G10R10_UINT_PACK32:case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R8G8_UINT:case VK_FORMAT_R16_UINT:case VK_FORMAT_R8_UINT:return true;
+    default:return false;
+    }
+}
 uint64_t last_attachment_trace=UINT64_MAX;
 struct Capture {
     std::string directory;FILE *trace=nullptr;uint64_t frame=0,bytes=0;
@@ -722,6 +746,35 @@ VkFormat decoded_format(uint32_t pixels) {
     default:xbg_fatalf("Invalid decoded BC pixel format %u",pixels);
     }
 }
+// Read-only capability report, logged once at initialization: what this device actually supports, so a missing capability can be
+// named precisely (a Vulkan 1.1 driver lacks much of what 1.3 drivers report) instead of being read off the first fatal error.
+void capability_report(){
+    const VkPhysicalDeviceFeatures &f=cfg.enabled_core;const VkPhysicalDeviceLimits &l=properties.limits;
+    xbg_logf("NVN caps device=\"%s\" vendor=%#x id=%#x api=%u.%u.%u driver=%#x",properties.deviceName,properties.vendorID,properties.deviceID,
+        VK_API_VERSION_MAJOR(properties.apiVersion),VK_API_VERSION_MINOR(properties.apiVersion),VK_API_VERSION_PATCH(properties.apiVersion),properties.driverVersion);
+    xbg_logf("NVN caps features drawParameters=%u storageReadWithoutFormat=%u storageWriteWithoutFormat=%u storageExtendedFormats=%u gatherExtended=%u "
+        "tessellation=%u geometry=%u occlusionQueryPrecise=%u depthBounds=%u depthClamp=%u fillModeNonSolid=%u bc=%u astcLdr=%u etc2=%u "
+        "anisotropy=%u logicOp=%u dualSrcBlend=%u independentBlend=%u clipDistance=%u cullDistance=%u float64=%u int64=%u int16=%u",
+        unsigned(cfg.enabled_shader_draw_parameters),f.shaderStorageImageReadWithoutFormat,f.shaderStorageImageWriteWithoutFormat,f.shaderStorageImageExtendedFormats,
+        f.shaderImageGatherExtended,f.tessellationShader,f.geometryShader,f.occlusionQueryPrecise,f.depthBounds,f.depthClamp,f.fillModeNonSolid,
+        f.textureCompressionBC,f.textureCompressionASTC_LDR,f.textureCompressionETC2,f.samplerAnisotropy,f.logicOp,f.dualSrcBlend,f.independentBlend,
+        f.shaderClipDistance,f.shaderCullDistance,f.shaderFloat64,f.shaderInt64,f.shaderInt16);
+    xbg_logf("NVN caps subgroup size=%u stages=%#x ops=%#x quadAllStages=%u",subgroup.subgroupSize,subgroup.supportedStages,subgroup.supportedOperations,subgroup.quadOperationsInAllStages);
+    xbg_logf("NVN caps limits ubRange=%u sbRange=%u ubDyn=%u sbDyn=%u ubAlign=%llu sbAlign=%llu texelAlign=%llu stageSamplers=%u stageSampled=%u "
+        "stageStorageImages=%u stageUB=%u stageSB=%u boundSets=%u colorAttachments=%u sharedMemory=%u workgroupInvocations=%u viewports=%u maxAnisotropy=%g",
+        l.maxUniformBufferRange,l.maxStorageBufferRange,l.maxDescriptorSetUniformBuffersDynamic,l.maxDescriptorSetStorageBuffersDynamic,
+        (unsigned long long)l.minUniformBufferOffsetAlignment,(unsigned long long)l.minStorageBufferOffsetAlignment,(unsigned long long)l.minTexelBufferOffsetAlignment,
+        l.maxPerStageDescriptorSamplers,l.maxPerStageDescriptorSampledImages,l.maxPerStageDescriptorStorageImages,l.maxPerStageDescriptorUniformBuffers,
+        l.maxPerStageDescriptorStorageBuffers,l.maxBoundDescriptorSets,l.maxColorAttachments,l.maxComputeSharedMemorySize,l.maxComputeWorkGroupInvocations,
+        l.maxViewports,double(l.maxSamplerAnisotropy));
+    // Every core format up to ASTC 12x12 sRGB (BC, ETC2 and ASTC included) as vkformat:optimalTilingFeatures/bufferFeatures
+    // (VkFormatFeatureFlagBits); formats with neither are left out.
+    std::string line;unsigned n=0;
+    for(int v=1;v<=int(VK_FORMAT_ASTC_12x12_SRGB_BLOCK);v++){const VkFormatProperties &p=format_properties(VkFormat(v));if(!p.optimalTilingFeatures && !p.bufferFeatures)continue;
+        char item[40];snprintf(item,sizeof(item)," %d:%#x/%#x",v,p.optimalTilingFeatures,p.bufferFeatures);line+=item;
+        if(++n%10==0){xbg_logf("NVN caps formats%s",line.c_str());line.clear();}}
+    if(!line.empty())xbg_logf("NVN caps formats%s",line.c_str());
+}
 struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false;
@@ -820,7 +873,7 @@ void capture_image(Image &im,const view_t *view,const char *role){
         if(++subresources>16){capture_log("SKIP role=%s reason=16-subresource-limit",role);return;}
         uint32_t w=std::max(1u,im.width>>m),h=std::max(1u,im.height>>m),z=std::max(1u,im.depth>>m);
         VkImageAspectFlags plane=im.aspects&VK_IMAGE_ASPECT_DEPTH_BIT?VK_IMAGE_ASPECT_DEPTH_BIT:im.aspects;
-        uint32_t bpp=im.bpp;if(plane==VK_IMAGE_ASPECT_DEPTH_BIT){xbg_depth_format f;if(xbg_depth_format_info(im.source.d.format,&f)){capture_log("SKIP reason=unknown-depth-format");return;}bpp=f.depth_bytes;}
+        uint32_t bpp=im.bpp;if(plane==VK_IMAGE_ASPECT_DEPTH_BIT){xbg_depth_format f;if(xbg_depth_format_info(im.source.d.format,&f)){capture_log("SKIP reason=unknown-depth-format");return;}bpp=im.source.d.format==0x32 && depth16_as_d24?4:f.depth_bytes;}
         uint64_t bytes=uint64_t(w)*h*z*bpp;
         if(!bytes || bytes>capture_limit-capture.bytes){capture_log("SKIP role=%s mip=%u layer=%u bytes=%llu reason=64MiB-budget",role,m,l,(unsigned long long)bytes);continue;}
         Buffer buffer=readback_buffer(size_t(bytes));Commands command;VkImageLayout saved=im.layout;
@@ -948,12 +1001,15 @@ void append_depth_planes(std::vector<uint8_t> &data,std::vector<VkBufferImageCop
     uint32_t format,uint32_t w,uint32_t h,uint32_t slices,const void *packed,size_t packed_bytes,
     size_t row,size_t image,const VkBufferImageCopy &region){
     xbg_depth_format f;need(xbg_depth_format_info(format,&f)==0,"Unknown NVN depth transfer format");
+    bool widen=format==0x32 && depth16_as_d24;   // image texels are X8_D24 (4 bytes), guest texels D16 (2 bytes)
     uint64_t pixels=uint64_t(w)*h*slices;need(pixels<=256ull*1024*1024/5,"Depth staging extent exceeds bound");
-    size_t begin=(data.size()+15)&~size_t(15),depth_bytes=size_t(pixels)*f.depth_bytes;
+    size_t begin=(data.size()+15)&~size_t(15),depth_bytes=size_t(pixels)*(widen?4:f.depth_bytes);
     size_t stencil_begin=(begin+depth_bytes+3)&~size_t(3),stencil_bytes=size_t(pixels)*f.stencil_bytes;
     need(stencil_begin+stencil_bytes<=256ull*1024*1024,"Depth staging allocation exceeds bound");data.resize(stencil_begin+stencil_bytes);
+    std::vector<uint8_t> d16(packed && widen?size_t(pixels)*2:0);
     if(packed)need(xbg_depth_extract(format,w,h,slices,packed,packed_bytes,row,image,
-        f.depth_bytes?data.data()+begin:nullptr,depth_bytes,f.stencil_bytes?data.data()+stencil_begin:nullptr,stencil_bytes)==0,"Invalid packed NVN depth upload extent");
+        f.depth_bytes?(widen?d16.data():data.data()+begin):nullptr,widen?d16.size():depth_bytes,f.stencil_bytes?data.data()+stencil_begin:nullptr,stencil_bytes)==0,"Invalid packed NVN depth upload extent");
+    for(size_t i=0;i<d16.size()/2;i++){uint16_t k;memcpy(&k,&d16[i*2],2);uint32_t v=d16_to_d24(k);memcpy(data.data()+begin+i*4,&v,4);}
     if(f.depth_bytes){auto r=region;r.bufferOffset=begin;r.imageSubresource.aspectMask=VK_IMAGE_ASPECT_DEPTH_BIT;copies.push_back(r);}
     if(f.stencil_bytes){auto r=region;r.bufferOffset=stencil_begin;r.imageSubresource.aspectMask=VK_IMAGE_ASPECT_STENCIL_BIT;copies.push_back(r);}
 }
@@ -975,7 +1031,7 @@ Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
         need(p->width && p->height && p->levels && p->levels<=16 && p->layers,"Invalid texture dimensions");
         xbg_bc_format info;p->decoded=xbg_bc_format_info(t->d.format,&info)==0;
         if(p->decoded){p->bpp=info.bytes_per_pixel;p->fmt=decoded_format(info.pixels);need(p->samples==VK_SAMPLE_COUNT_1_BIT,"BC texture cannot be multisampled");}
-        else {p->fmt=format(t->d.format);p->bpp=t->L.bpb;}
+        else {p->fmt=format(t->d.format);p->bpp=t->L.bpb;if(t->d.format==0x32 && depth16_as_d24)p->fmt=VK_FORMAT_X8_D24_UNORM_PACK32;}
         VkFormatProperties fp;vkGetPhysicalDeviceFormatProperties(cfg.physical,p->fmt,&fp);
         VkImageUsageFlags usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)usage|=VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -1427,7 +1483,7 @@ VkSampler sampler_slow(const samp_par &p,Image &im,VkFormat viewed,bool integer_
     VkSamplerCreateInfo s{};int result=xbg_sampler_from_nvn(&input,&limits,&s);
     if(result)xbg_fatalf("NVN sampler %s result=%d min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g aniso=%g compare=%u/%u border=%g,%g,%g,%g texture=%llu format=%#x vk=%u mirrorEnabled=%u",xbg_sampler_error(result),result,p.minf,p.magf,p.ws,p.wt,p.wr,p.lod_min,p.lod_max,p.lod_bias,p.aniso,p.cmp_mode,p.cmp_func,p.border[0],p.border[1],p.border[2],p.border[3],(unsigned long long)im.source.serial,im.source.d.format,unsigned(viewed),sampler_mirror_clamp_enabled);
     const VkFormatProperties &fp=format_properties(viewed);
-    if((s.minFilter==VK_FILTER_LINEAR || s.magFilter==VK_FILTER_LINEAR) && !(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))xbg_fatalf("NVN sampler linear filtering unsupported min=%u mag=%u format=%#x vk=%u",p.minf,p.magf,im.source.d.format,unsigned(viewed));
+    if((s.minFilter==VK_FILTER_LINEAR || s.magFilter==VK_FILTER_LINEAR) && !(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))xbg_fatalf("NVN sampler linear filtering unsupported min=%u mag=%u compare=%u/%u format=%#x vk=%u optimalFeatures=%#x texture=%llu",p.minf,p.magf,p.cmp_mode,p.cmp_func,im.source.d.format,unsigned(viewed),fp.optimalTilingFeatures,(unsigned long long)im.source.serial);
     need(s.pNext==nullptr,"Unexpected sampler extension chain");
     auto bits=[](float f){uint32_t u;memcpy(&u,&f,4);return u;};
     std::array<uint32_t,16> key{s.flags,uint32_t(s.magFilter),uint32_t(s.minFilter),uint32_t(s.mipmapMode),uint32_t(s.addressModeU),uint32_t(s.addressModeV),uint32_t(s.addressModeW),bits(s.mipLodBias),s.anisotropyEnable,bits(s.maxAnisotropy),s.compareEnable,uint32_t(s.compareOp),bits(s.minLod),bits(s.maxLod),uint32_t(s.borderColor),s.unnormalizedCoordinates};
@@ -1679,7 +1735,10 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                     if(b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.type==VK_DESCRIPTOR_TYPE_SAMPLER){DESC_SCOPE(SamplerBind);uint64_t sh=handle;if(b.sampler_slot!=UINT32_MAX){need(b.sampler_slot<128,"Sampler slot out of range");sh=state.samp[ns][b.sampler_slot];}int sid=int(sh>>20);samp_par parameters{};if(sid==0){parameters.ws=parameters.wt=parameters.wr=7;parameters.aniso=1;parameters.cmp_func=1;}
                         else{auto sp=samplers.find(pool_key(&state.sampler_pool));auto &table=sp==samplers.end()?legacy_samplers:sp->second;auto sa=table.find(sid);if(sa==table.end())xbg_fatalf("Unregistered sampler id=%d",sid);parameters=sa->second;}ii.sampler=sampler(parameters,im,im.view_format(registered.has_view?&registered.view:nullptr),((b.flags>>16)&3)!=0);if(capture.active)capture_log("SAMPLER st=%u binding=%u sid=%d samplerSlot=%u min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g",st,b.binding,sid,b.sampler_slot,parameters.minf,parameters.magf,parameters.ws,parameters.wt,parameters.wr,parameters.lod_min,parameters.lod_max,parameters.lod_bias);}
                     if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE){VkFormat viewed=im.view_format(registered.has_view?&registered.view:nullptr);if(!(im.usage&VK_IMAGE_USAGE_STORAGE_BIT))xbg_fatalf("NVN storage image without IMAGE flag serial=%llu format=%#x flags=%#x",(unsigned long long)texture.serial,texture.d.format,texture.d.flags);const VkFormatProperties &fp=format_properties(viewed);need(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,"Format not usable as storage image");
-                        if(b.flags&3){VkFormatProperties3 extra{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};VkFormatProperties2 all{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};all.pNext=&extra;vkGetPhysicalDeviceFormatProperties2(cfg.physical,viewed,&all);if(b.flags&1)need(extra.optimalTilingFeatures&VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT,"Image format lacks formatless-write support");if(b.flags&2)need(extra.optimalTilingFeatures&VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT,"Image format lacks formatless-read support");}im.gpu_written=true,provenance_write(im,__LINE__);im.last_write=++write_seq;}
+                        if((b.flags&3) && format_feature_flags2){VkFormatProperties3 extra{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};VkFormatProperties2 all{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};all.pNext=&extra;vkGetPhysicalDeviceFormatProperties2(cfg.physical,viewed,&all);if(b.flags&1)need(extra.optimalTilingFeatures&VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT,"Image format lacks formatless-write support");if(b.flags&2)need(extra.optimalTilingFeatures&VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT,"Image format lacks formatless-read support");}
+                        else if(b.flags&3){VkFormatProperties fp{};vkGetPhysicalDeviceFormatProperties(cfg.physical,viewed,&fp);bool listed=storage_without_format_listed(viewed) && (fp.optimalTilingFeatures&VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+                            if((b.flags&1) && !(listed && cfg.enabled_core.shaderStorageImageWriteWithoutFormat))xbg_fatalf("Image format %d lacks formatless-write support without VK_KHR_format_feature_flags2 (shader=%s listedWithStorageImage=%d shaderStorageImageWriteWithoutFormat=%u)",int(viewed),shader.key.c_str(),int(listed),unsigned(cfg.enabled_core.shaderStorageImageWriteWithoutFormat));
+                            if((b.flags&2) && !(listed && cfg.enabled_core.shaderStorageImageReadWithoutFormat))xbg_fatalf("Image format %d lacks formatless-read support without VK_KHR_format_feature_flags2 (shader=%s listedWithStorageImage=%d shaderStorageImageReadWithoutFormat=%u)",int(viewed),shader.key.c_str(),int(listed),unsigned(cfg.enabled_core.shaderStorageImageReadWithoutFormat));}im.gpu_written=true,provenance_write(im,__LINE__);im.last_write=++write_seq;}
                     image_infos.push_back(ii);write.pImageInfo=&image_infos.back();
                     if(img_cacheable){img_cache.emplace(ikey,ImgEntry{&texture,&im,ii.imageView,ii.sampler,record,record->revision});++img_cache_misses;}
                 }
@@ -1876,7 +1935,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};vi.vertexBindingDescriptionCount=bindings.size();vi.pVertexBindingDescriptions=bindings.data();vi.vertexAttributeDescriptionCount=attributes.size();vi.pVertexAttributeDescriptions=attributes.data();
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};ia.topology=topology(prim);
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};vp.viewportCount=vp.scissorCount=1;
-    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};rs.polygonMode=state.poly.mode==2?VK_POLYGON_MODE_FILL:state.poly.mode==1?VK_POLYGON_MODE_LINE:VK_POLYGON_MODE_POINT;need(rs.polygonMode==VK_POLYGON_MODE_FILL || cfg.enabled_core.fillModeNonSolid,"Non-solid polygon mode disabled");rs.cullMode=state.poly.cull;rs.frontFace=state.poly.front?VK_FRONT_FACE_COUNTER_CLOCKWISE:VK_FRONT_FACE_CLOCKWISE;rs.lineWidth=1;rs.depthBiasEnable=state.poly.offset_en!=0;rs.depthBiasConstantFactor=state.bias[1];rs.depthBiasSlopeFactor=state.bias[0];rs.depthBiasClamp=state.bias[2];need(!rs.depthBiasClamp || cfg.enabled_core.depthBiasClamp,"Depth bias clamp disabled");
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};rs.polygonMode=state.poly.mode==2?VK_POLYGON_MODE_FILL:state.poly.mode==1?VK_POLYGON_MODE_LINE:VK_POLYGON_MODE_POINT;need(rs.polygonMode==VK_POLYGON_MODE_FILL || cfg.enabled_core.fillModeNonSolid,"Non-solid polygon mode disabled");rs.cullMode=state.poly.cull;rs.frontFace=state.poly.front?VK_FRONT_FACE_COUNTER_CLOCKWISE:VK_FRONT_FACE_CLOCKWISE;rs.lineWidth=1;rs.depthBiasEnable=state.poly.offset_en!=0;rs.depthBiasConstantFactor=state.bias[1]*(state.rt.depth && state.rt.depth->d.format==0x32 && depth16_as_d24?256.0f:1.0f);   // bias units: 2^-16 for D16, 2^-24 for the X8_D24 stand-inrs.depthBiasSlopeFactor=state.bias[0];rs.depthBiasClamp=state.bias[2];need(!rs.depthBiasClamp || cfg.enabled_core.depthBiasClamp,"Depth bias clamp disabled");
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};ms.rasterizationSamples=p.samples;ms.alphaToCoverageEnable=state.ms.a2c;need(!state.ms.sl_en,"Custom sample locations unsupported");need(!state.ms.samples || state.ms.samples==uint32_t(p.samples),"NVN sample count differs from attachments");need(p.samples==VK_SAMPLE_COUNT_1_BIT || state.ms.enable,"Disabled multisampling on multisample target needs coverage emulation");
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};ds.depthTestEnable=state.ds.dt;ds.depthWriteEnable=state.ds.dw;ds.depthCompareOp=VkCompareOp(state.ds.df-1);ds.stencilTestEnable=state.ds.st;ds.front=stencil(false);ds.back=stencil(true);ds.depthBoundsTestEnable=state.bounds.enable;ds.minDepthBounds=state.bounds.minimum;ds.maxDepthBounds=state.bounds.maximum;need(!ds.depthBoundsTestEnable || cfg.enabled_core.depthBounds,"Depth bounds feature disabled");
     need(!(ds.depthTestEnable || ds.stencilTestEnable) || state.rt.depth,"Depth/stencil state requires attachment");
@@ -2061,6 +2120,7 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
             gpu_sync(perf.sync_readback);staging.invalidate();invalidate_cpu_range(p.src,bytes);const uint8_t *dp=nullptr,*sp=nullptr;
             for(auto &r:copies){if(r.imageSubresource.aspectMask==VK_IMAGE_ASPECT_DEPTH_BIT)dp=static_cast<const uint8_t*>(staging.mapped)+(r.bufferOffset-staging.offset);else sp=static_cast<const uint8_t*>(staging.mapped)+(r.bufferOffset-staging.offset);}
             size_t pixels=size_t(p.r.width)*p.r.height*p.r.depth;
+            std::vector<uint8_t> d16;if(dp && p.tex->d.format==0x32 && depth16_as_d24){d16.resize(pixels*2);for(size_t i=0;i<pixels;i++){uint32_t v;memcpy(&v,dp+i*4,4);uint16_t k=uint16_t(d24_to_d16(v));memcpy(&d16[i*2],&k,2);}dp=d16.data();}
             need(xbg_depth_merge(p.tex->d.format,p.r.width,p.r.height,p.r.depth,reinterpret_cast<void*>(p.src),bytes,row,row*p.r.height,dp,pixels*f.depth_bytes,sp,pixels*f.stencil_bytes)==0,"Packed NVN depth readback merge failed");
         }else im.gpu_written=true,provenance_write(im,__LINE__);
         xbg_logf("NVN depth %s serial=%llu format=%#x level=%u layer=%u region=%dx%dx%d planes=%zu",to_buffer?"readback":"upload",(unsigned long long)p.tex->serial,p.tex->d.format,level,layer,p.r.width,p.r.height,p.r.depth,copies.size());return;
@@ -2399,6 +2459,13 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      /* Android: no guest memory remapping probe. */
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
       std::string list;for(auto &e:ext){list+=e.extensionName;list+=' ';}
+      format_feature_flags2=properties.apiVersion>=VK_API_VERSION_1_3;for(auto &e:ext)if(!strcmp(e.extensionName,VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME))format_feature_flags2=true;
+      xbg_logf("NVN format-feature-flags2=%d (formatless storage checks %s)",int(format_feature_flags2),format_feature_flags2?"per format":"by the pre-1.3 format list");
+      capability_report();
+      {const VkFormatProperties &d16=format_properties(VK_FORMAT_D16_UNORM),&d24=format_properties(VK_FORMAT_X8_D24_UNORM_PACK32);
+       const VkFormatFeatureFlags d24_needs=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+       bool d16_linear=(d16.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)!=0;depth16_as_d24=!d16_linear && (d24.optimalTilingFeatures&d24_needs)==d24_needs;
+       xbg_logf("NVN depth16 stored as %s (D16 linear filtering=%u, X8_D24 features=%#x)",depth16_as_d24?"X8_D24":"D16",unsigned(d16_linear),d24.optimalTilingFeatures);}
       for(size_t at=0;at<list.size();at+=900)xbg_logf("NVN caps extensions[%zu] %s",at/900,list.substr(at,900).c_str());
       xbg_logf("NVN caps api=%u.%u.%u driver=%u maxUBdyn=%u maxPerStageUB=%u minUBAlign=%llu maxBoundSets=%u",VK_API_VERSION_MAJOR(properties.apiVersion),VK_API_VERSION_MINOR(properties.apiVersion),VK_API_VERSION_PATCH(properties.apiVersion),properties.driverVersion,properties.limits.maxDescriptorSetUniformBuffersDynamic,properties.limits.maxPerStageDescriptorUniformBuffers,(unsigned long long)properties.limits.minUniformBufferOffsetAlignment,properties.limits.maxBoundDescriptorSets);}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-ab-toggle").c_str(),"rb");ab_period=0;if(m){if(fscanf(m,"%d",&ab_period)!=1)ab_period=0;fclose(m);}xbg_logf("NVN PERF ab_period=%d",ab_period);}
