@@ -43,7 +43,9 @@ About 370 µs is the shader processing its full lists, as on the Switch. About 2
 
 `get_image` re-hashed every CPU-uploaded texture a draw bound: on its first 4 checks, then on every 16th submission. In a Den of Evil fight `hash_memory` was 2.2% of the game thread, about 0.27 ms a frame. A streamed write into a texture still being sampled could also show stale texels for up to 16 submissions.
 
-The iOS backend (`nvn_mtl.m` `tex_mtl`) already uses the write-protect tracker for this, and the engine now does the same. An upload write-protects the texture's pages and keeps the tracker's stamp. A check is one generation compare when nothing faulted since, and hashes only after a guest or host write to its pages. Untracked pools keep the old hash checks. In the steady camp no check needed a hash (`NVN PERF texdirty checks=0`).
+The iOS backend (`nvn_mtl.m` `tex_mtl`) already uses the write-protect tracker for this, and the engine now does the same. Once a texture has been unchanged for 4 checks, its pages are write-protected with the tracker's stamp. A check is then one generation compare when nothing faulted since, and hashes only after a guest or host write to its pages. Untracked pools keep the old hash checks. In the steady camp no check needed a hash (`NVN PERF texdirty checks=0`).
+
+The first version protected each texture at upload. The game's own writes then faulted while a level loaded: the HLE's write-protect fault counter rose by about 37,000 in the 5 s of the Den of Evil warp, as the loader went on writing those pages and their neighbours. Protecting only after 4 unchanged checks brings a whole boot, camp, warp and fight run to about 19,900 faults: about 12,000 at the warp, then 5–7 per 5 s in the fight. Steady play is unchanged.
 
 Den of Evil fight (`DM_GAME_SEED=12345`), in-process A/B (target `texdirty`), steady windows of the same scene: render thread 8.47 ms with the tracker against 8.59 ms with the hash checks, so about 0.1 ms less per frame. The `hash` part on timed frames roughly halves. The rest of `hash_memory` is the texel-buffer verification, which this does not change. PR #22.
 
