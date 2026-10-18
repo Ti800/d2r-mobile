@@ -39,6 +39,8 @@ __attribute__((weak)) void nvn_dirty_slot_stats(int *live,int *used_slots,uint64
 #include <unistd.h>
 #include <dlfcn.h>
 #include <map>
+#include <new>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
@@ -746,17 +748,30 @@ Buffer readback_buffer(size_t n,const void *data=nullptr,size_t copy=0){
 // Per-submission snapshot cache of guest memory ranges. Guest command streams
 // cannot change memory between draws except through in-stream CPU operations
 // (uniform updates, buffer copies, events, writebacks), which invalidate it.
-// Node-recycling allocator for the per-submission snapshot maps: their nodes are dropped wholesale every submission, and
-// new/delete of ~3k nodes per frame (with scudo's locking) was ~3% of the render thread. Graphics thread only (engine mutex).
-template<class T> struct NodePool {
-    using value_type=T;NodePool()=default;template<class U> NodePool(const NodePool<U>&){}
-    static std::vector<void*> &free_list(){static std::vector<void*> f;return f;}
-    T *allocate(size_t n){if(n==1){auto &f=free_list();if(!f.empty()){void *p=f.back();f.pop_back();return static_cast<T*>(p);}}return static_cast<T*>(::operator new(n*sizeof(T)));}
-    void deallocate(T *p,size_t n){if(n==1){free_list().push_back(p);return;}::operator delete(p);}
-    template<class U> bool operator==(const NodePool<U>&)const{return true;}template<class U> bool operator!=(const NodePool<U>&)const{return false;}
+// Bump arena for the per-submission snapshot maps' nodes. The maps are dropped wholesale every submission: freeing ~3k nodes
+// one by one with new/delete (scudo's locking) was ~3% of the render thread, and walking the trees to recycle them still
+// ~1% of the D2R camp's on the Redmi K50 Ultra (__tree destroy under snapshot_reset). Nodes are never freed singly now:
+// snapshot_reset builds both maps empty in place (keys and Buffer are trivially destructible, and the allocator frees
+// nothing) and rewinds the arena. The maps are never destroyed, so no destructor at exit walks the rewound nodes.
+// Graphics thread only (engine mutex).
+struct SnapArena{
+    static constexpr size_t chunk_bytes=256*1024;std::vector<uint8_t*> chunks;size_t chunk=0,used=0;
+    void *alloc(size_t n){n=(n+15)&~size_t(15);need(n<=chunk_bytes,"Snapshot map node too large");
+        if(chunks.empty() || used+n>chunk_bytes){if(!chunks.empty())++chunk;used=0;if(chunk==chunks.size())chunks.push_back(static_cast<uint8_t*>(::operator new(chunk_bytes)));}
+        void *p=chunks[chunk]+used;used+=n;return p;}
+    void rewind(){chunk=0;used=0;}
 };
-using SnapMap=std::map<std::pair<uint64_t,uint64_t>,Buffer,std::less<std::pair<uint64_t,uint64_t>>,NodePool<std::pair<const std::pair<uint64_t,uint64_t>,Buffer>>>;
-SnapMap snapshots,uniform_snapshots;
+SnapArena &snap_arena(){static SnapArena *a=new SnapArena;return *a;}
+template<class T> struct SnapAlloc {
+    using value_type=T;SnapAlloc()=default;template<class U> SnapAlloc(const SnapAlloc<U>&){}
+    T *allocate(size_t n){return static_cast<T*>(snap_arena().alloc(n*sizeof(T)));}
+    void deallocate(T*,size_t){}   // snapshot_reset rewinds the arena
+    template<class U> bool operator==(const SnapAlloc<U>&)const{return true;}template<class U> bool operator!=(const SnapAlloc<U>&)const{return false;}
+};
+using SnapMap=std::map<std::pair<uint64_t,uint64_t>,Buffer,std::less<std::pair<uint64_t,uint64_t>>,SnapAlloc<std::pair<const std::pair<uint64_t,uint64_t>,Buffer>>>;
+static_assert(std::is_trivially_destructible<Buffer>::value,"snapshot_reset skips the map nodes' destructors");
+SnapMap &snapshots=*new SnapMap(),&uniform_snapshots=*new SnapMap();
+void snapshot_maps_reset(){new(&snapshots) SnapMap();new(&uniform_snapshots) SnapMap();snap_arena().rewind();}
 uint64_t snapshot_maxlen=0;
 void desc_memo_reset();
 // Direct-mapped front for the two snapshot maps: most lookups repeat within a submission (~12k of 15k per D2R camp frame).
@@ -766,7 +781,7 @@ void desc_memo_reset();
 struct SnapFront{uint64_t address=0,bytes=0,epoch=0;Buffer buffer;};SnapFront snap_front[2][2048];uint64_t snapshot_epoch=1;
 uint64_t snap_front_hits=0,snap_map_hits=0,snap_invalidations=0,snap_invalidated=0;   // perf (NVN PERF snapfront)
 inline SnapFront &snap_front_for(int which,uint64_t a,uint64_t n){uint64_t x=a*0x9E3779B97F4A7C15ull^n*0xC2B2AE3D27D4EB4Full;return snap_front[which][(x^(x>>31))&2047];}
-void snapshot_reset(){snapshots.clear();uniform_snapshots.clear();snapshot_maxlen=0;desc_memo_reset();++texel_write_epoch;++snapshot_epoch;last_pass_reset();}   // the guest may write memory between submissions: texel copies are re-verified
+void snapshot_reset(){snapshot_maps_reset();snapshot_maxlen=0;desc_memo_reset();++texel_write_epoch;++snapshot_epoch;last_pass_reset();}   // the guest may write memory between submissions: texel copies are re-verified
 void snapshot_invalidate(uint64_t address,uint64_t bytes){
     ++snap_invalidations;if(ab_off("snapinval"))++snapshot_epoch;
     if(address<texel_hi && address+bytes>texel_lo)texel_touch(address,bytes);
