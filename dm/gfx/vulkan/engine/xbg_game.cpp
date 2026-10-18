@@ -1152,6 +1152,9 @@ void capture_image(Image &im,const view_t *view,const char *role){
 }
 std::map<uintptr_t,size_t> pools;
 struct RegisteredTexture{tex_t texture{};view_t view{};bool has_view=false;uint64_t revision=0;};
+// Bumped by every event that can fail a descriptor memo entry's per-image checks: a texture registration that changes, an
+// image created or released for a serial. A memo hit repeats those checks only when it moved since the entry's last ones.
+uint64_t memo_check_gen=1;
 // 只比较可影响图像/视图的语义字段，忽略 padding、snapshot 指针及未启用的 view 字段。
 // Compare image/view semantics only, ignoring padding, snapshot pointers and inactive view fields.
 static bool registered_texture_equal(const RegisteredTexture &a,const RegisteredTexture &b){
@@ -1173,7 +1176,7 @@ static bool register_texture_record(RegisteredTexture &slot,const tex_t &texture
     RegisteredTexture next;next.texture=texture;
     if(view && (view->set_levels || view->set_layers || view->set_format || view->set_target)){next.view=*view;next.has_view=true;}
     bool changed=!slot.revision || !registered_texture_equal(slot,next);
-    next.revision=slot.revision+uint64_t(changed);slot=next;return changed;
+    next.revision=slot.revision+uint64_t(changed);slot=next;if(changed)++memo_check_gen;return changed;
 }
 struct MemoImage{const tex_t *first;Image *second;const RegisteredTexture *record;uint64_t revision;};
 using PoolKey=std::pair<uintptr_t,int64_t>;
@@ -1316,7 +1319,7 @@ Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
         // GPU contents. Serial-only caches would incorrectly re-upload stale CPU
         // bytes when the new object aliases an already-rendered attachment.
         Image *alias=nullptr;for_images_overlapping(uint64_t(uintptr_t(t->mem)),1,[&](Image &c){if(!alias && c.source.mem==t->mem && !memcmp(&c.source.d,&t->d,sizeof(t->d)))alias=&c;});
-        if(alias)for(auto &candidate:images)if(candidate.second.get()==alias){it=images.emplace(t->serial,candidate.second).first;image_index_dirty=true;++memo_bump[3];provenance_image("ALIAS",t,*it->second);break;}
+        if(alias)for(auto &candidate:images)if(candidate.second.get()==alias){it=images.emplace(t->serial,candidate.second).first;image_index_dirty=true;++memo_check_gen;++memo_bump[3];provenance_image("ALIAS",t,*it->second);break;}
     }
     if(it==images.end()){
         need(t->d.samples<=1 || t->d.samples==2 || t->d.samples==4 || t->d.samples==8,"Unsupported texture sample count");
@@ -1342,7 +1345,7 @@ Image &get_image(const tex_t *t,bool upload){CPU_SCOPE(Image);
         VK(vkCreateImage(cfg.device,&ci,nullptr,&p->image));p->create=ci;VkMemoryRequirements r;vkGetImageMemoryRequirements(cfg.device,p->image,&r);
         p->mem_bytes=int64_t(r.size);image_bytes_live+=p->mem_bytes;if(xbg_bc_format_info(t->d.format,&info)==0){p->bc_bytes=p->mem_bytes;p->bc_data=int64_t(t->L.size);bc_image_bytes_live+=p->bc_bytes;bc_data_bytes_live+=p->bc_data;}
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=r.size;ai.memoryTypeIndex=memory_type(r.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);VK(vkAllocateMemory(cfg.device,&ai,nullptr,&p->memory));VK(vkBindImageMemory(cfg.device,p->image,p->memory,0));
-        it=images.emplace(t->serial,std::move(p)).first;image_index_dirty=true;++memo_bump[4];provenance_image("CREATE",t,*it->second);
+        it=images.emplace(t->serial,std::move(p)).first;image_index_dirty=true;++memo_check_gen;++memo_bump[4];provenance_image("CREATE",t,*it->second);
     }
     hit=it->second.get();front.serial=t->serial;front.epoch=images_epoch;front.im=hit;}
     Image &im=*hit;
@@ -1898,7 +1901,7 @@ void upgrade_mutable(Image &im){
     xbg_logf("NVN mutable upgrade serial=%llu fmt=%d %ux%ux%u levels=%u layers=%u copied=%d total=%llu",(unsigned long long)im.source.serial,int(im.fmt),im.width,im.height,im.depth,im.levels,im.layers,int(copied),(unsigned long long)mutable_upgrades);
 }
 struct DescMemo{const LayoutEntry *entry;VkDescriptorSet set;VkPipelineLayout pipeline_layout;std::vector<uint32_t> dynamic_offsets;std::vector<MemoImage> images;struct Dyn{uint64_t order;VkBuffer buffer;uint32_t offset;bool uniform;uint8_t src=0,ns=0,bank=0;};std::vector<Dyn> dyn;bool persistent=false;std::vector<std::pair<uint64_t,const void*>> tex_ids;struct Stor{uint64_t base,bytes;VkBuffer buffer;VkDeviceSize offset;};std::vector<Stor> stor;
-    struct Texel{const RegisteredTexture *record;uint64_t revision,base,bytes,gen;uint32_t format;};std::vector<Texel> texel;};   // texel: resident uniform texel buffers (texel_acquire)
+    struct Texel{const RegisteredTexture *record;uint64_t revision,base,bytes,gen;uint32_t format;};std::vector<Texel> texel;uint64_t checked_gen=0;};   // checked_gen: memo_check_gen at its last passed image checks   // texel: resident uniform texel buffers (texel_acquire)
 struct DynUbo{uint64_t order,address;size_t copy;};
 // Cross-frame memo (Claude C147): the memo lives per frame slot and survives submits. An entry is persistent when its set
 // holds no per-frame snapshot except dynamic uniform buffers (re-snapshotted on every hit, only the offset moves) and the
@@ -2027,10 +2030,14 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                 same=same && fi==fresh.size();
                 // 每个缓存项均核注册版本（包括 view）和存活图像；仅重建失效项。
                 // Every cached entry checks registration revision (including view) and live image identity.
-                if(same)for(size_t k=0;k<m.images.size();k++){const auto &cached=m.images[k];const tex_t *t=cached.first;
-                    if(cached.record->revision!=cached.revision){same=false;break;}
-                    if(t->serial!=m.tex_ids[k].first || t->mem!=m.tex_ids[k].second){same=false;break;}
-                    if(find_image(t->serial)!=m.images[k].second){same=false;break;}}
+                // Repeated only when memo_check_gen moved since this entry's last pass: re-reading every record was ~12% of
+                // descriptors() in the D2R camp (a scattered load per image per draw), and in play no registration changes.
+                if(same && m.checked_gen!=memo_check_gen){
+                    for(size_t k=0;k<m.images.size();k++){const auto &cached=m.images[k];const tex_t *t=cached.first;
+                        if(cached.record->revision!=cached.revision){same=false;break;}
+                        if(t->serial!=m.tex_ids[k].first || t->mem!=m.tex_ids[k].second){same=false;break;}
+                        if(find_image(t->serial)!=m.images[k].second){same=false;break;}}
+                    if(same)m.checked_gen=memo_check_gen;}
                 // Resident texel copies: same registration and range, the same copy the set holds (generation), content
                 // refreshed if the guest changed it since this slot last recorded.
                 if(same)for(auto &tr:m.texel){const tex_t &tt=tr.record->texture;
@@ -2044,7 +2051,6 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){
                 // 命中也走既有按 submit 节流的 CPU 内容复核，不强制重传。
                 // Hits retain get_image's bounded per-submit CPU checks, without forcing uploads.
                 for(auto &ti:m.images){Image &im=get_image(ti.first,true);prepare_read(im,commands.command);}
-                {size_t elements=0;for(unsigned st=0;st<5;st++)if(state.shader[st])for(auto &b:state.shader[st]->bindings)elements+=b.count;out.buffers.reserve(elements*2+40);} // draw() keeps vertex/index buffers here
                 out.entry=m.entry;out.set=m.set;out.pipeline_layout=m.pipeline_layout;out.dynamic_offsets=offsets;++desc_memo_hits;if(m.persistent)++xmemo_hits;desc_ns[5]+=perf_clock()-tm0;return;}
                 ++desc_memo_why[3];
                 if(m.persistent){auto pin=memo_pinned[slot_index].find(m.set);if(pin!=memo_pinned[slot_index].end() && --pin->second.refs==0){slots[slot_index].used_sets[pin->second.layout].push_back(m.set);memo_pinned[slot_index].erase(pin);}}
@@ -3053,7 +3059,7 @@ static void xbg_legacy_pool_add_now(void *p,size_t n){std::lock_guard<std::recur
 static void xbg_legacy_pool_del_now(void *p){std::lock_guard<std::recursive_mutex> lock(mutex);provenance_log("POOL_DEL mem=%p epoch=%llu",p,provenance.epoch(uint64_t(p)));provenance.pool(uint64_t(p),false);{auto pit=pools.find(uintptr_t(p));if(pit!=pools.end())vcache::drop_pool(uintptr_t(p),pit->second);}pools.erase(uintptr_t(p));cmd_range_lo=0;cmd_range_bytes=0;}
 static void xbg_register_texture_now(const dpool_t *p,int id,const tex_t *t,const view_t *v){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&id>=0&&id<p->n&&t,"Invalid texture registration");auto &slot=textures[pool_key(p)][id];if(register_texture_record(slot,*t,v))++memo_bump[0];}
 static void xbg_register_sampler_now(const dpool_t *p,int id,const samp_par *s){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&id>=0&&id<p->n&&s,"Invalid sampler registration");auto &slot=samplers[pool_key(p)][id];if(memcmp(&slot,s,sizeof(*s))){++memo_epoch;++memo_bump[1];}slot=*s;}
-static void xbg_legacy_tex_release_now(tex_t *t){std::lock_guard<std::recursive_mutex> lock(mutex);if(t){auto i=images.find(t->serial);if(i!=images.end()){provenance_image("RELEASE",t,*i->second);retire_object(i->second);++memo_bump[2];}images.erase(t->serial);image_index_dirty=true;++images_epoch;}}
+static void xbg_legacy_tex_release_now(tex_t *t){std::lock_guard<std::recursive_mutex> lock(mutex);if(t){auto i=images.find(t->serial);if(i!=images.end()){provenance_image("RELEASE",t,*i->second);retire_object(i->second);++memo_bump[2];}images.erase(t->serial);image_index_dirty=true;++images_epoch;++memo_check_gen;}}
 static void xbg_legacy_prog_release_now(prog_t *p){/* Immutable shader modules are keyed by original control digest, shared safely. */std::lock_guard<std::recursive_mutex> lock(mutex);if(p && p->serial)program_cache.erase(p->serial);}
 static void xbg_texture_invalidate_now(const tex_t *t){std::lock_guard<std::recursive_mutex> lock(mutex);if(t){auto i=images.find(t->serial);if(i!=images.end()){need(!i->second->gpu_written,"CPU invalidation of GPU-written texture needs explicit range merge");i->second->uploaded=false;}}}
 extern "C" void *xbg_host_command_memory(cmd_t *owner,size_t n){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(n<=64*1024*1024 && host_bytes+n<=256ull*1024*1024,"Host command memory cap reached; finalize handles before reusing");auto p=std::make_unique<uint8_t[]>(n);void *out=p.get();host_ranges[uintptr_t(out)]=n;host_segments.push_back({owner,std::move(p),n});host_bytes+=n;return out;}
