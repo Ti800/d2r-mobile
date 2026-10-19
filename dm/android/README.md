@@ -24,9 +24,11 @@ finished Android release.
 
 The current configuration uses JDK 17 or newer, Gradle 9.8.1, Android SDK 36,
 NDK 29.0.14206865, CMake 3.31.6, and Python 3. ARM64 devices must support Android
-12/API 31 or newer and Vulkan 1.3. These are build/manifest requirements, not a
+12/API 31 or newer and Vulkan 1.1 with the required device features. These are build/manifest requirements, not a
 claim that all matching devices have been tested. The first target is vivo X200
 Ultra (Android 16/API 36, Adreno 830).
+
+Vulkan compatibility is selected from actual format features, not the Android version. Startup logs `format_feature_flags2` and `depth16_as_d24`; D16 is widened only when D16 lacks linear filtering and X8_D24 has all required uses. A Vulkan 1.1 version number alone does not establish compatibility. vivo should log `1 / 0`; the Redmi K50 Ultra (Adreno 730, Vulkan 1.1) logs `0 / 1` and runs this path.
 
 Prepare your own game files according to the root setup documentation. Generate
 `dm_vault_tab.h`, `dm_hud_exp.h`, and `dm_bright_levels.inc` outside the repository
