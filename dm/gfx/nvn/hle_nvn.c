@@ -1051,6 +1051,7 @@ static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
+__attribute__((weak)) void dm_hle_wake_counts(uint64_t *wakes, uint64_t *skips) { *wakes = 0; *skips = 0; }
 extern uint32_t mtl_present_qos(void);
 static uint64_t g_frame;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
@@ -1395,6 +1396,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
         // 单调时钟的绝对秒数：按时间轮换的进程内对照（gfx-ab-toggle、DM_HLE_SPIN_AB）据此给每帧分相位 | absolute monotonic seconds, so time-based in-process A/B runs (gfx-ab-toggle, DM_HLE_SPIN_AB) can split frames by phase
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); trow(f, "@mono_s", ts.tv_sec + ts.tv_nsec / 1e9); }
+        // 客体线程唤醒次数，及其中目标在自旋、省掉信号的次数（hle_thread.c 的 wake）
+        // Guest thread wakes, and those whose target was spinning so no signal was sent (hle_thread.c's wake)
+        { static uint64_t pw, pk; uint64_t w, k; dm_hle_wake_counts(&w, &k); trow(f, "@wakes", (double)(w - pw)); trow(f, "@wake_skips", (double)(k - pk)); pw = w; pk = k; }
         trow(f, "@drawable_ms", mtl_drawable_ns_take() / 1e6);
         trow(f, "@sub_wall_ms", atomic_exchange(&g_sub_wall_ns, 0) / 1e6); trow(f, "@sub_cpu_ms", atomic_exchange(&g_sub_cpu_ns, 0) / 1e6); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
     } else atomic_store(&g_nvn_ns, 0);
