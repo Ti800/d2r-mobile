@@ -179,6 +179,13 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // gfx-warp32; a marker file still wins): on Adreno the clutter, grass, fluid and PPR shaders' warp-aggregated appends lost
     // lanes 32-63 and overwrote entries.
     setenv("DM_GFX_WARP32", "1", 0);
+    // 翻译器输出的两项等价整理（引擎的 gfx-ldc-fold 与 gfx-forward-temps；标记文件仍优先）：常量缓冲区按字寻址时可推出的分量下标
+    // 换成常量，只写一次的临时变量直接转发。Redmi K50 Ultra 营地（比例 0.75）GPU 每帧 15.70 → 14.34 ms，结果不变。
+    // Two exact clean-ups of the translator's output (the engine's gfx-ldc-fold and gfx-forward-temps; a marker file still
+    // wins): constant-buffer component indexes that follow from known low bits become constants, and single-store temporaries
+    // are forwarded. Redmi K50 Ultra camp at scale 0.75: GPU 15.70 -> 14.34 ms a frame, with the same results.
+    setenv("DM_GFX_LDC_FOLD", "1", 0);
+    setenv("DM_GFX_FORWARD_TEMPS", "1", 0);
     // 帧重叠缺省开：命令缓冲里的 SignalEvent 不提交、留到所在槽退役时再公布（引擎的 gfx-defer-events = 2；标记文件仍优先）。
     // 与呈现端的 gfx-present-overlap 一起，Redmi K50 Ultra 营地从 7.7 fps 到 19.5 fps（PR #9）。
     // Frame overlap on by default: command-buffer SignalEvents do not submit and are published when their slot retires (the
