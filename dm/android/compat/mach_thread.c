@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <ucontext.h>
@@ -87,6 +88,18 @@ kern_return_t task_threads(mach_port_t task, thread_act_array_t *out, mach_msg_t
 kern_return_t thread_info(thread_act_t t, int flavor, thread_info_t out, mach_msg_type_number_t *count) {
     (void)count;
     if (flavor != THREAD_BASIC_INFO) return KERN_FAILURE;
+    // 问的是调用线程自己（hle_nvn.c 的 thr_sys_ns 每次提交读两次）：getrusage(RUSAGE_THREAD) 一次系统调用、微秒精度。
+    // 打开 /proc 读 stat 每次要 open / read / close 加解析，约占 Redmi 营地渲染线程的 0.7%，而且只有时钟滴答（10 ms）精度
+    // The calling thread itself (hle_nvn.c's thr_sys_ns reads it twice per submit): getrusage(RUSAGE_THREAD) is one system
+    // call with microsecond precision. Reading /proc's stat takes an open, a read, a close and parsing each time, about 0.7% of
+    // the render thread in the Redmi camp, and it only has clock-tick (10 ms) precision
+    if ((pid_t)t == gettid()) {
+        struct rusage ru; if (getrusage(RUSAGE_THREAD, &ru)) return KERN_FAILURE;
+        thread_basic_info_data_t *bi = (thread_basic_info_data_t *)out; memset(bi, 0, sizeof *bi);
+        bi->user_time.seconds = (int)ru.ru_utime.tv_sec; bi->user_time.microseconds = (int)ru.ru_utime.tv_usec;
+        bi->system_time.seconds = (int)ru.ru_stime.tv_sec; bi->system_time.microseconds = (int)ru.ru_stime.tv_usec;
+        return KERN_SUCCESS;
+    }
     char path[64], buf[1024]; snprintf(path, sizeof path, "/proc/self/task/%u/stat", t);
     FILE *f = fopen(path, "r"); if (!f) return KERN_FAILURE;
     size_t got = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[got] = 0;
