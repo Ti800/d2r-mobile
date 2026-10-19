@@ -6,7 +6,6 @@
 #include "../host/dm_hud.h"
 #include <pthread.h>
 #include <math.h>
-#include <stdlib.h>
 #include <string.h>
 
 uint64_t now_ns(void);
@@ -26,32 +25,6 @@ static float width = 800, height = 375, safe_left, safe_right, safe_bottom;
 static uint64_t epoch = 1, world = 1, pulse_epoch, pulse_sample, resume_sample;
 static double pulse_hold_start;
 static unsigned seen_world, seen_mouse, seen_tab, seen_use, seen_ident, seen_long, seen_item, seen_stack;
-/* 前端页面（主菜单 / 选角 / 建角 / 读取画面，即不在局内），同 iOS front_ios.m frontendMode：不画控件，第一根手指直接当原生点击交给游戏界面
-   （dm_ui_touch → 鼠标消息，dm_cursor.c），纵向拖过 10 点改成滚动。只在装了触屏覆盖层（DM_ROMFS_OVERLAY）时这样：覆盖层把选角页换成键鼠版
-   （「开始」「创建新角色」靠点）；没有覆盖层时前端是原版手柄页，仍走导航键。
-   Front-end pages (main menu / character select / creation / loading, i.e. not in a run), as iOS front_ios.m frontendMode: no controls are drawn, and
-   the first finger goes straight to the game UI as a native click (dm_ui_touch → mouse messages, dm_cursor.c); a vertical drag past 10 points scrolls.
-   Only with the touch overlay (DM_ROMFS_OVERLAY): it turns character select into the keyboard-and-mouse page ("Play", "Create New" are tapped);
-   without it the front end is the original controller page and keeps the navigation keys. */
-static int frontend, fe_slot = -1, fe_drag;
-static float fe_x0, fe_y0;
-static int touch_overlay(void) { static int v = -1; if (v < 0) { const char *o = getenv("DM_ROMFS_OVERLAY"); v = o && *o; } return v; }
-static void fe_end_locked(void) {
-    if (fe_slot >= 0) { if (fe_drag) dm_ui_drag_end(); else dm_ui_touch(3, 0, 0); }
-    fe_slot = -1; fe_drag = 0;
-}
-static void fe_event_locked(const touch_event *e) {
-    if (e->phase == 0 && fe_slot < 0) { fe_slot = e->slot; fe_x0 = e->x; fe_y0 = e->y; fe_drag = 0; }
-    if (e->slot != fe_slot) return;
-    float nx = e->x / width, ny = e->y / height, dy = fabsf(e->y - fe_y0);
-    if (e->phase == 1 && !fe_drag && dy > 10 && dy > fabsf(e->x - fe_x0) && dm_ui_fe_drag_ok()) {
-        fe_drag = 1; dm_ui_touch(3, 0, 0); dm_ui_drag_begin(1, fe_x0 / width, fe_y0 / height, 0);
-    }
-    if (fe_drag) { if (e->phase == 1) dm_ui_drag_move(nx, ny); else fe_end_locked(); return; }
-    if (e->phase == 3) { fe_end_locked(); return; }
-    dm_ui_touch(e->phase, nx, ny);
-    if (e->phase == 2) fe_slot = -1;
-}
 
 static void init_locked(void) {
     if (ready) return;
@@ -66,7 +39,6 @@ static void cancel_locked(void) {
     dm_tc_cancel_all(&tc);
     if (ui_drag) dm_ui_drag_end();
     ui_drag = 0;
-    fe_end_locked();
     pulse_epoch = pulse_sample = resume_sample = 0;
     pulse_hold_start = 0;
     dm_cursor_clear();
@@ -104,8 +76,6 @@ void dm_android_touch_uimsg(const char *cat, const char *act, const char *arg) {
         ++epoch; if (before.game != scene.game) ++world;
         cancel_locked(); head = tail = 0;
     }
-    int fe = !scene.game && touch_overlay();
-    if (fe != frontend) { cancel_locked(); head = tail = 0; frontend = fe; }
     dm_tc_set_navigation_mode(&tc, nav);
     dm_tc_set_joy_block(&tc, !!(dm_ui_panel_state() & DM_PS_TEXT));
     dm_tc_enable_targets(&tc, nav ? dm_tc_nav_mask(!dm_tc_scene_dead()) : ((1u << DM_TC_COUNT) - 1));
@@ -171,16 +141,8 @@ void dm_android_touch_step(uint64_t guest_now, uint64_t *buttons, int32_t *lx, i
     }
     if (!focused) { pthread_mutex_unlock(&lock); return; }
     sync_host();
-    /* 本次取手柄前排队的触点整批在这里套用：按下与抬起落在同一批（点得比游戏两次取手柄的间隔还短、或游戏卡住没取输入）时，状态机算出的键在批末已经松开，
-       游戏一次也看不到——iOS 由前端异步调 dm_input_set，按下沿进 hle_hid.c 的 g_press_latch 锁存，这里同样：批内任何时刻按着过的键这次一并给出，下一次照实际值。
-       The touches queued before this controller read are applied here as one batch: when press and release land in the same batch (a tap shorter than the
-       interval between two reads, or the game stalling its input reads), the state machine's key is already up at the end of the batch and the game never
-       sees it. On iOS the front end calls dm_input_set asynchronously and the press edge is latched in hle_hid.c g_press_latch; likewise here, keys held at
-       any point in the batch are delivered with this read, and the next read reports the actual state. */
-    uint64_t pressed = 0;
     while (head != tail) {
         touch_event e = queue[head++ % 256];
-        if (frontend) { fe_event_locked(&e); continue; }
         dm_tc_finger *f = &tc.finger[e.slot];
         if (e.phase == 0) {
             if (dm_tc_belt_outside(&tc,e.x,e.y)) { dm_belt_expand(0); continue; }
@@ -213,7 +175,6 @@ void dm_android_touch_step(uint64_t guest_now, uint64_t *buttons, int32_t *lx, i
             } else dm_tc_cancel_finger(&tc,e.slot);
             if (ui_drag) { dm_ui_drag_end(); ui_drag = 0; }
         }
-        pressed |= tc.buttons;
         requests();
     }
     double now = now_ns()/1e9;
@@ -240,7 +201,7 @@ void dm_android_touch_step(uint64_t guest_now, uint64_t *buttons, int32_t *lx, i
     if (tc.pointer_valid) dm_cursor_set_screen(tc.pointer_x,tc.pointer_y,width,height); else dm_cursor_clear();
     int active = 0; for (int i=0;i<DM_TC_MAX_TOUCH;++i) active |= tc.finger[i].active;
     dm_ui_hand_idle(!active && !tc.pulse_button && !dm_tc_pulse_pending(&tc) && !dm_cursor_pending() && !dm_ui_touch_active());
-    *buttons |= tc.buttons | pressed;
+    *buttons |= tc.buttons;
     if (!*lx && !*ly) { *lx = tc.lx; *ly = tc.ly; }
     if (!*rx && !*ry) { *rx = tc.rx; *ry = tc.ry; }
     pthread_mutex_unlock(&lock);
@@ -260,7 +221,6 @@ void dm_android_touch_layout(float out[DM_ANDROID_TOUCH_DRAW_FLOATS]) {
             p[3]=i<DM_TC_COUNT?!!(tc.enabled_targets&(1u<<i)):!tc.navigation_mode && (i<15 || tc.diff_open);
             for (int j=0;j<DM_TC_MAX_TOUCH;++j) if (tc.finger[j].active && tc.finger[j].target==(i==13?DM_TC_SWAP:i==14?DM_TC_DIFF:i)) p[4]=1;
         }
-        if (frontend) p[3]=0;   /* 前端页面不画控件（见 frontend） | No controls drawn on front-end pages (see frontend) */
     }
     pthread_mutex_unlock(&lock);
 }

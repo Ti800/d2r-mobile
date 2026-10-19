@@ -7,7 +7,6 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
-import android.view.Choreographer;
 import android.view.MotionEvent;
 import android.view.View;
 import java.io.File;
@@ -21,18 +20,6 @@ public final class TouchOverlay extends View {
     private final float density;
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final float[] layout = new float[119];
-    // 每个刷新周期只查一次原生布局；与上次画出的不同才重画（原先每帧都重画，120 Hz 下 RenderThread 占一个核的约 12%）。
-    // The native layout is checked once per refresh; the view redraws only when it differs from what was last drawn
-    // (it used to redraw every frame: at 120 Hz about 12% of a core on RenderThread, plus GPU time).
-    private final float[] probe = new float[119], drawn = new float[119];
-    private boolean drawnValid;
-    private final Choreographer.FrameCallback poll = new Choreographer.FrameCallback() {
-        @Override public void doFrame(long frameTimeNanos) {
-            if (!running) return;
-            if (inputEnabled && isShown()) { nativeLayout(probe); if (!drawnValid || !Arrays.equals(probe, drawn)) invalidate(); }
-            Choreographer.getInstance().postFrameCallback(this);
-        }
-    };
     private final int[] pointerIds = new int[16];
     private final float[] lastX = new float[16], lastY = new float[16];
     private final int[] rawIds = new int[16];
@@ -64,8 +51,8 @@ public final class TouchOverlay extends View {
         if (inputEnabled==enabled) return;
         if (!enabled) cancelTouches();
         inputEnabled=enabled;
-        drawnValid=false; invalidate();
-        if (enabled) resizeNative();
+        if (enabled) { resizeNative(); postInvalidateOnAnimation(); }
+        else invalidate();
     }
     private void resizeNative() {
         if (inputEnabled && getWidth()>0 && getHeight()>0) nativeResize(getWidth()/density,getHeight()/density,safeLeft,safeRight,safeBottom);
@@ -74,10 +61,10 @@ public final class TouchOverlay extends View {
         cancelTouches(); resizeNative();
     }
     @Override protected void onAttachedToWindow() {
-        super.onAttachedToWindow(); running=true; drawnValid=false; invalidate(); Choreographer.getInstance().postFrameCallback(poll);
+        super.onAttachedToWindow(); running=true; postInvalidateOnAnimation();
     }
     @Override protected void onDetachedFromWindow() {
-        running=false; Choreographer.getInstance().removeFrameCallback(poll); cancelTouches(); super.onDetachedFromWindow();
+        running=false; cancelTouches(); super.onDetachedFromWindow();
     }
     public void cancelTouches() {
         if (!inputEnabled) { Arrays.fill(pointerIds,-1); return; }
@@ -123,7 +110,7 @@ public final class TouchOverlay extends View {
         return i<source.length && source[i]!=null?source[i]:"";
     }
     @Override protected void onDraw(Canvas canvas) {
-        super.onDraw(canvas); if (!inputEnabled) return; nativeLayout(layout); System.arraycopy(layout, 0, drawn, 0, layout.length); drawnValid=true;
+        super.onDraw(canvas); if (!inputEnabled) return; nativeLayout(layout);
         canvas.save(); canvas.scale(density,density);
         boolean navigation=layout[2]!=0;
         for (int i=0;i<23;++i) {
@@ -144,6 +131,6 @@ public final class TouchOverlay extends View {
             String text=label(i,navigation);
             canvas.drawText(text,x,y-(paint.ascent()+paint.descent())/2,paint);
         }
-        canvas.restore();
+        canvas.restore(); if (running && isShown()) postInvalidateOnAnimation();
     }
 }
