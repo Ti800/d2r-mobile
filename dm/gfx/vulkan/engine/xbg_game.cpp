@@ -880,7 +880,7 @@ bool pending_view(uint64_t address,uint64_t bytes,VkDeviceSize align,Buffer &out
 namespace wtrack {
 constexpr size_t min_bytes=1u<<20;constexpr unsigned max_regions=8,versions=2;bool enabled=true;int marker=-1;   // marker: gfx-wtrack 1 / 0 (or gfx-no-wtrack), -1 = none
 struct Region{std::atomic<uintptr_t> begin{0},end{0};std::atomic<uint8_t> *dirty=nullptr;};
-Region regions[max_regions];std::atomic<unsigned> nregions{0};struct sigaction previous{};bool installed=false;
+Region regions[max_regions];std::atomic<unsigned> nregions{0};struct sigaction previous{};bool installed=false,host_hooks=false;
 // Re-enable writes to the tracked pages in [a,a+len) and mark them dirty. Signal-safe: atomics and mprotect only.
 bool unprotect(uintptr_t a,size_t len){bool any=false;unsigned n=nregions.load(std::memory_order_acquire);
     for(unsigned i=0;i<n;i++){uintptr_t b=regions[i].begin.load(std::memory_order_relaxed),e=regions[i].end.load(std::memory_order_relaxed);
@@ -951,13 +951,31 @@ bool snapshot(uint64_t address,size_t bytes,Buffer &out){
     if(!pick->coherent){VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};mr.memory=pick->memory;mr.size=VK_WHOLE_SIZE;VK(vkFlushMappedMemoryRanges(cfg.device,1,&mr));}
     pick->last_use=slot_serial;out=Buffer{};out.buffer=pick->buffer;out.memory=pick->memory;out.offset=0;out.size=bytes;out.mapped=pick->mapped;out.coherent=pick->coherent;return true;
 }
+// Renderer shutdown, once the queue is idle (from main's 65721a2): the tracked guest pages become writable again and the
+// tracked copies are freed, so a restarted renderer tracks afresh; a fault handler the engine installed itself is replaced by
+// the previous one, while host fault hooks stay with the host. Tracking stays enabled for the next start.
+void release(){
+    for(unsigned i=0;i<nregions.load();i++){
+        uintptr_t b=regions[i].begin.load(),e=regions[i].end.load();
+        if(e>b)need(mprotect(reinterpret_cast<void*>(b),e-b,PROT_READ|PROT_WRITE)==0,"Restore tracked guest pages failed");
+        delete[] regions[i].dirty;regions[i].dirty=nullptr;regions[i].begin=0;regions[i].end=0;
+    }
+    nregions=0;
+    for(auto &t:tracked)for(auto &v:t.second->v){
+        if(v.mapped)vkUnmapMemory(cfg.device,v.memory);
+        if(v.buffer)vkDestroyBuffer(cfg.device,v.buffer,nullptr);
+        if(v.memory)vkFreeMemory(cfg.device,v.memory,nullptr);
+    }
+    tracked.clear();exhausted=false;
+    if(installed && !host_hooks){sigaction(SIGSEGV,&previous,nullptr);installed=false;}
+}
 }
 // Host fault hooks for write tracking. A host with one SIGSEGV handler of its own (dm crash.c) calls
 // xbg_wtrack_use_host_hooks() once and routes faults here instead of letting the engine install a handler;
 // xbg_wtrack_prepare is for host writes into guest memory that do not fault (a syscall gets EFAULT).
 // With the host owning the fault handler, write tracking is on unless a marker turns it off (Redmi K50 Ultra camp A/B: CPU
 // -1.15 ms per frame, no mismatches); without it, it stays opt-in (gfx-wtrack = '1') with the engine's own handler.
-extern "C" void xbg_wtrack_use_host_hooks(void){wtrack::installed=true;if(wtrack::marker!=0)wtrack::enabled=true;xbg_logf("NVN wtrack through host hooks enabled=%d",int(wtrack::enabled));}
+extern "C" void xbg_wtrack_use_host_hooks(void){wtrack::installed=wtrack::host_hooks=true;if(wtrack::marker!=0)wtrack::enabled=true;xbg_logf("NVN wtrack through host hooks enabled=%d",int(wtrack::enabled));}
 extern "C" int xbg_wtrack_fault(void *addr){return wtrack::unprotect(uintptr_t(addr),1);}
 extern "C" void xbg_wtrack_prepare(void *addr,size_t len){if(len)wtrack::unprotect(uintptr_t(addr),len);}
 // Texture content checks through the write-protect tracker (nvn_dirty.c), as nvn_mtl.m tex_mtl does on iOS: once a texture
@@ -3194,7 +3212,7 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
 static void xbg_legacy_pool_add_now(void *p,size_t n){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&n,"Invalid NVN pool");pools[uintptr_t(p)]=n;cmd_range_lo=0;cmd_range_bytes=0;auto epoch=provenance.pool(uint64_t(p),true);provenance_log("POOL_ADD mem=%p bytes=%zu epoch=%llu",p,n,epoch);}
 static void xbg_legacy_pool_del_now(void *p){std::lock_guard<std::recursive_mutex> lock(mutex);provenance_log("POOL_DEL mem=%p epoch=%llu",p,provenance.epoch(uint64_t(p)));provenance.pool(uint64_t(p),false);{auto pit=pools.find(uintptr_t(p));if(pit!=pools.end())vcache::drop_pool(uintptr_t(p),pit->second);}pools.erase(uintptr_t(p));cmd_range_lo=0;cmd_range_bytes=0;}
