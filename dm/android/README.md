@@ -66,8 +66,8 @@ screen is not implemented.
 | --- | --- |
 | App internal `files/dm/out/` | `main` and `sdk` rewriter products generated with `DM_TARGET=android`, including patched modules, fixups, and gates |
 | App internal `files/dm/shaders/` | External `.xgs` bundles matching the game and Vulkan backend |
-| App internal `files/dm/overlay/` | Optional CASC touch overlay generated from the current source and the user's resources |
-| App internal `files/dm/overlay/touchart/` | Optional locally generated `dm_touch_joy.png`; otherwise the UI draws a fallback joystick |
+| App internal `files/dm/overlay/` | Required CASC touch overlay, including `overlay.manifest`, generated from the matching source and the user's resources |
+| App internal `files/dm/overlay/touchart/` | Skill atlases, map icon and joystick image staged by `stage_touch_assets.py` (the joystick comes from the repository's `dm/ios/Sources/TouchArt/dm_touch_joy.png`); without the joystick image the UI draws a fallback joystick |
 | Shared `Download/data/` | User's resource archives and `.build.config`; requires Android's all-files-access setting |
 | App internal `files/save/` | Saves; preserve during upgrades |
 | App internal `files/temp/`, `files/dm/boot.log` | Temporary files and appended startup logs |
@@ -109,3 +109,23 @@ Advanced iOS skill artwork, empty-slot skill menus, specialized quantity/stat
 popovers, and shop drag-follow visuals are incomplete. Generic controls and text
 input do not establish complete iOS parity. macOS/iOS regressions must be run on
 an Apple build host before upstream integration.
+
+The overlay generator writes a source fingerprint and exact file hashes to `overlay.manifest`. The APK embeds the same generator-input fingerprint. Missing, incomplete, or mismatched overlays stop startup with a localized message before the host thread starts. Deploy the complete generated directory; do not copy a manifest onto old resources or generate one on the phone. Regenerate after generator/layout changes. This contract does not authenticate third-party resource downloads.
+
+`gen_romfs_overlay.py` requests overlay-only assets: it skips the iOS skill atlas and its unused skill silhouettes. Full `gen_assets.ensure()` still requires them. Skill atlas validation compares dimensions and decoded RGBA pixels while retaining source sprite SHA256/MD5 checks. Generator subprocesses explicitly use UTF-8/LF and preserve an existing read-only resource adapter. Windows/Linux byte equality must still be verified with the same game input and tool versions.
+
+# Current iOS touch controls
+
+Android shares the upstream touch state machine and its read-only skill-binding observer. Generate the binding index and atlas PNGs from your own matching RomFS outside the checkout:
+
+```
+python dm/ios/tools/native_art/generate.py <RomFS> --output-dir <external-native-art>
+```
+
+Copy only `dm_touch_native_art.c` into the existing `DM_GEN_DIR`. CMake requires that external index alongside the existing generated host headers. After generating a fresh overlay and HUD, run:
+
+```
+python dm/android/tools/stage_touch_assets.py --native-art <external-native-art>/TouchArt --hud <assets>/NativeHUD/v4/hud_v4_ui --overlay <candidate-overlay>
+```
+
+Import the complete finalized candidate overlay. Skill PNGs and HUD images stay in the external resource payload; do not add them to Git or APK assets. The renderer reads them from the validated imported `files/dm/overlay` directory. `DM_NATIVE_ART_DIR=<external-native-art>` lets the native-art capture test verify the external index and pixels. The five navigation buttons remain enabled until the complete replacement inventory flow passes device validation.

@@ -47,8 +47,8 @@ APK 和 Git 仓库均不含游戏程序、着色器、游戏美术或存档。�
 | --- | --- |
 | 应用内部 `files/dm/out/` | 使用 `DM_TARGET=android` 生成的 `main`、`sdk` 改写产物，含 patched 模块、fixups 和 gates |
 | 应用内部 `files/dm/shaders/` | 与游戏及 Vulkan 后端匹配的仓外 `.xgs` 包 |
-| 应用内部 `files/dm/overlay/` | 可选 CASC 触摸覆盖层，由当前源码及用户资源生成 |
-| 应用内部 `files/dm/overlay/touchart/` | 可选本地生成的 `dm_touch_joy.png`；没有时绘制备用摇杆 |
+| 应用内部 `files/dm/overlay/` | 必需 CASC 触摸覆盖层，含 `overlay.manifest`，由匹配源码及用户资源生成 |
+| 应用内部 `files/dm/overlay/touchart/` | 由 `stage_touch_assets.py` 放入的技能图集、地图图标与摇杆图（摇杆图取自仓库的 `dm/ios/Sources/TouchArt/dm_touch_joy.png`）；没有摇杆图时绘制备用摇杆 |
 | 共享 `Download/data/` | 用户资源档案及 `.build.config`，需要安卓“所有文件访问”授权 |
 | 应用内部 `files/save/` | 存档，升级时必须保留 |
 | 应用内部 `files/temp/`、`files/dm/boot.log` | 临时文件及追加写入的启动日志 |
@@ -71,3 +71,23 @@ java -cp /tmp/dm-input-tests com.xiaoboluo.d2r.TextInputRulesTest
 真机验收须分别记录安装、真实 GPU 出图/帧率、建角、进局、移动停止、NPC 交互、背包/技能、声音、后台恢复及保存重进。无窗口宿主帧率不等于渲染帧率。本后端尚未接入 Metal GPU 计时及实际扫描显示时间，缺失读数不能当作零耗时。
 
 Vulkan 当前每次全画，并使用同步宿主翻译（`DM_NVN_SYNC=1`）；上游新增异步路径需独立审计对象生命周期。呈现层仍逐帧等待队列。iOS 技能图、空技能槽菜单、专用数量/属性加点浮层及商店拖动跟随图尚未完整实现，通用控件和系统输入框不代表完整 iOS 功能对齐。提交上游集成前，还须在 Apple 构建机上验证 macOS/iOS 回归。
+
+覆盖层生成器将源码指纹和逐文件哈希写入 `overlay.manifest`，APK 编入同一生成器输入指纹。缺失、不完整或不匹配时，启动界面提示并在宿主线程启动前退出启动流程。须部署完整生成目录，不可把新清单贴到旧资源上，也不可在手机启动时补清单；生成器或布局修改后应重新生成。这项校验不负责认证第三方下载来源。
+
+`gen_romfs_overlay.py` 显式请求只生成 overlay 所需资产，跳过 iOS 技能图集及未使用的技能剪影；完整 `gen_assets.ensure()` 仍要求这些产物。技能图集改核尺寸和解码 RGBA 像素，保留原 sprite SHA256/MD5。生成子进程显式使用 UTF-8/LF，并保留已有只读资源适配器；Windows/Linux 的字节一致性仍须以同一游戏输入和工具版本实测。
+
+# 当期iOS触控
+
+安卓复用上游触控状态机及只读技能绑定观测桥。用自己的匹配RomFS在仓外生成绑定索引和图集PNG：
+
+```
+python dm/ios/tools/native_art/generate.py <RomFS> --output-dir <仓外native-art>
+```
+
+只把`dm_touch_native_art.c`复制到现有`DM_GEN_DIR`。CMake要求该仓外索引与原有宿主生成头同时存在。生成新的overlay和HUD后执行：
+
+```
+python dm/android/tools/stage_touch_assets.py --native-art <仓外native-art>/TouchArt --hud <assets>/NativeHUD/v4/hud_v4_ui --overlay <候选overlay>
+```
+
+导入完整且已生成最终manifest的候选overlay。技能PNG和HUD图像留在外部资源载荷，不加Git或APK assets；绘制层从已校验导入的`files/dm/overlay`读取。设置`DM_NATIVE_ART_DIR=<仓外native-art>`可让素材采图测试核验仓外索引和像素。五个导航键保留，等完整替代背包流程通过真机验证后再调整。

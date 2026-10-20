@@ -427,4 +427,12 @@ static const struct { const char *k, *zh, *en; } k_dm_i18n[] = {
     { "dmAndroidWidgetClassDruid", "德鲁伊", "Druid" },
     { "dmAndroidWidgetClassAssassin", "刺客", "Assassin" },
     { "dmAndroidWidgetClassWarlock", "术士", "Warlock" },
+    { "dmAndroidMissingOverlay", "缺少必需的触摸资源，启动已停止。请导入与此版本匹配的完整 overlay 资源后重新打开应用。", "Required touch resources are missing. Startup stopped. Import the complete overlay matching this version, then reopen the app." },
+    { "dmAndroidInvalidOverlay", "触摸资源不完整或与此版本不匹配，启动已停止。请重新生成并导入完整 overlay 资源。", "Touch resources are incomplete or do not match this version. Startup stopped. Regenerate and import the complete overlay." },
+    { "dmCustomTouchSwapAbove", "换组键位置", "Skill-set switch position" },
+    { "dmCustomTouchSwapNear", "换组键：传送门左侧", "Skill-set switch: left of portal" },
+    { "dmCustomTouchSwapNearHint", "沿传送门外侧弧线排布，松手后切换", "On the portal arc; release to switch" },
+    { "dmCustomTouchSwapFar", "换组键：技能区上方", "Skill-set switch: above skills" },
+    { "dmCustomTouchSwapFarHint", "位于技能区左上，松手后切换", "Above-left of skills; release to switch" },
+    { "dmAndroidHudLevel", "Lv %d · %d%%", "Lv %d · %d%%" },
 };

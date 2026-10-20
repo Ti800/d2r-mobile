@@ -122,6 +122,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 case -3 -> R.string.dmandroidmissingmodules;
                 case -4 -> R.string.dmandroidmissingshaders;
                 case -5 -> R.string.dmandroidmissingconfig;
+                case -9 -> R.string.dmandroidmissingoverlay;
+                case -10 -> R.string.dmandroidinvalidoverlay;
                 default -> 0;
             };
             showStartError(resource == 0 ? getString(R.string.dmandroidstartfailed, result) : getString(resource)); return;
