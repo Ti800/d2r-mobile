@@ -97,6 +97,11 @@ static void test_scale3d(void) {
     CHECK(s3_n(299, D60) == 1 && s3_n(1, D60) == 2, "快降：停判后历史清空，再满 5 窗 → 降到 2 档");
     s3_hold_pass();
     CHECK(s3_n(3000, D60) == 2, "下限：已到第 2 档（max_level），再掉也不动");
+    // 档位表：配置 0.75 仍是 0.75 / 0.70 / 0.65 / 0.60（下限 0.60 时最深第 3 档）；配置 0.85 时中间多出 0.80 / 0.75
+    // Level table: with the configured 0.75 still 0.75 / 0.70 / 0.65 / 0.60 (deepest level 3 at floor 0.60); with 0.85, 0.80 / 0.75 in between
+    CHECK(s3_max_level(0.75f, 0.60f) == 3 && s3_level_scale(0.75f, 0) == 0.75f && s3_level_scale(0.75f, 1) == 0.70f && s3_level_scale(0.75f, 3) == 0.60f, "档位：配置 0.75 → 0.70 / 0.65 / 0.60，最深第 3 档");
+    CHECK(s3_max_level(0.85f, 0.60f) == 5 && s3_level_scale(0.85f, 1) == 0.80f && s3_level_scale(0.85f, 2) == 0.75f && s3_level_scale(0.85f, 5) == 0.60f, "档位：配置 0.85 → 0.80 / 0.75 / 0.70 / 0.65 / 0.60，最深第 5 档");
+    CHECK(s3_max_level(1.0f, 0.70f) == 6 && s3_level_scale(1.0f, 1) == 0.95f && s3_level_scale(1.0f, 9) == 0.55f && s3_level_scale(0.72f, 1) == 0.70f, "档位：配置 1.0 的第 1 档 0.95；超出取最低；配置 0.72 的第 1 档 0.70");
     // 慢降：每窗 3 帧掉帧 + 114 帧正常（3 × 33.4 + 114 × 16.6667 = 2000.2 ms，一窗 117 帧，掉帧率 2.56%）
     // Slow lowering: per window 3 dropped frames + 114 normal frames (3 × 33.4 + 114 × 16.6667 = 2000.2 ms, 117 frames per window, dropped-frame rate 2.56%)
     s3 = (scale3d_ctl){.max_level = 2}; s3_now = 2000 * S3_SEC;

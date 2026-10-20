@@ -156,10 +156,31 @@ HLE_FORCE("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", "前后台
 // DM_3D_SCALE_DYN_INJECT=start frame-end frame (counted by dm_nvn_frame_count): diagnostics; within that frame range every interval fed to the controller is treated as two periods (dropped), outside it as one period
 // (the Mac has no present timestamps, so this verifies the whole downgrade / recovery chain). Active only in-game (no judging outside a game); the first level drops after a full 10 s (5 windows).
 #include <TargetConditionals.h>
-// 3D 比例的档位表：0 档 = 配置值（iPhone 0.75），往下每档一个比例；下限由 DM_3D_SCALE_FLOOR（缺省见 S3_FLOOR_DEF）截断。只动 3D 渲染比例，界面和文字不降
-// 3D scale level table: level 0 = configured value (iPhone 0.75), one scale per level going down; the floor is clamped by DM_3D_SCALE_FLOOR (default: see S3_FLOOR_DEF). Only the 3D render scale changes; UI and text are not lowered
-static const float g_s3_levels[] = {0.70f, 0.65f, 0.60f, 0.55f, 0.50f};   // 1 档起 | Starting from level 1
+// 3D 比例的档位表：0 档 = 配置值（iPhone 0.75），往下依次是表里低于配置值的各档（每档 0.05）；下限由 DM_3D_SCALE_FLOOR（缺省见 S3_FLOOR_DEF）截断。
+// 配置值 0.75 时档位仍是 0.75 / 0.70 / 0.65 / 0.60；配得更高（如 DM_3D_SCALE=0.85）时中间多出 0.80、0.75 两档，重场景一档档往下退。只动 3D 渲染比例，界面和文字不降
+// 3D scale level table: level 0 = configured value (iPhone 0.75), then in order the table's scales below the configured value (0.05 apart); the floor is clamped by DM_3D_SCALE_FLOOR (default: see S3_FLOOR_DEF).
+// With the configured 0.75 the levels stay 0.75 / 0.70 / 0.65 / 0.60; a higher setting (e.g. DM_3D_SCALE=0.85) gains 0.80 and 0.75 in between, so heavy scenes step down one level at a time. Only the 3D render scale changes; UI and text are not lowered
+static const float g_s3_levels[] = {0.95f, 0.90f, 0.85f, 0.80f, 0.75f, 0.70f, 0.65f, 0.60f, 0.55f, 0.50f};
 #define S3_NLV ((int)(sizeof g_s3_levels / sizeof g_s3_levels[0]))
+// 第 lv 档的比例：0 = 配置值，lv ≥ 1 = 表里第 lv 个低于配置值的比例（超出取最低的那个） | Scale of level lv: 0 = configured value, lv >= 1 = the lv-th table scale below the configured value (past the end: the lowest)
+static float s3_level_scale(float cfg, int lv) {
+    float last = cfg; int n = 0; if (lv <= 0) return cfg;
+    for (int k = 0; k < S3_NLV; k++) if (g_s3_levels[k] < cfg - 1e-4f) { last = g_s3_levels[k]; if (++n == lv) return last; }
+    return last;
+}
+// 最深一档：表里低于配置值、不低于下限的档数 | Deepest level: the number of table scales below the configured value and not below the floor
+static int s3_max_level(float cfg, float floor) {
+    int n = 0; for (int k = 0; k < S3_NLV; k++) if (g_s3_levels[k] < cfg - 1e-4f && g_s3_levels[k] >= floor - 1e-4f) n++;
+    return n;
+}
+// 配置值：DM_3D_SCALE（0.5–1.0），缺省手机 0.75、Mac 宿主 1.0；读一次 | Configured value: DM_3D_SCALE (0.5-1.0), default 0.75 on phones and 1.0 on the Mac host; read once
+static float s3_cfg(void) {
+    static float cfg = -1;
+    if (cfg < 0) { const char *e = getenv("DM_3D_SCALE"); float v = DM_PHONE ? 0.75f : 1.0f;
+        if (e) { char *end; v = strtof(e, &end); if (end == e || *end || !(v >= 0.5f && v <= 1.0f)) die("DM_3D_SCALE 非法：%s（要求 0.5–1.0）", e); }
+        cfg = v; }
+    return cfg;
+}
 #define S3_FLOOR_DEF 0.60f   // 待真机扫档（热机稳态最后 30 秒掉帧 ≤ 1%）定 | To be set by a device level sweep (dropped frames ≤ 1% in the last 30 s of warm steady state)
 // 纯函数控制器（单测 t_oe.c 直接喂序列）：level 0 = 配置值，越大越低。判据只认实际上屏：
 //   掉帧 = 上屏间隔 > 1.5 × 目标周期（60 帧时 25 ms），或被系统丢弃（−1）；每 2 秒一个窗，记窗内帧数与掉帧数，留最近 30 窗（60 秒）。
@@ -214,8 +235,8 @@ void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_per
     if (on < 0) { const char *e = getenv("DM_3D_SCALE_DYN"), *j = getenv("DM_3D_SCALE_DYN_INJECT"); on = !(e && !strcmp(e, "0")) && !getenv("DM_THERMAL_NOFALLBACK");
         if (j) { inj0 = atol(j); inj1 = strchr(j, '-') ? atol(strchr(j, '-') + 1) : inj0; }
         const char *fe = getenv("DM_3D_SCALE_FLOOR"); float fl = fe ? strtof(fe, NULL) : S3_FLOOR_DEF;   // 下限：档位表里不低于它的最深一档 | Floor: the deepest level in the level table that is not below it
-        for (int k = 0; k < S3_NLV; k++) if (g_s3_levels[k] >= fl - 1e-4f) c.max_level = k + 1;
-        LOG("3D 比例控制：%s，下限 %.2f（第 %d 档）", on ? "开" : "关", c.max_level ? g_s3_levels[c.max_level - 1] : 0.0f, c.max_level); }
+        c.max_level = s3_max_level(s3_cfg(), fl);
+        LOG("3D 比例控制：%s，配置 %.2f，下限 %.2f（第 %d 档）", on ? "开" : "关", s3_cfg(), s3_level_scale(s3_cfg(), c.max_level), c.max_level); }
     if (!on) return;
     if (atomic_load(&g_3d_quality_mode) == 1) { if (c.level) { c.level = 0; LOG("3D 比例控制：画质优先，回到配置值"); } atomic_store(&g_scale3d_level, 0); return; }
     uint64_t now = now_ns();
@@ -228,7 +249,7 @@ void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_per
     if (inj0 >= 0) { long f = (long)dm_nvn_frame_count(); double per = c.period_ms > 0 ? c.period_ms : 1000.0 / 60; iv_ms = f >= inj0 && f <= inj1 ? 2 * per : per; }   // 注入：段内每帧当掉一帧（两个周期） | Injection: every frame within the segment counts as a dropped frame (two periods)
     int was = c.level, lv = scale3d_ctl_step(&c, iv_ms, now);
     if (lv != was) LOG("3D 比例控制：最近 10 秒掉帧 %.1f%%、60 秒 %.1f%% → %s到第 %d 档（3D 比例 %.2f）%s", c.last_r10 * 100, c.last_r60 * 100, lv > was ? "降" : "升", lv,
-                       lv ? g_s3_levels[lv - 1] : -1.0f, c.need_good ? "（刚升又掉：下次升档要 90 秒）" : "");
+                       s3_level_scale(s3_cfg(), lv), c.need_good ? "（刚升又掉：下次升档要 90 秒）" : "");
     atomic_store(&g_scale3d_level, lv);
 }
 void dm_3d_scale_hot(int hot) { (void)hot; }   // 过热不再直接降档（改按实际掉帧）；保留符号给前端 | overheating no longer lowers the level directly (now by actual dropped frames); the symbol is kept for the front end
@@ -237,12 +258,11 @@ float dm_3d_scale_cur(void) { return atomic_load(&g_scale3d_cur); }
 static void scale3d_tick(void) {
     static float want_cfg = -1, cur = 1.0f; static module_t *main;
     if (want_cfg < 0) {
-        const char *e = getenv("DM_3D_SCALE"); want_cfg = DM_PHONE ? 0.75f : 1.0f;
-        if (e) { char *end; float v = strtof(e, &end); if (end == e || *end || !(v >= 0.5f && v <= 1.0f)) die("DM_3D_SCALE 非法：%s（要求 0.5–1.0）", e); want_cfg = v; }
+        want_cfg = s3_cfg();
         for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) main = &g_mod[i];
     }
-    int lv = atomic_load(&g_scale3d_level);   // 动态档：0 = 配置值，k = g_s3_levels[k − 1]（都不高于配置值） | Dynamic level: 0 = configured value, k = g_s3_levels[k − 1] (none higher than the configured value)
-    float dyn = lv <= 0 ? want_cfg : g_s3_levels[(lv > S3_NLV ? S3_NLV : lv) - 1]; if (dyn > want_cfg) dyn = want_cfg;
+    // 动态档：0 = 配置值，k = 表里第 k 个低于配置值的比例 | Dynamic level: 0 = configured value, k = the k-th table scale below the configured value
+    int lv = atomic_load(&g_scale3d_level); float dyn = s3_level_scale(want_cfg, lv);
     float want = dm_nvn_ruler_truth() ? 1.0f : dyn;
     if (want == cur || !main || dm_nvn_frame_count() < 30) return;
     uintptr_t renderer = *(uintptr_t *)(main->base + 0x31e0848); if (!renderer) return;
