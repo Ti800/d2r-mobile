@@ -459,6 +459,8 @@ struct Slot {
     VkCommandBuffer cmd{};VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0; // covers: guest fence value complete once this slot retires
     std::vector<VkQueryPool> occlusion_pools,timestamp_pools;uint32_t occlusion_used=0,timestamp_used=0;
     Retire retire;Arena stream,readback;std::vector<VkDescriptorPool> pools;size_t pool_next=0;
+    // gfx-xview-arena: the second readback arena, recorded into while the other slot may still read the first (recording_slot).
+    Arena readback_alt;
     std::map<std::vector<uint64_t>,VkFramebuffer> framebuffers;
     std::map<std::array<uint64_t,4>,VkBufferView> texel_views; // per-frame texel views (same snapshot -> one view)
     Buffer query_results;size_t query_copied=0; // occlusion results copied by the GPU at the end of the frame
@@ -476,7 +478,10 @@ struct Slot {
 };
 Slot slots[2];unsigned slot_index=0;
 // Pending views of the other slot's results (xviews), and arena reuse while a slot with such views was in flight (races).
-uint64_t xviews=0,xview_races=0;
+// gfx-xview-arena (marker 1 / 0, else DM_GFX_XVIEW_ARENA; off by default): at such a reuse the slot records into its
+// second readback arena instead (swaps), so the arena the reader may use stays intact; the reader retires before this slot
+// records again, and the slot then swaps back only if a reader is in flight once more.
+uint64_t xviews=0,xview_races=0,xview_swaps=0;bool xview_arena=false;
 // Command pool resets off the render thread. vkResetCommandPool took ~0.4 ms of every frame on the Redmi K50 Ultra's render
 // thread. After a slot is submitted, the reset thread waits for its fence and resets its pool; retiring the slot first waits
 // for that job, so vkResetFences never overlaps the thread's wait (concurrent waits are allowed), and reusing the slot skips
@@ -695,14 +700,14 @@ Slot &recording_slot(){
         {SiteScope site(SITE_RING,true);retire_slot(s);}
         // From here on this slot reuses its readback arena while the other slot, still in flight, may read it through pending
         // views (xview): its GPU reads then race the CPU copies of this submission.
-        {const Slot &o=slots[slot_index^1];if(o.pending && o.xview)++xview_races;}
+        {const Slot &o=slots[slot_index^1];if(o.pending && o.xview){++xview_races;if(xview_arena){std::swap(s.readback,s.readback_alt);++xview_swaps;}}}
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
         s.stream.trim();s.readback.keep_chunks=1;s.readback.trim();
         if(texel_memo_enabled && (slot_serial&15)<2)texel_evict(slot_index,false);   // this slot's copies: its previous submission retired
         if(!s.cmd){if(slot_pools_enabled){VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;VK(vkCreateCommandPool(cfg.device,&cp,nullptr,&s.pool));}
             VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};a.commandPool=s.pool?s.pool:command_pool;a.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;a.commandBufferCount=1;VK(vkAllocateCommandBuffers(cfg.device,&a,&s.cmd));}
-        s.readback.cached=readback_cached;
+        s.readback.cached=s.readback_alt.cached=readback_cached;
         if(!s.fence){VkFenceCreateInfo f{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};VK(vkCreateFence(cfg.device,&f,nullptr,&s.fence));}
         if(!s.timestamps && timestamp_bits){VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=2;VK(vkCreateQueryPool(cfg.device,&q,nullptr,&s.timestamps));}
         bind_cache_reset();if(s.pool){if(s.reset_queued){poolreset::finish(s);s.reset_queued=false;VK(s.reset_result);}else VK(vkResetCommandPool(cfg.device,s.pool,0));}else VK(vkResetCommandBuffer(s.cmd,0));VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;VK(vkBeginCommandBuffer(s.cmd,&b));
@@ -830,7 +835,7 @@ void perf_frame(){
      if(at<int(sizeof(line))-24)at+=snprintf(line+at,sizeof(line)-at," depth_idle=%.1f",depth_idle_passes/f);
      xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;depth_idle_passes=0;}
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
-    xbg_logf("NVN PERF xview views=%.2f races=%.2f",xviews/f,xview_races/f);xviews=xview_races=0;
+    xbg_logf("NVN PERF xview views=%.2f races=%.2f swaps=%.2f",xviews/f,xview_races/f,xview_swaps/f);xviews=xview_races=xview_swaps=0;
     if(wb_skip){xbg_logf("NVN PERF wbskip ab=%d skipped=%.1f (%.2fMB)",int(ab_frame_on),wb_skipped/f,wb_skipped_bytes/1048576.0/f);wb_skipped=wb_skipped_bytes=0;}
     if(pipe_memo){xbg_logf("NVN PERF pipememo ab=%d hits=%.1f misses=%.1f",int(ab_frame_on),pipe_memo_hits/f,pipe_memo_misses/f);pipe_memo_hits=pipe_memo_misses=0;}
     perf=Perf{};perf.window_start=now;perf_timed_frames=0;
@@ -3313,7 +3318,7 @@ PerfCounts perf_counts(){return {pipeline_objects.size(),layout_cache.size(),sam
 void destroy_slots(){
     poolreset::drain();for(auto &s:slots)s.reset_queued=false;
     texel_evict(0,true);texel_evict(1,true);
-    for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);if(s.pool)vkDestroyCommandPool(cfg.device,s.pool,nullptr);s=Slot{};}
+    for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();s.readback_alt.release();if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);if(s.pool)vkDestroyCommandPool(cfg.device,s.pool,nullptr);s=Slot{};}
     slot_index=0;snapshot_reset();
 }
 } // namespace
@@ -3389,6 +3394,8 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-read-preflight").c_str(),"rb");read_preflight=true;if(m){read_preflight=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_READ_PREFLIGHT"))read_preflight=atoi(e)!=0;
       xbg_logf("NVN CPU reads resolved before each operation=%d (marker gfx-read-preflight)",int(read_preflight));}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-cache-save").c_str(),"rb");sync_cache_save=false;if(m){sync_cache_save=fgetc(m)=='1';fclose(m);}}
+     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-xview-arena").c_str(),"rb");xview_arena=false;if(m){xview_arena=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_XVIEW_ARENA"))xview_arena=atoi(e)!=0;
+      xbg_logf("NVN second readback arena while the other slot reads this one=%d (marker gfx-xview-arena)",int(xview_arena));}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-async-pipelines").c_str(),"rb");warm::async_on=false;if(m){warm::async_on=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_ASYNC_PIPELINES"))warm::async_on=atoi(e)!=0;
       xbg_logf("NVN background builds for skippable draws=%d (marker gfx-async-pipelines)",int(warm::async_on));}
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
