@@ -45,6 +45,12 @@ def stage(native_art, hud, overlay):
         target.mkdir(parents=True, exist_ok=True)
         for name in sorted(names):
             shutil.copyfile(source / name, target / name)
+    # 摇杆图（可选；仓库自带的项目美术，不是游戏资源）一并放进 touchart，manifest 覆盖它，TouchOverlay 读到就不画后备摇杆。
+    # The joystick image (optional; project art shipped in the repository, not game art) goes into touchart too, so the manifest
+    # covers it and TouchOverlay draws it instead of the fallback joystick.
+    joystick = Path(__file__).resolve().parents[3] / 'dm/ios/Sources/TouchArt/dm_touch_joy.png'
+    if joystick.is_file() and not joystick.is_symlink():
+        shutil.copyfile(joystick, overlay / 'touchart' / 'dm_touch_joy.png')
     source_sha = overlay_contract.source_fingerprint(Path(__file__).resolve().parents[3])
     overlay_contract.write_manifest(overlay, source_sha)
     entries = overlay_contract.verify_manifest(overlay, source_sha)

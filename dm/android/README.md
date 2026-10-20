@@ -67,7 +67,7 @@ screen is not implemented.
 | App internal `files/dm/out/` | `main` and `sdk` rewriter products generated with `DM_TARGET=android`, including patched modules, fixups, and gates |
 | App internal `files/dm/shaders/` | External `.xgs` bundles matching the game and Vulkan backend |
 | App internal `files/dm/overlay/` | Required CASC touch overlay, including `overlay.manifest`, generated from the matching source and the user's resources |
-| App internal `files/dm/overlay/touchart/` | Optional locally generated `dm_touch_joy.png`; otherwise the UI draws a fallback joystick |
+| App internal `files/dm/overlay/touchart/` | Skill atlases, map icon and joystick image staged by `stage_touch_assets.py` (the joystick comes from the repository's `dm/ios/Sources/TouchArt/dm_touch_joy.png`); without the joystick image the UI draws a fallback joystick |
 | Shared `Download/data/` | User's resource archives and `.build.config`; requires Android's all-files-access setting |
 | App internal `files/save/` | Saves; preserve during upgrades |
 | App internal `files/temp/`, `files/dm/boot.log` | Temporary files and appended startup logs |
