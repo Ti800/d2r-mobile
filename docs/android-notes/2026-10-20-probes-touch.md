@@ -81,6 +81,20 @@ Narrower barriers could at best recover what skipping them all does, so they are
 
 **The main-pass fragment shaders are heavy and run at the lowest occupancy.** With `gfx-pipe-stats` the driver reports, for the most-used main-pass fragment shader (`38f344ad…`, 133 draws a frame), 3,614 instructions, 1,872 32-bit ALU instructions, 11 16-bit ones and a footprint of 22 registers, with `Max_active_invocations` 1; the other three main-pass shaders are alike (17–21 registers, 1). Post-chain shaders have 33–260 instructions, 2–5 registers and 3. The SPIR-V of `38f344ad…` holds 775 multiplies, 527 FMAs, 166 adds, 30 inverse square roots and about 40 exp / log against 26 texture operations: real lighting work, nearly all of it 32-bit. An exact rewrite has little to take out; half precision would, but it changes the image.
 
+## Dynamic 3D scale: every 0.05 step below a higher ceiling (`8564533`)
+
+Resolution is the lever left, so the dynamic scale may now start higher. Its levels were the configured value and then a fixed 0.70 / 0.65 / 0.60, so a configured 0.85 fell straight to 0.70 on the first drop. They are now the configured value and every 0.05 step below it down to the floor (0.60): the default 0.75 keeps 0.75 / 0.70 / 0.65 / 0.60, and `DM_3D_SCALE=0.85` steps down through 0.80 and 0.75. `t_oe` checks the table.
+
+On the Redmi with `DM_3D_SCALE=0.85` (3D target 1700 × 765 instead of 1500 × 675), from 34.5 °C:
+
+| Run | fps median / 10th percentile | GPU median | Level changes | Battery |
+|---|---|---|---|---|
+| Camp, 3 min | 60.0 / 60.0 | 14.95 ms | none | |
+| Den of Evil fight (seed 12345), 2.8 min | 60.0 / 59.9 | 14.14 ms | none | 34.3 → 37.0 °C |
+| The same fight, 9 min | 60.0 / 59.9 (1st percentile 59.0) | 14.07 ms | none | 34.4 → 42.0 °C |
+
+The windows under 58 fps were all at the load and the warp. The phone was charging throughout. The same 9-minute fight at the default 0.75 is not a usable baseline: there the harness's screenshot every 10 s stalled about 20 frames each time (1st percentile 42.5 fps), and the controller, which counts any late frame, stepped down to 0.60 for stalls that resolution cannot fix. The 0.85 run took the same screenshots without stalling. Whether the phone ships at 0.85 is a choice between sharpness and heat.
+
 ## A level-40 test character, levelled by the game itself
 
 The host's test switches (`files/dm/env`) give a test character a full set of skills without editing its save:
