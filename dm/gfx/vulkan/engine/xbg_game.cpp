@@ -454,6 +454,8 @@ inline bool ab_off(const char *name){return ab_period>0 && !ab_frame_on && !strc
 bool ab_enabled(){if(ab_period<=0)return true;ab_on=((std::chrono::steady_clock::now().time_since_epoch().count()/1000000000ll/ab_period)&1)==0;return ab_on;}
 struct Slot {
     bool reset_queued=false,reset_busy=false;VkResult reset_result=VK_SUCCESS;   // poolreset: a reset job was queued for this submission / still runs (under poolreset::mu)
+    // xview: this submission read a pending result of the other slot through pending_view (from its readback arena).
+    bool xview=false;
     VkCommandBuffer cmd{};VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0; // covers: guest fence value complete once this slot retires
     std::vector<VkQueryPool> occlusion_pools,timestamp_pools;uint32_t occlusion_used=0,timestamp_used=0;
     Retire retire;Arena stream,readback;std::vector<VkDescriptorPool> pools;size_t pool_next=0;
@@ -473,6 +475,8 @@ struct Slot {
     std::vector<struct Descriptors*> desc_used; // pooled per-draw descriptor records, returned after this slot's fence // handed out this frame; recycled into spare_sets after the slot fence (no per-frame pool reset)
 };
 Slot slots[2];unsigned slot_index=0;
+// Pending views of the other slot's results (xviews), and arena reuse while a slot with such views was in flight (races).
+uint64_t xviews=0,xview_races=0;
 // Command pool resets off the render thread. vkResetCommandPool took ~0.4 ms of every frame on the Redmi K50 Ultra's render
 // thread. After a slot is submitted, the reset thread waits for its fence and resets its pool; retiring the slot first waits
 // for that job, so vkResetFences never overlaps the thread's wait (concurrent waits are allowed), and reusing the slot skips
@@ -670,13 +674,16 @@ void retire_slot(Slot &s){
     // Every set is fully rewritten before use, so sets are recycled instead of resetting pools (vkAllocateDescriptorSets cost ~15 us/set on Maleoon).
     for(auto &u:s.used_sets){auto &sp=s.spare_sets[u.first];sp.insert(sp.end(),u.second.begin(),u.second.end());u.second.clear();}s.set_cache.clear();
     cleanup_ns[0]+=c1-c0;cleanup_ns[1]+=c2-c1;cleanup_ns[2]+=c3-c2;cleanup_ns[3]+=c4-c3;cleanup_ns[4]+=timing_clock()-c4;
-    s.pending=false;
+    s.pending=false;s.xview=false;
     if(!resolving_pending)apply_ready_events();   // after this slot's writebacks; inside resolve_pending its own copy runs first
 }
 Slot &recording_slot(){
     Slot &s=slots[slot_index];
     if(!s.recording){
         {SiteScope site(SITE_RING,true);retire_slot(s);}
+        // From here on this slot reuses its readback arena while the other slot, still in flight, may read it through pending
+        // views (xview): its GPU reads then race the CPU copies of this submission.
+        {const Slot &o=slots[slot_index^1];if(o.pending && o.xview)++xview_races;}
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
         s.stream.trim();s.readback.keep_chunks=1;s.readback.trim();
@@ -798,6 +805,7 @@ void perf_frame(){
      if(at<int(sizeof(line))-24)at+=snprintf(line+at,sizeof(line)-at," depth_idle=%.1f",depth_idle_passes/f);
      xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;depth_idle_passes=0;}
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
+    xbg_logf("NVN PERF xview views=%.2f races=%.2f",xviews/f,xview_races/f);xviews=xview_races=0;
     if(wb_skip){xbg_logf("NVN PERF wbskip ab=%d skipped=%.1f (%.2fMB)",int(ab_frame_on),wb_skipped/f,wb_skipped_bytes/1048576.0/f);wb_skipped=wb_skipped_bytes=0;}
     if(pipe_memo){xbg_logf("NVN PERF pipememo ab=%d hits=%.1f misses=%.1f",int(ab_frame_on),pipe_memo_hits/f,pipe_memo_misses/f);pipe_memo_hits=pipe_memo_misses=0;}
     perf=Perf{};perf.window_start=now;perf_timed_frames=0;
@@ -882,7 +890,10 @@ bool pending_view(uint64_t address,uint64_t bytes,VkDeviceSize align,Buffer &out
         if(!(address<w->addr+w->bytes && address+bytes>w->addr))continue;
         if(address<w->addr || address+bytes>w->addr+w->bytes)return false;
         VkDeviceSize delta=address-w->addr;if(align>1 && (w->buffer.offset+delta)%align)return false;
-        out=w->buffer;out.offset+=delta;out.mapped=static_cast<uint8_t*>(out.mapped)+delta;out.size=bytes;++perf.pending_views;return true;
+        out=w->buffer;out.offset+=delta;out.mapped=static_cast<uint8_t*>(out.mapped)+delta;out.size=bytes;++perf.pending_views;
+        if(w->slot!=&slots[slot_index]){++xviews;slots[slot_index].xview=true;
+            static unsigned n=0;if(n++<24)xbg_logf("NVN XVIEW frame=%llu addr=%#llx bytes=%llu writeback=%#llx+%llu",(unsigned long long)stats.presents.load(),(unsigned long long)address,(unsigned long long)bytes,(unsigned long long)w->addr,(unsigned long long)w->bytes);}
+        return true;
     }
     return false;
 }
