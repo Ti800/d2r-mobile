@@ -17,6 +17,8 @@
 #include "xbg_spirv_warp.h"
 #include "xbg_spirv_ldc.h"
 #include "xbg_spirv_temps.h"
+#include "xbg_spirv_raster.h"
+#include "../../nvn/nvn_cover.h"
 extern "C" {
 #include "../../tex/nvn_deswizzle.h"
 // The HLE's write-protect dirty-page tracker over the guest memory pools (dm/gfx/nvn/nvn_dirty.c). Weak: hosts and tests
@@ -1526,6 +1528,7 @@ std::string control_key(const void *data){char key[17];need(xbg_shader_control_k
 struct Shader {std::string key;uint32_t stage;VkShaderModule module{};std::vector<xbg_shader_binding> bindings;std::vector<uint32_t> inputs,input_classes;std::vector<uint8_t> c1;
     std::set<uint32_t> storage_writes; // Vulkan bindings of storage buffers the SPIR-V may write
     bool discards=true; // fragment shader may kill/demote (conservative default)
+    XbgRasterFacts raster; // position input (vertex), declared outputs and SampleMask (fragment): first_draw_covers
     Buffer c1_buffer{};bool c1_ready=false;
     ~Shader(){if(module)vkDestroyShaderModule(cfg.device,module,nullptr);}};
 // Storage buffers written by a shader. Pointers rooted at a storage-buffer
@@ -1664,6 +1667,7 @@ Shader *load_shader(const void *control){
     std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);validate_capabilities(words,h.stage);quad_rewrite(words,h.stage);warp_rewrite(words,h.stage);tidy_rewrite(words);
     {auto extent=spirv_uniform_extent(words);uint32_t trimmed=0;for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM){auto e=extent.find(b.binding);uint32_t declared=b.bytes?b.bytes:65536;if(e!=extent.end() && e->second<declared){b.bytes=e->second;++trimmed;}}uniform_trimmed+=trimmed;}
     {bool kill=false;for(size_t i=5;i<words.size();){uint32_t n=words[i]>>16,op=words[i]&0xffff;if(op==252||op==4416||op==5380){kill=true;break;}if(!n)break;i+=n;}p->discards=kill;}
+    p->raster=xbg_spirv_raster_facts(words.data(),words.size(),h.stage);
     {bool unknown=false;p->storage_writes=spirv_storage_writes(words,unknown);if(unknown){for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)p->storage_writes.insert(b.binding);}}
     if(h.stage==0){p->input_classes.resize(p->inputs.size());need(xbg_vertex_input_classes(words.data(),words.size(),p->inputs.data(),p->inputs.size(),p->input_classes.data())==0,"Unsupported vertex input scalar interface");}
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();VK(vkCreateShaderModule(cfg.device,&ci,nullptr,&p->module));warm::register_module(p->module,key);Shader *out=p.get();shaders.emplace(key,std::move(p));++stats.shader_loads;xbg_logf("NVN shader %s stage=%u loaded",key.c_str(),h.stage);return out;
@@ -2357,7 +2361,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
 // per frame slot (they reference image views of possibly released images).
 struct Pass {
     const PipelineDefinition *definition=nullptr;
-    VkRenderPass pass{};VkFramebuffer framebuffer{};uint32_t width{},height{},color_slots{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;ImageList images;
+    VkRenderPass pass{},pass_noload{};VkFramebuffer framebuffer{};uint32_t width{},height{},color_slots{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;ImageList images;
 };
 // Draws inside the open pass with unchanged render-target state get the same Pass: non-draw ops end the pass, so nothing
 // else touched its attachments since. Only the attachments' write marks are refreshed (as prepare_attachment does).
@@ -2366,10 +2370,12 @@ struct LastPass{decltype(state.rt) rt;Pass pass;bool valid=false;} last_pass;uin
 void last_pass_reset(){last_pass.valid=false;}
 // 保留零值计数用于与旧版本日志比较；任意 guest draw 不再丢弃附件内容。
 // Keep zero counters for baseline logs; arbitrary guest draws retain attachment contents.
-uint64_t noload_passes=0;
-struct RenderPassEntry {VkRenderPass pass{};PipelineDefinition definition;};
+uint64_t noload_passes=0;bool noload_enabled=false;
+// noload: the same pass with every color loadOp DONT_CARE (noload_enabled; first_draw_covers). Only load ops differ, so it is
+// compatible with pass and its pipelines and framebuffers.
+struct RenderPassEntry {VkRenderPass pass{},noload{};PipelineDefinition definition;};
 std::map<std::vector<uint32_t>,RenderPassEntry> render_pass_cache;
-void clear_render_pass_cache(){for(auto &r:render_pass_cache)vkDestroyRenderPass(cfg.device,r.second.pass,nullptr);render_pass_cache.clear();pipeline_fast.clear();pipe_memo_valid=false;}
+void clear_render_pass_cache(){for(auto &r:render_pass_cache){vkDestroyRenderPass(cfg.device,r.second.pass,nullptr);if(r.second.noload)vkDestroyRenderPass(cfg.device,r.second.noload,nullptr);}render_pass_cache.clear();pipeline_fast.clear();pipe_memo_valid=false;}
 bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,bool soft=false){CPU_SCOPE(Pass);
     const bool plain_draw=c.draw && clear_color<0 && !clear_depth && !soft && !provenance_file && !capture.active && !ab_off("passfast");
     if(plain_draw && last_pass.valid && open_pass.cmd==c.command && open_pass.pass==last_pass.pass.pass && open_pass.framebuffer==last_pass.pass.framebuffer && !memcmp(&state.rt,&last_pass.rt,sizeof state.rt)){
@@ -2416,8 +2422,12 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};rp.attachmentCount=descriptions.size();rp.pAttachments=descriptions.data();rp.subpassCount=1;rp.pSubpasses=&sub;rp.dependencyCount=2;rp.pDependencies=dep;
     {XbgPipelineKey key;bool valid=xbg_renderpass_key(key,rp);
         if(valid && key.valid){static std::vector<uint32_t> words;words.assign(key.words,key.words+key.count);auto it=render_pass_cache.find(words);
-            if(it==render_pass_cache.end()){RenderPassEntry e;VK(vkCreateRenderPass(cfg.device,&rp,nullptr,&e.pass));e.definition.assign(key,true);it=render_pass_cache.emplace(words,std::move(e)).first;}
-            p.pass=it->second.pass;p.definition=&it->second.definition;
+            if(it==render_pass_cache.end()){RenderPassEntry e;VK(vkCreateRenderPass(cfg.device,&rp,nullptr,&e.pass));e.definition.assign(key,true);
+                if(noload_enabled && p.samples==VK_SAMPLE_COUNT_1_BIT){std::vector<VkAttachmentDescription> nl(descriptions.begin(),descriptions.end());bool any=false;
+                    for(size_t k=0;k<nl.size() && k<p.images.size();k++)if(p.images[k]->aspects==VK_IMAGE_ASPECT_COLOR_BIT){nl[k].loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;any=true;}
+                    if(any){VkRenderPassCreateInfo r2=rp;r2.pAttachments=nl.data();VK(vkCreateRenderPass(cfg.device,&r2,nullptr,&e.noload));}}
+                it=render_pass_cache.emplace(words,std::move(e)).first;}
+            p.pass=it->second.pass;p.pass_noload=it->second.noload;p.definition=&it->second.definition;
         }
         else{VK(vkCreateRenderPass(cfg.device,&rp,nullptr,&p.pass));VkRenderPass rpass=p.pass;retire_handle([rpass]{vkDestroyRenderPass(cfg.device,rpass,nullptr);});static PipelineDefinition invalid;p.definition=&invalid;}
     }
@@ -2483,10 +2493,57 @@ BindCache bind_cache;bool bind_cache_enabled=true;uint64_t binds_skipped=0;
 // offsets only.
 uint64_t set_binds=0,set_bind_offsets=0,set_binds_offsets_only=0;
 void bind_cache_reset(){bind_cache=BindCache{};}
-// 顶点数量与全 viewport/scissor 不能证明几何覆盖所有像素（局部三角形也满足）。
-// Vertex count and full viewport/scissor do not prove full pixel coverage: a partial triangle qualifies.
-// Guest draws therefore preserve LOAD; explicit clears keep their separate clear semantics.
+// 顶点数量与全 viewport/scissor 不能证明几何覆盖所有像素（局部三角形也满足）。所以只在几何上证明了的时候才不读旧内容：
+// 与 Metal 侧（nvn_mtl.m 的 first_draw_covers）同一套条件与同一个纯函数 nvn_cover.h（单测 t_cover.c），位置从这次绘制
+// 实际交给 GPU 的顶点 / 索引快照里读。不成立就照旧 LOAD。
+// Vertex count and full viewport/scissor do not prove full pixel coverage: a partial triangle qualifies. So the old contents
+// are skipped only when the geometry proves it: the conditions of the Metal side (nvn_mtl.m's first_draw_covers) and the same
+// pure function nvn_cover.h (unit test t_cover.c), with the positions read from the vertex and index snapshots this draw
+// hands to the GPU. Otherwise LOAD as before. Explicit clears keep their separate clear semantics.
+// The first draw of a pass covers every pixel of each color attachment, writing it without blending: the vertex position
+// is one input as it is (XbgRasterFacts), the fragment shader declares every attachment's output, never discards and does
+// not write SampleMask, no depth (except ALWAYS), stencil or depth-bounds test, fill mode, single sample, 2D targets, and
+// nvn_cover holds for the viewport, scissor, culling (the NVN cull and front face, as the Metal side passes them) and
+// vertices. Should its winding reading ever differ from the GPU's, the visible triangle reads as culled and the pass simply
+// loads. noload_why counts the first failing check:
+// 0 shaders, 1 attachment state, 2 depth/stencil, 3 raster state (also: covered but culled), 4 primitive/count,
+// 5 position format/stream, 6 vertex/index read, 7 geometry.
 uint64_t noload_why[8]={};
+bool first_draw_covers(const Pass &p,int prim,int first,int count,const p_draw_idx *indexed,const std::vector<std::pair<uint32_t,Buffer*>> &vbufs,const Buffer *ib,VkIndexType itype){
+    const Shader *vs=state.shader[0],*fs=state.shader[4];
+    if(!vs || !fs || state.shader[1] || state.shader[2] || state.shader[3] || vs->raster.pos_input<0 || vs->raster.pos_input>=16 || fs->discards || fs->raster.sample_mask){++noload_why[0];return false;}
+    for(int i=0;i<state.rt.n;i++)if(state.rt.color[i]){
+        if(!(fs->raster.outputs>>i&1) || (state.color.blend_en>>i&1) || ((state.mask.mask>>(4*i))&15)!=15 || state.rt.color[i]->d.target==2){++noload_why[1];return false;}}
+    if(state.rt.depth && ((state.ds.dt && state.ds.df!=8) || state.ds.st)){++noload_why[2];return false;}
+    if(state.bounds.enable){++noload_why[2];return false;}
+    if(state.ms.a2c || state.poly.mode!=2 || p.samples!=VK_SAMPLE_COUNT_1_BIT){++noload_why[3];return false;}
+    if((prim!=NVN_COVER_TRIANGLES && prim!=NVN_COVER_TRIANGLE_STRIP) || count<3 || count>64){++noload_why[4];return false;}
+    va_st a;memcpy(&a,&state.attrib[vs->raster.pos_input],4);
+    const VkFormat f=a.fmt?format(a.fmt):VK_FORMAT_UNDEFINED;const int nc=f==VK_FORMAT_R32G32_SFLOAT?2:f==VK_FORMAT_R32G32B32_SFLOAT?3:f==VK_FORMAT_R32G32B32A32_SFLOAT?4:0;
+    if(!nc || a.stream>=16 || !state.stream[a.stream].stride || state.stream[a.stream].divisor){++noload_why[5];return false;}
+    const Buffer *vb=nullptr;for(auto &b:vbufs)if(b.first==a.stream)vb=b.second;
+    if(!vb || !vb->mapped || (indexed && (!ib || !ib->mapped))){++noload_why[6];return false;}
+    const uint64_t stride=state.stream[a.stream].stride;const size_t isz=itype==VK_INDEX_TYPE_UINT16?2:4;
+    float P[64][4];
+    for(int k=0;k<count;k++){
+        int64_t vid;
+        if(indexed){if(uint64_t(k+1)*isz>ib->size){++noload_why[6];return false;}const uint8_t *q=static_cast<const uint8_t*>(ib->mapped)+size_t(k)*isz;
+            uint32_t x=0;if(isz==2){uint16_t h;memcpy(&h,q,2);x=h;}else memcpy(&x,q,4);vid=int64_t(x)+indexed->base_vertex;}
+        else vid=int64_t(first)+k;
+        if(vid<0){++noload_why[6];return false;}
+        const uint64_t off=uint64_t(vid)*stride+a.offset;
+        if(off+4u*unsigned(nc)>vb->size){++noload_why[6];return false;}
+        float v[4]={0,0,0,1};memcpy(v,static_cast<const uint8_t*>(vb->mapped)+off,4*size_t(nc));
+        if(vs->raster.pos_w1)v[3]=1;
+        memcpy(P[k],v,sizeof v);
+    }
+    const VkRect2D sr=scissor(p);const int sc[4]={sr.offset.x,sr.offset.y,int(sr.extent.width),int(sr.extent.height)};
+    const float vp[4]={state.viewport.x,state.viewport.y,state.viewport.width,state.viewport.height};
+    // A failure that culling alone causes counts under raster state (3), the rest under geometry (7).
+    if(!nvn_cover(P,count,prim,int(state.poly.cull),state.poly.front==1,1,vp,1,sc,long(p.width),long(p.height))){
+        ++noload_why[state.poly.cull && nvn_cover(P,count,prim,NVN_COVER_CULL_NONE,1,1,vp,1,sc,long(p.width),long(p.height))?3:7];return false;}
+    return true;
+}
 void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){CPU_SCOPE(Draw);DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
     need(state.rt.n>=0 && state.rt.n<=8,"Invalid draw color target count");
     VkShaderModule modules[5]{};for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=state.shader[i]->module;
@@ -2558,7 +2615,11 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkQueryPool occlusion{};uint32_t occlusion_index=0;const bool counting=state.count_samples && !no_occlusion_queries;
     const bool new_run=counting && (query_per_draw || ab_off("query") || !open_query.open || open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer);
     if(new_run){need(cfg.enabled_core.occlusionQueryPrecise,"Precise samples-passed query disabled");occlusion_query(occlusion,occlusion_index);++occlusion_queries;}   // a new pool ends the pass first
-    if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();begin_pass(p,c);open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
+    if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();
+        // Proven full overwrite: begin with the color-DONT_CARE twin; open_pass keeps p.pass, so later draws continue this pass.
+        if(p.pass_noload && quad_indices.empty() && !ab_off("noload") && first_draw_covers(p,prim,first,count,indexed,vertex_buffers,ib,index_type)){VkRenderPass keep=p.pass;p.pass=p.pass_noload;begin_pass(p,c);p.pass=keep;++noload_passes;}
+        else begin_pass(p,c);
+        open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
     if(state.ds.dt || state.ds.st || state.bounds.enable)open_pass.depth_used=true;
     if(new_run){end_open_query();vkCmdBeginQuery(c.command,occlusion,occlusion_index,VK_QUERY_CONTROL_PRECISE_BIT);open_query={occlusion,occlusion_index,c.command,true};}
     BindCache &bc=bind_cache;if(!bind_cache_enabled || bc.cmd!=c.command || pipeline.transient){bc=BindCache{};bc.cmd=c.command;}
@@ -3113,7 +3174,8 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-mode";FILE *m=fopen(marker.c_str(),"rb");sync_mode=false;if(m){sync_mode=fgetc(m)=='1';fclose(m);}}
      {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}else if(const char *e=getenv("DM_GFX_DEFER_EVENTS")){int v=atoi(e);defer_events=v==1?1:v==2?2:0;}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *eg=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-event-guard").c_str(),"rb");evguard::enabled=eg!=nullptr;if(eg)fclose(eg);if(evguard::enabled)xbg_logf("NVN event guard on (marker gfx-event-guard)");}{FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-vcache").c_str(),"rb");vcache::enabled=false;if(v){vcache::enabled=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_VCACHE"))vcache::enabled=atoi(e)!=0;xbg_logf("NVN vertex/index cross-frame cache=%d tracker=%d (marker gfx-vcache)",int(vcache::enabled),int(nvn_dirty_since!=nullptr));}
      {FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-tex-dirty").c_str(),"rb");tex_dirty=false;if(v){tex_dirty=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_TEX_DIRTY"))tex_dirty=atoi(e)!=0;
-      xbg_logf("NVN texture checks through the dirty tracker=%d (marker gfx-tex-dirty)",int(tex_dirty));}{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc)",int(native_bc));}{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=32;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=32;fclose(m);}else if(const char *e=getenv("DM_GFX_PERF_SAMPLE"))perf_sample=unsigned(atoi(e));perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
+      xbg_logf("NVN texture checks through the dirty tracker=%d (marker gfx-tex-dirty)",int(tex_dirty));}{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc)",int(native_bc));}
+     {FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-noload").c_str(),"rb");noload_enabled=false;if(b){noload_enabled=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NOLOAD"))noload_enabled=atoi(e)!=0;xbg_logf("NVN proven full-overwrite first draws skip the color load=%d (marker gfx-noload; A/B target noload)",int(noload_enabled));}{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=32;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=32;fclose(m);}else if(const char *e=getenv("DM_GFX_PERF_SAMPLE"))perf_sample=unsigned(atoi(e));perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
     for(auto &sl:slots)sl=Slot{};slot_index=0;pass_prof_enabled=false;pass_prof_next=300;pass_prof_frame=UINT64_MAX;pass_prof_draws=0;pass_prof_queries=pass_prof_slots=pass_prof_skipped_slots=0;perf=Perf{};for(auto &c:perf_timing_before)c=XbgCpuTiming::Counter{};static_arena.cached=false;support_static.clear();format_property_cache.clear();for(auto &k:format_flat_known)k=false;
     VkPhysicalDeviceShaderDrawParametersFeatures draw_parameters{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};features.pNext=&draw_parameters;vkGetPhysicalDeviceFeatures2(cfg.physical,&features);if(cfg.enabled_shader_draw_parameters && !draw_parameters.shaderDrawParameters){if(error&&bytes)snprintf(error,bytes,"shaderDrawParameters unsupported");return -1;}
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;VkResult r=vkCreateCommandPool(cfg.device,&cp,nullptr,&command_pool);if(r!=VK_SUCCESS){if(error&&bytes)snprintf(error,bytes,"vkCreateCommandPool=%d",r);return r;}
