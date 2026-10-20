@@ -96,9 +96,12 @@ void xbg_record_command(cmd_t *c,const void *record,uint32_t bytes){if(!c||!c->r
 // ---------- 计时与统计（无图形时全 0） ----------
 // ---------- Timing and statistics (all 0 without graphics) ----------
 static _Atomic uint64_t g_cur_frame;
-void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); }
+void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); xbg_game_set_frame(f); }
 void mtl_ub_present(double iv) { (void)iv; }
-double mtl_gpu_ms(uint64_t f) { (void)f; return -1; }
+// 长帧日志（hle_nvn.c）的 GPU、新建管线、着色器载入与贴图上传几项取自引擎的读数（xbg_game_frame_counters）；GPU 时刻跨度没有读数。
+// The long-frame log's (hle_nvn.c) GPU, new-pipeline, shader-load and texture-upload items come from the engine's readings
+// (xbg_game_frame_counters); there is no reading for GPU time spans.
+double mtl_gpu_ms(uint64_t f) { return xbg_game_gpu_ms(f); }
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; *t0 = *t1 = 0; return 0; }
 void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = 0; xbg_game_stats s; xbg_game_get_stats(&s); *draws = s.draws; }
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse) { *enc = *reuse = 0; }
@@ -107,13 +110,13 @@ uint64_t mtl_ds_omit(void) { return 0; }
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full) { *load = *store = *full = 0; }
 uint64_t mtl_udc_saved_bytes(void) { return 0; }
 uint64_t mtl_drawable_ns_take(void) { return 0; }
-void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = *reuploads = 0; }
+void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { xbg_frame_counters c; xbg_game_frame_counters(&c); *uploads = c.uploads; *reuploads = c.reuploads; }
 uint64_t mtl_pkg_miss(void) { return 0; }
-uint64_t mtl_upload_ns_take(void) { return 0; }
+uint64_t mtl_upload_ns_take(void) { static _Atomic uint64_t taken; xbg_frame_counters c; xbg_game_frame_counters(&c); return c.upload_ns - atomic_exchange(&taken, c.upload_ns); }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }
-uint64_t mtl_upload_bytes(void) { return 0; }
-void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = *pso = 0; }
-void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = *pso_ns = 0; }
+uint64_t mtl_upload_bytes(void) { xbg_frame_counters c; xbg_game_frame_counters(&c); return c.upload_bytes; }
+void mtl_create_stats(uint64_t *lib, uint64_t *pso) { xbg_frame_counters c; xbg_game_frame_counters(&c); *lib = c.shader_loads; *pso = c.pipelines; }
+void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { xbg_frame_counters c; xbg_game_frame_counters(&c); *lib_ns = c.shader_load_ns; *pso_ns = c.pipeline_ns; }
 void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = *grown = 0; *n = 0; }
 void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]) { memcpy(rep, g_cnt_report, sizeof g_cnt_report); memcpy(rst, g_cnt_reset, sizeof g_cnt_reset); }
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb, int heap_ok, unsigned long long heap_mb, unsigned long long heap_free_mb, unsigned long long heap_maxblk_kb) {

@@ -38,6 +38,15 @@ void xbg_present_texture(const win_t *window,const tex_t *texture);
 uint64_t xbg_legacy_last_fence(void);
 int xbg_legacy_wait(uint64_t fence,uint64_t timeout);
 void xbg_legacy_finish(void);
+/* 长帧日志的读数（xbg_game.cpp 的 hud）：自启动起帧里同步建管线、载入着色器、整份上传贴图的次数与 ns；每个 HLE 帧的 GPU 时间
+ * （不知道时 −1）；xbg_game_set_frame 给出此后提交所属的 HLE 帧。
+ * Readings for the long-frame log (xbg_game.cpp's hud): counts and ns since start of the pipelines created, shaders loaded and whole
+ * textures uploaded synchronously in a frame; the GPU time of each HLE frame (−1 when unknown); xbg_game_set_frame names the HLE frame
+ * that later submissions belong to. */
+typedef struct xbg_frame_counters { uint64_t pipelines,pipeline_ns,shader_loads,shader_load_ns,uploads,reuploads,upload_bytes,upload_ns; } xbg_frame_counters;
+void xbg_game_frame_counters(xbg_frame_counters *out);
+void xbg_game_set_frame(uint64_t frame);
+double xbg_game_gpu_ms(uint64_t frame);
 /* Extension records retain the original command layout header. */
 typedef struct xbg_indirect { uint64_t arguments,count_address,index_address; int32_t primitive,index_type,max_count,stride; } xbg_indirect;
 typedef struct xbg_wait_event { uint64_t address; uint32_t mode,value; } xbg_wait_event;
