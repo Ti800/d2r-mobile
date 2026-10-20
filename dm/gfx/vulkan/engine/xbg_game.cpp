@@ -478,9 +478,9 @@ struct Slot {
 };
 Slot slots[2];unsigned slot_index=0;
 // Pending views of the other slot's results (xviews), and arena reuse while a slot with such views was in flight (races).
-// gfx-xview-arena (marker 1 / 0, else DM_GFX_XVIEW_ARENA; off by default): at such a reuse the slot records into its
-// second readback arena instead (swaps), so the arena the reader may use stays intact; the reader retires before this slot
-// records again, and the slot then swaps back only if a reader is in flight once more.
+// gfx-xview-arena (marker 1 / 0, else DM_GFX_XVIEW_ARENA; off by default; A/B target xarena): at such a reuse the slot
+// records into its second readback arena instead (swaps), so the arena the reader may use stays intact; the reader retires
+// before this slot records again, and the slot then swaps back only if a reader is in flight once more.
 uint64_t xviews=0,xview_races=0,xview_swaps=0;bool xview_arena=false;
 // Command pool resets off the render thread. vkResetCommandPool took ~0.4 ms of every frame on the Redmi K50 Ultra's render
 // thread. After a slot is submitted, the reset thread waits for its fence and resets its pool; retiring the slot first waits
@@ -700,7 +700,7 @@ Slot &recording_slot(){
         {SiteScope site(SITE_RING,true);retire_slot(s);}
         // From here on this slot reuses its readback arena while the other slot, still in flight, may read it through pending
         // views (xview): its GPU reads then race the CPU copies of this submission.
-        {const Slot &o=slots[slot_index^1];if(o.pending && o.xview){++xview_races;if(xview_arena){std::swap(s.readback,s.readback_alt);++xview_swaps;}}}
+        {const Slot &o=slots[slot_index^1];if(o.pending && o.xview){++xview_races;if(xview_arena && !ab_off("xarena")){std::swap(s.readback,s.readback_alt);++xview_swaps;}}}
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
         s.stream.trim();s.readback.keep_chunks=1;s.readback.trim();
