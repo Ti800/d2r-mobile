@@ -150,14 +150,18 @@ the OnePlus 13 is still to be seen there.
 
 ### A first launch: a seed for the warm-up list
 
-A Den of Evil fight as a first launch (`DM_GAME_SEED=12345`, driver pipeline cache removed), from the warp on:
+A first launch (`DM_GAME_SEED=12345`, driver pipeline cache removed) from the menus and the camp into a Den of Evil
+fight, from the warp on:
 
-| Run | warm-up list | pipelines built in the fight | long frames | ≥ 50 ms | ≥ 100 ms | worst | p1 fps |
+| Run | warm-up list | pipelines compiled in frames | long frames | ≥ 50 ms | ≥ 100 ms | worst | p1 fps |
 |---|---|---|---|---|---|---|---|
-| W0 | none | 226 (3.5 s) | 39 | 13 | 6 | 207 ms | 30.7 |
-| W1 | the list file | 0 | 12 | 0 | 0 | 45 ms | 44.4 |
-| W2 | from the seed | 0 | 82 | 2 | 0 | 52 ms | 48.5 |
+| W0 | none | 55 (1.2 s) | 39 | 13 | 6 | 207 ms | 43.0 |
+| W1 | the list file | 0 | 12 | 0 | 0 | 45 ms | 59.6 |
+| W2 | from the seed | 0 | 82 | 2 | 0 | 52 ms | 58.5 |
 
-With a list the warm-up threads built its 392 pipelines at start-up (9.8 s of compile time on 3 threads, none failed).
-`9dec4ac` copies `shaders/vk-pipeline-list.seed` to `files/dm/vk-pipeline-list.bin` while that file does not exist: make
-the seed from devices' lists with `dm/android/tools/merge_warm_lists.py` and ship it with the shaders.
+Before the warp W0 compiled another 171 pipelines in frames (2.2 s), W1 and W2 none. (The first version of this table
+gave W0's 226 pipelines and the p1 values 30.7, 44.4 and 48.5 fps for the whole run.) With a list the warm-up threads
+built its 392 pipelines within about 6 s of start-up (9.8 s of compile time on 3 threads, none failed), and the game took
+215 of them. W2's long frames are not pipeline builds: neither W1 nor W2 compiled one in a frame. `9dec4ac` copies
+`shaders/vk-pipeline-list.seed` to `files/dm/vk-pipeline-list.bin` while that file does not exist: make the seed from
+devices' lists with `dm/android/tools/merge_warm_lists.py` and ship it with the shaders (PR #33 for main).
