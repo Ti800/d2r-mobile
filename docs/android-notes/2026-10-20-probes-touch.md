@@ -93,7 +93,7 @@ On the Redmi with `DM_3D_SCALE=0.85` (3D target 1700 × 765 instead of 1500 × 6
 | Den of Evil fight (seed 12345), 2.8 min | 60.0 / 59.9 | 14.14 ms | none | 34.3 → 37.0 °C |
 | The same fight, 9 min | 60.0 / 59.9 (1st percentile 59.0) | 14.07 ms | none | 34.4 → 42.0 °C |
 
-The windows under 58 fps were all at the load and the warp. The phone was charging throughout. The same 9-minute fight at the default 0.75 is not a usable baseline: there the harness's screenshot every 10 s stalled about 20 frames each time (1st percentile 42.5 fps), and the controller, which counts any late frame, stepped down to 0.60 for stalls that resolution cannot fix. The 0.85 run took the same screenshots without stalling. Whether the phone ships at 0.85 is a choice between sharpness and heat.
+The windows under 58 fps were all at the load and the warp. The phone was charging throughout. The same 9-minute fight at a fixed 0.75, without the harness's screenshots and profiler, gave fps 60.0 / 59.9 (1st percentile 58.6) with GPU 13.87 ms, and the battery went from 34.1 to 37.0 °C after 4 minutes, 39.0 °C after 6 and 40.0 °C at the end, against 39.0, 40.4 and 42.0 °C at 0.85. So 0.85 keeps the frame rate and costs about 2 °C after 9 minutes of fighting. An earlier 0.75 run with the screenshots is not usable: each screenshot stalled about 20 frames, and the controller, which counts any late frame, stepped down to 0.60 for stalls that resolution cannot fix. Whether the phone ships at 0.85 is a choice between sharpness and heat.
 
 ## A level-40 test character, levelled by the game itself
 
