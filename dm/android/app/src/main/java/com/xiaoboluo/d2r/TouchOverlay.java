@@ -56,6 +56,7 @@ public final class TouchOverlay extends View {
     private final File overlayRoot;
     private final HashMap<String,Bitmap> images=new HashMap<>();
     private final Bitmap[] skillAtlases=new Bitmap[9];
+    private Bitmap mapArt;
     private final String lifeFormat, manaFormat, levelFormat, cancelLabel;
     private JSONObject hudUi;
     private float safeLeft, safeRight, safeBottom;
@@ -90,6 +91,7 @@ public final class TouchOverlay extends View {
         if (enabled) {
             images.clear();
             for(int i=0;i<skillAtlases.length;i++) skillAtlases[i]=image("touchart/dm_native_skill_"+i+".png");
+            mapArt=image("touchart/dm_native_map.png");
             try { hudUi=new JSONObject(new String(Files.readAllBytes(new File(overlayRoot,"hud_v4_ui/ui.json").toPath()),StandardCharsets.UTF_8)); }
             catch(Exception ignored) { hudUi=null; }
             resizeNative();
@@ -261,9 +263,20 @@ public final class TouchOverlay extends View {
             if(!navigation && i>=6 && i<=10 && hudUi!=null) continue;
             if(i==12 && layout[HUD+14]!=0) continue;
             if(!navigation && i==13) { socket(canvas,x,y,r,pressed,false,false);text(canvas,label(i,false),x,y+r*.18f,r*.55f);continue; }
+            // 地图钮：与 iOS 同一张原版图标（36×36 一格，平时第 0 格、按住第 1 格），放进技能同款圆座；拖技能时它是「取消」，照旧写字。
+            // Map button: the same original icon as iOS (36x36 frames, frame 0 idle, frame 1 held) in the skill-style socket; while a
+            // skill drag makes it "Cancel" it keeps the caption.
+            if(!navigation && i==11 && mapArt!=null && layout[HUD+15]==0 && mapArt.getWidth()>=2*mapArt.getHeight()) {
+                socket(canvas,x,y,r,pressed,false,false);
+                int f=mapArt.getHeight(),sx=pressed?f:0;float half=r*.76f;
+                canvas.drawBitmap(mapArt,new Rect(sx,0,sx+f,f),new RectF(x-half,y-half,x+half,y+half),paint);
+                continue;
+            }
             if (i==12 && joyArt!=null) {
                 paint.setAlpha(pressed?210:140);
                 canvas.drawBitmap(joyArt,null,new RectF(x-r,y-r,x+r,y+r),paint); paint.setAlpha(255);
+                // 摇杆图本身就说明用途；与 iOS 一样不再压一行「移动」。 | The joystick art says what it is; like iOS, no "Move" caption on top.
+                continue;
             } else {
                 paint.setStyle(Paint.Style.FILL); paint.setColor(pressed?0x9960a0c0:0x66202024);
                 canvas.drawCircle(x,y,r,paint);
