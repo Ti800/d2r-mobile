@@ -425,7 +425,10 @@ void resolve_pending();
 void resolve_slot_writebacks(const void *slot);
 void resolve_known_reports();
 extern bool resolving_pending;
-uint64_t snap_site_bytes[6]={};unsigned snap_site=0; // perf: copied bytes by caller (0 other,1 vertex,2 index,3 storage,4 texel,5 uniform)
+// perf, by caller (0 other, 1 vertex, 2 index, 3 storage, 4 texel, 5 uniform): snap_site_bytes = bytes copied in full,
+// snap_site_req = bytes asked for, before the vertex cache, write tracking and pending-result views (their copies are logged
+// on their own lines: vcache fills, wtrack copied_kb).
+uint64_t snap_site_bytes[6]={},snap_site_req[6]={};unsigned snap_site=0;
 std::unordered_set<uint64_t> storage_pages;uint64_t storage_snap_count=0;
 namespace wtrack{extern uint64_t copied_bytes,dirty_pages,mismatches,fallbacks;}
 extern std::atomic<uint64_t> memo_epoch;extern uint64_t key_diff[14];extern uint64_t memo_bump[5];extern uint64_t xmemo_hits,xmemo_drops;struct PinRef{VkDescriptorSetLayout layout;uint32_t refs;};extern std::unordered_map<VkDescriptorSet,PinRef> memo_pinned[2];
@@ -763,7 +766,7 @@ void perf_frame(){
     }
     xbg_logf("NVN PERF storage_snapshots_per_frame=%.1f union_mb_per_frame=%.2f",storage_snap_count/f,storage_pages.size()*4096.0/1048576.0/tf);storage_pages.clear();storage_snap_count=0;
     xbg_logf("NVN PERF wtrack copied_kb_per_frame=%.1f dirty_pages_per_frame=%.1f mismatches=%llu fallbacks=%llu",wtrack::copied_bytes/1024.0/f,wtrack::dirty_pages/f,(unsigned long long)wtrack::mismatches,(unsigned long long)wtrack::fallbacks);wtrack::copied_bytes=wtrack::dirty_pages=0;
-    xbg_logf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;
+    xbg_logf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f requested vertex=%.2f index=%.2f storage=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f,snap_site_req[1]/1048576.0/f,snap_site_req[2]/1048576.0/f,snap_site_req[3]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;for(auto &b:snap_site_req)b=0;
     xbg_logf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed));
     xbg_logf("NVN PERF snapfront front_hits=%.1f map_hits=%.1f invalidations=%.1f erased=%.1f",snap_front_hits/f,snap_map_hits/f,snap_invalidations/f,snap_invalidated/f);xbg_logf("NVN PERF textures bc_native=%llu bc_decoded=%llu live_images=%.1fMB bc_images=%.1fMB bc_payload=%.1fMB",(unsigned long long)native_bc_images,(unsigned long long)decoded_bc_images,image_bytes_live/1048576.0,bc_image_bytes_live/1048576.0,bc_data_bytes_live/1048576.0);snap_front_hits=snap_map_hits=snap_invalidations=snap_invalidated=0;
     if(tex_dirty){xbg_logf("NVN PERF texdirty tracked=%.1f checks=%.1f changed=%.1f",tex_dirty_tracked/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_tracked=tex_dirty_checks=tex_dirty_changed=0;}
@@ -1046,10 +1049,11 @@ Buffer snapshot_slow(uint64_t address,size_t bytes,VkDeviceSize align){
     auto key=std::make_pair(address,uint64_t(bytes));auto it=snapshots.find(key);
     if(it!=snapshots.end()){++perf.snapshot_hits;++snap_map_hits;return it->second;}
     {Buffer view;if(pending_view(address,bytes,align,view)){snapshots.emplace(key,view);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,bytes);return view;}}
-    ++perf.snapshot_misses;perf.snapshot_bytes+=bytes;snap_site_bytes[snap_site<6?snap_site:0]+=bytes;if(snap_site==3){static unsigned logged=0;if(logged<40 && bytes>=65536){++logged;xbg_logf("NVN PERF storage_snapshot addr=%#llx bytes=%zu frame=%llu",(unsigned long long)address,bytes,(unsigned long long)stats.presents.load());}++storage_snap_count;if(timing_now())for(uint64_t pg=address>>12;pg<=(address+bytes-1)>>12;pg++)storage_pages.insert(pg);}   // page union: timed frames only (~4.8k inserts per D2R frame)
+    ++perf.snapshot_misses;perf.snapshot_bytes+=bytes;snap_site_req[snap_site<6?snap_site:0]+=bytes;if(snap_site==3){static unsigned logged=0;if(logged<40 && bytes>=65536){++logged;xbg_logf("NVN PERF storage_snapshot addr=%#llx bytes=%zu frame=%llu",(unsigned long long)address,bytes,(unsigned long long)stats.presents.load());}++storage_snap_count;if(timing_now())for(uint64_t pg=address>>12;pg<=(address+bytes-1)>>12;pg++)storage_pages.insert(pg);}   // page union: timed frames only (~4.8k inserts per D2R frame)
     cpu_access(address,bytes,1);   // a pending GPU result that only partly covers the range (or is misaligned for a view) lands first
     if(snap_site==3 && bytes>=wtrack::min_bytes && wtrack::enabled && !ab_off("wtrack")){Buffer t;if(wtrack::snapshot(address,bytes,t)){snapshots.emplace(key,t);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,bytes);return t;}}
     if((snap_site==1 || snap_site==2) && vcache::enabled && !ab_off("vcache")){Buffer v;if(vcache::lookup(address,bytes,v)){snapshots.emplace(key,v);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,bytes);return v;}}
+    snap_site_bytes[snap_site<6?snap_site:0]+=bytes;
     Buffer b=stream_buffer(bytes,reinterpret_cast<const void*>(address),bytes,false);snapshots.emplace(key,b);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,bytes);return b;
 }
 struct Commands {
@@ -2008,7 +2012,7 @@ Buffer uniform_snapshot_slow(uint64_t address,size_t copy){
     size_t n=uniform_range(copy);auto key=std::make_pair(address,uint64_t(copy));
     auto it=uniform_snapshots.find(key);if(it!=uniform_snapshots.end()){++perf.snapshot_hits;++snap_map_hits;return it->second;}
     {Buffer view;if(pending_view(address,n,properties.limits.minUniformBufferOffsetAlignment,view)){uniform_snapshots.emplace(key,view);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,n);return view;}}
-    ++perf.snapshot_misses;perf.snapshot_bytes+=copy;snap_site_bytes[5]+=copy;cpu_access(address,copy,2);
+    ++perf.snapshot_misses;perf.snapshot_bytes+=copy;snap_site_bytes[5]+=copy;snap_site_req[5]+=copy;cpu_access(address,copy,2);
     Buffer b=stream_buffer(n,reinterpret_cast<const void*>(address),copy,true);uniform_snapshots.emplace(key,b);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,copy);return b;
 }
 // Descriptor memo (iOS "same inputs -> reuse the parameter block"): within one guest submit, a draw whose shaders and
