@@ -1977,7 +1977,19 @@ bool async_request(const VkGraphicsPipelineCreateInfo &ci,const XbgPipelineKey &
     if(!async_thread.joinable())async_thread=std::thread(async_worker);
     async_cv.notify_one();record(ci,key);return true;
 }
+// A first launch has no list yet. A seed shipped with the shaders (shaders/vk-pipeline-list.seed, made from devices' lists
+// with dm/android/tools/merge_warm_lists.py) then becomes the list, so the warm-up builds the pipelines those devices saw
+// before the first fight instead of in it; records a device cannot build fail in the warm-up (warm_failed).
+void seed(){
+    const std::string list=list_path();if(FILE *f=fopen(list.c_str(),"rb")){fclose(f);return;}
+    const std::string from=std::string(cfg.shader_directory)+"/vk-pipeline-list.seed";FILE *in=fopen(from.c_str(),"rb");if(!in)return;
+    const std::string tmp=list+".tmp";FILE *out=fopen(tmp.c_str(),"wb");bool ok=out!=nullptr;size_t total=0;
+    for(char buf[65536];ok;){size_t n=fread(buf,1,sizeof buf,in);if(!n)break;ok=fwrite(buf,1,n,out)==n;total+=n;}
+    fclose(in);if(out)ok=fclose(out)==0 && ok;if(ok)ok=rename(tmp.c_str(),list.c_str())==0;else remove(tmp.c_str());
+    xbg_logf("NVN warm list seeded from %s bytes=%zu ok=%d",from.c_str(),total,int(ok));
+}
 void start(){
+    seed();
     FILE *f=fopen(list_path().c_str(),"rb");if(f){fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);std::vector<uint8_t> b(n>0 && n<(64l<<20)?size_t(n):0);bool ok=b.empty() || fread(b.data(),1,b.size(),f)==b.size();fclose(f);
         size_t i=0;auto get=[&](uint32_t &v){if(i+4>b.size())return false;memcpy(&v,b.data()+i,4);i+=4;return true;};
         while(ok && i<b.size()){uint32_t magic,ns,count;if(!get(magic)||magic!=0x57504c58||!get(ns)||ns>5)break;Rec r;bool good=true;
