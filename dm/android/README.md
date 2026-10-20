@@ -68,7 +68,7 @@ screen is not implemented.
 | App internal `files/dm/shaders/` | External `.xgs` bundles matching the game and Vulkan backend |
 | App internal `files/dm/overlay/` | Required CASC touch overlay, including `overlay.manifest`, generated from the matching source and the user's resources |
 | App internal `files/dm/overlay/touchart/` | Skill atlases, map icon and joystick image staged by `stage_touch_assets.py` (the joystick comes from the repository's `dm/ios/Sources/TouchArt/dm_touch_joy.png`); without the joystick image the UI draws a fallback joystick |
-| Shared `Download/data/` | User's resource archives and `.build.config`; requires Android's all-files-access setting |
+| Shared `Download/S2X/D2R Mobile/data/` | User's resource archives and `.build.config`; requires Android's all-files-access setting. When it has no `.build.config` but the earlier `Download/data/` does, the App keeps using `Download/data/` |
 | App internal `files/save/` | Saves; preserve during upgrades |
 | App internal `files/temp/`, `files/dm/boot.log` | Temporary files and appended startup logs |
 
@@ -114,6 +114,7 @@ The overlay generator writes a source fingerprint and exact file hashes to `over
 
 `gen_romfs_overlay.py` requests overlay-only assets: it skips the iOS skill atlas and its unused skill silhouettes. Full `gen_assets.ensure()` still requires them. Skill atlas validation compares dimensions and decoded RGBA pixels while retaining source sprite SHA256/MD5 checks. Generator subprocesses explicitly use UTF-8/LF and preserve an existing read-only resource adapter. Windows/Linux byte equality must still be verified with the same game input and tool versions.
 
+Vulkan compatibility is selected from actual format features, not the Android version. Startup logs `format_feature_flags2` and `depth16_as_d24`; D16 is widened only when D16 lacks linear filtering and X8_D24 has all required uses. A Vulkan 1.1 version number alone does not establish compatibility. vivo should retain `1 / 0`; Redmi K50 Ultra needs separate device validation.
 # Current iOS touch controls
 
 Android shares the upstream touch state machine and its read-only skill-binding observer. Generate the binding index and atlas PNGs from your own matching RomFS outside the checkout:
@@ -129,3 +130,17 @@ python dm/android/tools/stage_touch_assets.py --native-art <external-native-art>
 ```
 
 Import the complete finalized candidate overlay. Skill PNGs and HUD images stay in the external resource payload; do not add them to Git or APK assets. The renderer reads them from the validated imported `files/dm/overlay` directory. `DM_NATIVE_ART_DIR=<external-native-art>` lets the native-art capture test verify the external index and pixels. The five navigation buttons remain enabled until the complete replacement inventory flow passes device validation.
+
+## Debug performance controls
+
+Only CMake's Debug configuration reads `<files>/dm/android-debug.env`; Release contains no reader or call. This file is separate from the game's general `env`. It accepts only `DM_3D_SCALE`, `DM_3D_SCALE_DYN` and `DM_3D_SCALE_FLOOR`, one `KEY=VALUE` per line. Blank lines, `#` comments and CRLF are accepted. Unknown or repeated keys, files over 4096 bytes, lines over 127 characters, non-finite or malformed numbers, invalid switches and a floor above the starting scale reject the whole file. Scale and floor range from 0.50 through 1.00; DYN is exactly 0 or 1. The log reports acceptance/rejection without values.
+
+Defaults are a scale ceiling of 0.85 on Android (0.75 on the other phone platforms), dynamic scaling enabled, floor 0.60. For a fixed-scale A/B comparison, use:
+
+```
+DM_3D_SCALE=0.75
+DM_3D_SCALE_DYN=0
+DM_3D_SCALE_FLOOR=0.60
+```
+
+Synchronization stays enabled. The file cannot override synchronization, frame overlap or any other setting. The parser regression is `dm/android/tests/test_debug_env.c`; build and run it independently from the game.

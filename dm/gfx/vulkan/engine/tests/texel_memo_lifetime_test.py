@@ -29,6 +29,7 @@ enum {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER=1,
       VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER=4,
       VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER=5,
       VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER=6};
+constexpr bool texel_memo_enabled=false;
 bool eligible(int type){struct {int type;} b{type};bool ok=true;unsigned desc_memo_why[6]={};do {
 '''
     suffix = r'''

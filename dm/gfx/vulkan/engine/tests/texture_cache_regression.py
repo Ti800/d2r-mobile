@@ -65,7 +65,12 @@ int memcmp(const void *a,const void *b,size_t n){
 '''
     harness += '\n'.join(declarations) + '\n' + registration
     harness += r'''
-struct CpuImage {bool uploaded=true,gpu_written=false;uint64_t checked_submission=~uint64_t(0),cpu_hash=0;uint32_t stable_checks=0;};
+struct CpuImage {bool uploaded=true,gpu_written=false;uint64_t checked_submission=~uint64_t(0),cpu_hash=0,dirty_stamp=0,dirty_seen=0;uint32_t stable_checks=0;};
+// No dirty-page tracker (gfx-tex-dirty off, hooks absent), so the extracted cadence runs its hash checks.
+bool tex_dirty=false;uint64_t tex_dirty_tracked=0,tex_dirty_checks=0,tex_dirty_changed=0;
+bool ab_off(const char*){return false;}
+int (*nvn_dirty_tracked)(const void*,size_t)=nullptr;void (*nvn_dirty_protect)(const void*,size_t)=nullptr;
+uint64_t (*nvn_dirty_now)()=nullptr;int (*nvn_dirty_since)(const void*,size_t,uint64_t)=nullptr;
 struct {uint64_t submissions=0;} stats;
 unsigned hash_calls=0;
 uint64_t hash_memory(const void *memory,size_t n){++hash_calls;uint64_t h=0;for(size_t i=0;i<n;i++)h=h*31+((const uint8_t*)memory)[i];return h;}

@@ -3,14 +3,14 @@
 //   nativeSurface：交来 / 收回 ANativeWindow（front_android.c）；nativeTouch：整组触点（front.h dm_touch_set）；nativeFocus：场景生命周期（同 iOS 1 / 2 / 3 + 后台挂起）。
 // 目录约定（都不进 APK，见 dm/android/README）：
 //   <外部私有目录>/dm/out/   改写产物（*.patched.bin 与各表，patch_nso.py DM_TARGET=android 出），开发时 adb push
-//   资源目录（缺省 /sdcard/Download/data）  玩家的 18 个 .data 档案 + .build.config；App 在内部目录建 romfs/data/ 逐个链接过去
+//   资源目录（缺省 /sdcard/Download/S2X/D2R Mobile/data）  玩家的 18 个 .data 档案 + .build.config；App 在内部目录建 romfs/data/ 逐个链接过去
 //   <内部目录>/save、temp            存档与临时文件
 // JNI entry of the App form (Java side app/src/main/java/com/xiaoboluo/d2r/DmActivity.java): counterpart of iOS's main.m startup chain + front_ios.m's lifecycle / touch forwarding.
 //   nativeStart: prepare directories and environment variables (as iOS boot_prepare: DM_ROMFS / DM_SAVE / DM_TEMP, cwd), connect stderr to a log file + logcat, start the host thread running dm_main.
 //   nativeSurface: hand over / take back the ANativeWindow (front_android.c); nativeTouch: the whole set of touch points (front.h dm_touch_set); nativeFocus: scene lifecycle (as iOS 1 / 2 / 3 + background suspend).
 // Directory conventions (none of these go into the APK, see dm/android/README):
 //   <external private dir>/dm/out/   rewriter products (*.patched.bin and tables, from patch_nso.py DM_TARGET=android), adb push during development
-//   resource dir (default /sdcard/Download/data)  the player's 18 .data archives + .build.config; the App creates romfs/data/ in the internal dir linking to each of them
+//   resource dir (default /sdcard/Download/S2X/D2R Mobile/data)  the player's 18 .data archives + .build.config; the App creates romfs/data/ in the internal dir linking to each of them
 //   <internal dir>/save, temp        saves and temporary files
 #include "../host/dm.h"
 #include "../host/front.h"
@@ -35,6 +35,21 @@ void front_android_boot_failed(int code);
 
 static char g_files[1024], g_ext[1024], g_src[1024], g_runtime[1100];
 static FILE *g_logf;
+
+#ifdef DM_ANDROID_DEBUG_ENV
+#include "debug_env.h"
+/* 专用调试文件只供性能A/B，不读取游戏通用env，也不开放同步等危险键。
+ * This dedicated performance A/B file is separate from the game's general env and never exposes synchronization keys. */
+static void debug_environment(void) {
+    char path[1200];snprintf(path,sizeof path,"%s/dm/android-debug.env",g_files);
+    dm_android_debug_values values;
+    int result=dm_android_debug_load(path,&values);
+    if(result<0) { LOG("boot: debug environment rejected");return; }
+    if(!result)return;
+    for(unsigned i=0;i<3;++i)if(values.present&(1u<<i))setenv(dm_android_debug_keys[i],values.value[i],1);
+    LOG("boot: debug environment allowlist applied");
+}
+#endif
 
 // 挂起只能在原生pthread栈上执行；UI只登记最新状态，不能等正在等待Surface的呈现调用。
 // Suspend only on a native pthread stack; UI posts latest state without waiting for a present that needs a Surface.
@@ -154,6 +169,9 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     int n = link_romfs(romfs);
     LOG("boot: 资源链接 %d 个文件", n);
     setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
+#ifdef DM_ANDROID_DEBUG_ENV
+    debug_environment();
+#endif
     // 被更新的 GPU 结果覆盖、又只有 GPU 读的存储写回不做（引擎的 gfx-wb-skip；标记文件仍优先）：营地每帧省 1.37 MB、约 1 ms 的回读。
     // Storage writebacks that a newer GPU result supersedes and only the GPU reads are dropped (the engine's gfx-wb-skip; a
     // marker file still wins): 1.37 MB and about 1 ms of readback per camp frame.
@@ -200,6 +218,12 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // engine's gfx-defer-events = 2; a marker file still wins). With the presenter's gfx-present-overlap the Redmi K50 Ultra
     // camp went from 7.7 to 19.5 fps (PR #9).
     setenv("DM_GFX_DEFER_EVENTS", "2", 0);
+    // 不在每个绘制、计算和拷贝前先完成全部待写回与报告（引擎的 gfx-read-preflight；标记文件仍优先）。延后事件下几乎总有报告待写，
+    // 开着就等于每个绘制前同步一次 GPU；营地与 Den of Evil 战斗里 CPU 读从未碰到待写结果（NVN PERF why=a0）。
+    // CPU reads are not all resolved before every draw, dispatch and copy (the engine's gfx-read-preflight; a marker file still
+    // wins). With deferred events a report is nearly always pending, so it would sync the GPU before every draw; in the camp
+    // and the Den of Evil fight no CPU read ever met a pending result (NVN PERF why=a0).
+    setenv("DM_GFX_READ_PREFLIGHT", "0", 0);
     // 顶点与索引的跨帧副本缺省开（引擎的 gfx-vcache；靠 nvn_dirty.c 的写保护脏页跟踪，标记文件仍优先）：营地 CPU 少约 0.7 ms。
     // Cross-frame vertex and index copies on by default (the engine's gfx-vcache, through nvn_dirty.c's write-protect
     // tracking; a marker file still wins): about 0.7 ms less CPU per camp frame on the Redmi K50 Ultra.

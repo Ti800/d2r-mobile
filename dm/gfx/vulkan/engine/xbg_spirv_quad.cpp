@@ -1,138 +1,296 @@
-// 片元着色器的四像素邻居交换：着色器库把 Maxwell 的 SHFL.BFLY（同一 2x2 四元组里取左右 / 上下邻居，lane ^ 1 / ^ 2）
-// 译成 OpGroupNonUniformShuffle。Vulkan 不保证辅助调用（三角形外、只为求导存在的像素）参与子组操作；Adreno 上它们取到的
-// 是垃圾值，D2R 罪恶洞穴打斗时由此生出的 NaN 经模糊链扩成单位周围的黑方块。这里把浮点的这种交换改成由精细导数求邻居：
-// 同一四元组里 dFdxFine(v) = 右 - 左、dFdyFine(v) = 下 - 上，辅助调用一定参与求导，左（上）像素的邻居是 v + d，右（下）
-// 像素的是 v - d；对角（异或 3）取两者之和（差一个二阶项）。像素在四元组里的位置由 gl_FragCoord 的奇偶得出。
-// The quad-neighbour exchange of fragment shaders: the shader library translates Maxwell's SHFL.BFLY (the left / right or
-// upper / lower neighbour in the same 2x2 quad, lane ^ 1 / ^ 2) into OpGroupNonUniformShuffle. Vulkan does not promise that
-// helper invocations (pixels outside the triangle that exist only for derivatives) take part in subgroup operations; on
-// Adreno they read garbage, and in the D2R Den of Evil fight the resulting NaNs spread through the blur chain into black
-// squares around units. This rewrites such float exchanges to take the neighbour from fine derivatives: within a quad
-// dFdxFine(v) = right - left and dFdyFine(v) = lower - upper, helper invocations always take part in derivatives, the left
-// (upper) pixel's neighbour is v + d and the right (lower) pixel's is v - d; the diagonal (xor 3) adds both (off by a
-// second-order term). The pixel's place in its quad comes from the parity of gl_FragCoord.
+// PR14 a90826a的有界修订：只改已证明lane XOR 1..3、直线主函数、无整数/位用途的32位浮点。
+// XOR3先求水平邻居n1，再取dFdyFine(n1)，避免原补丁遗漏混合二阶项。
+// 非有限值保留原shuffle回退；有限数值仍受IEEE舍入影响，须另验截图，不宣称位精确。
+// Bounded correction of PR14 a90826a: require proven lane XOR 1..3, a straight-line entry function, and numeric float32 data without bit/integer uses.
+// XOR3 first takes horizontal neighbour n1, then dFdyFine(n1), preserving the mixed second-order term missing from the original patch.
+// Keep the original shuffle as a nonfinite fallback; IEEE rounding remains for finite values and requires separate screenshot validation, not a bit-exact claim.
+// 规范依据 | Specification: https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html
 #include "xbg_spirv_quad.h"
+#include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace {
 enum : uint32_t {
-    OpCapability = 17, OpEntryPoint = 15, OpDecorate = 71, OpTypeBool = 20, OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23,
-    OpTypePointer = 32, OpConstant = 43, OpVariable = 59, OpFunction = 54, OpLoad = 61, OpBitcast = 124, OpBitwiseXor = 198,
-    OpBitwiseAnd = 199, OpINotEqual = 171, OpDPdxFine = 210, OpDPdyFine = 211, OpCompositeExtract = 81, OpConvertFToU = 109,
-    OpFNegate = 127, OpSelect = 169, OpFAdd = 129, OpGroupNonUniformShuffle = 345,
-    CapDerivativeControl = 51, DecBuiltIn = 11, BuiltInFragCoord = 15, BuiltInSubgroupLocalInvocationId = 41, StorageInput = 1,
-    ModelFragment = 4,
+    ExtInst=12, EntryPoint=15, ExecutionMode=16, Capability=17, TypeVoid=19, TypeBool=20, TypeInt=21,
+    TypeFloat=22, TypeVector=23, TypeMatrix=24, TypePointer=32, Constant=43, ConstantComposite=44,
+    Function=54, FunctionEnd=56, FunctionCall=57, Variable=59, Load=61, Store=62, AccessChain=65,
+    InBoundsAccessChain=66, Decorate=71, VectorShuffle=79, CompositeConstruct=80, CompositeExtract=81,
+    CompositeInsert=82, CopyObject=83, ConvertFToU=109, Bitcast=124, FNegate=127, FAdd=129,
+    IsNan=156, IsInf=157, LogicalOr=166, Select=169, INotEqual=171, BitwiseXor=198,
+    BitwiseAnd=199, DPdxFine=210, DPdyFine=211, Label=248, Branch=249, BranchConditional=250,
+    Switch=251, Kill=252, Return=253, ReturnValue=254, Unreachable=255, Shuffle=345,
+    Input=1, Output=3, Uniform=2, PushConstant=9, BuiltIn=11, FragCoord=15, Lane=41, Fragment=4
 };
-inline uint32_t inst(uint32_t op, uint32_t words) { return (words << 16) | op; }
-bool is_global_decl(uint32_t op) { return (op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == OpVariable || op == 1 /*OpUndef*/ || op == 322 /*OpTypeForwardPointer*/; }
+struct Instruction { size_t offset; uint32_t op,wc,type=0,id=0,fn=0; };
+struct Type { uint32_t op=0,a=0,b=0; };
+uint32_t word(uint32_t op,uint32_t wc) { return op|(wc<<16); }
+struct Module {
+    const uint32_t *w; size_t n; uint32_t bound,entry_fn=0,entry_count=0,lane_var=0,coord_var=0;
+    uint32_t t_float=0,t_uint=0,t_bool=0,t_vec4=0,t_ptr4=0;
+    size_t entry_offset=0,first_type=0,first_func=0,first_cap=0;
+    bool fragment=true,derivatives=false,origin_upper=false,valid=true;
+    std::vector<Instruction> instructions;
+    std::vector<Type> types;
+    std::vector<size_t> definitions;
+    std::vector<std::vector<size_t>> uses;
+    std::vector<uint32_t> unsafe_functions;
+    std::vector<uint32_t> glsl_sets;
+    explicit Module(const uint32_t *p,size_t count):w(p),n(count),bound(p[3]),types(bound),definitions(bound,SIZE_MAX),uses(bound) {}
+    const Instruction *def(uint32_t id) const { return id<bound && definitions[id]!=SIZE_MAX?&instructions[definitions[id]]:nullptr; }
+    bool float_type(uint32_t id,unsigned depth=0) const {
+        if(!id || id>=bound || depth>32)return false;
+        const Type &t=types[id];
+        return t.op==TypeFloat || ((t.op==TypeVector || t.op==TypeMatrix) && float_type(t.a,depth+1));
+    }
+    bool int_type(uint32_t id,unsigned depth=0) const {
+        if(!id || id>=bound || depth>32)return false;
+        const Type &t=types[id];return t.op==TypeInt || (t.op==TypeVector && int_type(t.a,depth+1));
+    }
+    bool constant(uint32_t id,uint32_t &value) const {
+        const auto *i=def(id);
+        if(!i || i->op!=Constant || i->wc!=4 || !int_type(i->type))return false;
+        value=w[i->offset+3];return true;
+    }
+    uint32_t pointer_root(uint32_t id,unsigned depth=0) const {
+        if(depth>32)return 0;
+        const auto *i=def(id);if(!i)return 0;
+        if(i->op==Variable)return id;
+        if((i->op==AccessChain || i->op==InBoundsAccessChain || i->op==CopyObject) && i->wc>=4)
+            return pointer_root(w[i->offset+3],depth+1);
+        return 0;
+    }
+    uint32_t storage(uint32_t ptr) const {
+        const auto *i=def(pointer_root(ptr));return i && i->wc>=4?w[i->offset+3]:UINT32_MAX;
+    }
+    bool lane_value(uint32_t id,unsigned depth=0) const {
+        if(depth>16)return false;
+        const auto *i=def(id);if(!i)return false;
+        const auto *p=w+i->offset;
+        if(i->op==Load && i->wc==4 && p[3]==lane_var)return true;
+        return (i->op==Bitcast || i->op==CopyObject) && i->wc==4 && int_type(i->type) && lane_value(p[3],depth+1);
+    }
+};
+
+// 只列实际ID操作数；未知指令宁可把字面量当ID多跳过，也不漏过整数消费者。
+// Enumerate actual ID operands where known; unknown instructions may over-classify literals as IDs to avoid missing integer consumers.
+std::vector<uint32_t> operands(const Module &m,const Instruction &i) {
+    const auto *p=m.w+i.offset;std::vector<uint32_t> ids;
+    auto tail=[&](unsigned first){for(unsigned j=first;j<i.wc;++j)ids.push_back(p[j]);};
+    if(i.op==Constant || i.op==Variable || i.op==Label || i.op==Function || i.op==FunctionEnd)return ids;
+    if(i.op==VectorShuffle) { if(i.wc>=5)ids={p[3],p[4]}; }
+    else if(i.op==CompositeExtract || i.op==Load || i.op==CopyObject || i.op==Bitcast) { if(i.wc>=4)ids={p[3]}; }
+    else if(i.op==CompositeInsert) { if(i.wc>=5)ids={p[3],p[4]}; }
+    else if(i.op==ExtInst)tail(5);
+    else if(i.op==Store) { if(i.wc>=3)ids={p[1],p[2]}; }
+    else if(i.op==BranchConditional) { if(i.wc>=2)ids={p[1]}; }
+    else if(i.op==Switch) { if(i.wc>=2)ids={p[1]}; }
+    else if(i.op==ReturnValue) { if(i.wc>=2)ids={p[1]}; }
+    else if(i.op==Branch || i.op==Return || i.op==Kill || i.op==Unreachable || i.op==246 || i.op==247)return ids;
+    else if(i.op==245) { for(unsigned j=3;j+1<i.wc;j+=2)ids.push_back(p[j]); }
+    else if(i.type)tail(3);
+    else if(i.fn)tail(1);
+    return ids;
+}
+bool parse(Module &m) {
+    uint32_t fn=0;
+    for(size_t off=5;off<m.n;) {
+        uint32_t wc=m.w[off]>>16,op=m.w[off]&65535;
+        if(!wc || wc>m.n-off)return false;
+        const auto *p=m.w+off;
+        if(op>=19 && op<=39) {
+            if(wc<2 || !p[1] || p[1]>=m.bound)return false;
+            if(!m.first_type)m.first_type=off;
+            auto &t=m.types[p[1]];t.op=op;if(wc>=3)t.a=p[2];if(wc>=4)t.b=p[3];
+            if(op==TypeFloat && wc==3 && p[2]==32)m.t_float=p[1];
+            if(op==TypeInt && wc==4 && p[2]==32 && !p[3])m.t_uint=p[1];
+            if(op==TypeBool && wc==2)m.t_bool=p[1];
+        }
+        if(op==Function) { if(wc!=5)return false;fn=p[2];if(!m.first_func)m.first_func=off; }
+        m.instructions.push_back({off,op,wc,0,0,fn});
+        if(op==FunctionEnd)fn=0;
+        if(op==Capability) {if(wc!=2)return false;if(!m.first_cap)m.first_cap=off;if(p[1]==51)m.derivatives=true;}
+        if(op==EntryPoint) {if(wc<4)return false;++m.entry_count;m.fragment&=p[1]==Fragment;m.entry_fn=p[2];m.entry_offset=off;}
+        if(op==ExecutionMode && wc>=3 && p[2]==7)m.origin_upper=true;
+        if(op==Decorate && wc>=4 && p[2]==BuiltIn) {
+            if(p[3]==Lane) {if(m.lane_var)return false;m.lane_var=p[1];}
+            if(p[3]==FragCoord) {if(m.coord_var)return false;m.coord_var=p[1];}
+        }
+        if(op==11 && wc>=5 && std::memcmp(p+2,"GLSL.std.450",12)==0)m.glsl_sets.push_back(p[1]);
+        if(fn && (op==FunctionCall || op==BranchConditional || op==Switch || op==Kill || op==Unreachable || op==246 || op==247 || op==5380 || op==4416))
+            m.unsafe_functions.push_back(fn);
+        off+=wc;
+    }
+    for(size_t index=0;index<m.instructions.size();++index) {
+        auto &i=m.instructions[index];const auto *p=m.w+i.offset;
+        if((i.fn || (i.op>=41 && i.op<=52) || i.op==Variable || i.op==1) && i.wc>=3 && p[1]<m.bound && m.types[p[1]].op && !(i.op>=19 && i.op<=39)) {
+            if(!p[2] || p[2]>=m.bound || m.definitions[p[2]]!=SIZE_MAX)return false;
+            i.type=p[1];i.id=p[2];m.definitions[i.id]=index;
+        }
+    }
+    for(size_t index=0;index<m.instructions.size();++index)
+        for(uint32_t id:operands(m,m.instructions[index]))if(id<m.bound)m.uses[id].push_back(index);
+    for(uint32_t id=1;id<m.bound;++id) {
+        const auto &t=m.types[id];
+        if(t.op==TypeVector && t.a==m.t_float && t.b==4)m.t_vec4=id;
+    }
+    for(uint32_t id=1;id<m.bound;++id)if(m.types[id].op==TypePointer && m.types[id].a==Input && m.types[id].b==m.t_vec4)m.t_ptr4=id;
+    return true;
+}
+bool numeric_op(uint32_t op) {
+    return op==FNegate || op==129 || op==131 || op==133 || op==136 || op==140 || op==141 ||
+        (op>=142 && op<=148) || op==115 || op==116 || op==VectorShuffle || op==CompositeConstruct ||
+        op==CompositeExtract || op==CompositeInsert || op==CopyObject || op==Select ||
+        (op>=207 && op<=215) || op==Shuffle;
+}
+bool numeric_ext(const Module &m,const Instruction &i) {
+    if(i.op!=ExtInst || i.wc<6)return false;
+    const auto *p=m.w+i.offset;uint32_t op=p[4];
+    bool set=std::find(m.glsl_sets.begin(),m.glsl_sets.end(),p[3])!=m.glsl_sets.end();
+    return set && ((op>=1 && op<=34 && op!=5 && op!=7) || (op>=37 && op<=50) || op==53 || (op>=66 && op<=72) || (op>=79 && op<=81));
+}
+bool source_safe(const Module &m,uint32_t id,std::vector<uint8_t> &seen,xbg_quad_skip &reason,unsigned depth=0) {
+    if(depth>256 || !id || id>=m.bound) {reason=xbg_quad_skip::unknown_source;return false;}
+    if(seen[id]==2)return true;
+    if(seen[id]==1) {reason=xbg_quad_skip::unknown_source;return false;}
+    const auto *i=m.def(id);if(!i) {reason=xbg_quad_skip::unknown_source;return false;}
+    if(i->op==Bitcast) {reason=xbg_quad_skip::bit_pattern;return false;}
+    if(m.int_type(i->type)) {reason=xbg_quad_skip::integer_flow;return false;}
+    if(!m.float_type(i->type)) {reason=xbg_quad_skip::unknown_source;return false;}
+    if(i->op==Constant)return true;
+    const auto *p=m.w+i->offset;
+    if(i->op==Load) {
+        uint32_t storage=m.storage(p[3]);
+        if(storage==Input || storage==Uniform || storage==PushConstant)return true;
+        reason=xbg_quad_skip::memory_flow;return false;
+    }
+    if(i->op>=87 && i->op<=98)return true;
+    if(!numeric_op(i->op) && !numeric_ext(m,*i) && i->op!=ConstantComposite) {reason=xbg_quad_skip::unknown_source;return false;}
+    seen[id]=1;
+    std::vector<uint32_t> deps;
+    if(i->op==Select && i->wc==6)deps={p[4],p[5]};
+    else if(i->op==Shuffle && i->wc==6)deps={p[4]};
+    else deps=operands(m,*i);
+    for(uint32_t dep:deps)if(!source_safe(m,dep,seen,reason,depth+1))return false;
+    seen[id]=2;return true;
+}
+bool uses_safe(const Module &m,uint32_t id,std::vector<uint8_t> &seen,xbg_quad_skip &reason,unsigned depth=0) {
+    if(depth>256) {reason=xbg_quad_skip::unknown_use;return false;}
+    if(seen[id])return true;seen[id]=1;
+    for(size_t index:m.uses[id]) {
+        const auto &i=m.instructions[index];const auto *p=m.w+i.offset;
+        if(i.op==Bitcast) {reason=xbg_quad_skip::bit_pattern;return false;}
+        if(m.int_type(i.type)) {reason=xbg_quad_skip::integer_flow;return false;}
+        if(i.op==Store) {
+            bool readback=false;
+            uint32_t root=m.pointer_root(p[1]);
+            for(const auto &other:m.instructions)if(other.op==Load && other.wc>=4 && m.pointer_root(m.w[other.offset+3])==root)readback=true;
+            if(i.wc==3 && p[2]==id && m.storage(p[1])==Output && !readback)continue;
+            reason=xbg_quad_skip::memory_flow;return false;
+        }
+        if(i.op==IsNan || i.op==IsInf || (i.op>=180 && i.op<=191))continue;
+        if(!i.id || !m.float_type(i.type) || (!numeric_op(i.op) && !numeric_ext(m,i))) {reason=xbg_quad_skip::unknown_use;return false;}
+        if(!uses_safe(m,i.id,seen,reason,depth+1))return false;
+    }
+    return true;
+}
 }
 
-size_t xbg_spirv_quad_derivatives(const uint32_t *in, size_t n, std::vector<uint32_t> &out) {
-    out.clear();
-    if (n < 5 || in[0] != 0x07230203u) return 0;
-    uint32_t bound = in[3];
-    // Pass 1: what the module already has.
-    bool has_deriv = false; size_t first_cap = 0, entry = 0, first_type = 0, first_func = 0;
-    uint32_t fragcoord = 0, lane_var = 0, t_bool = 0, t_uint = 0, t_int = 0, t_float = 0, t_v4f = 0, t_ptr_in_v4f = 0;
-    uint32_t c_u0 = 0, c_u1 = 0, c_u2 = 0, c_f0 = 0;
-    std::vector<size_t> shuffles;
-    struct Type { uint32_t op, a, b; };
-    std::vector<Type> types(bound, Type{0, 0, 0});   // by id: OpTypeInt (width, signedness) / OpTypeFloat (width) / OpTypePointer (class, pointee)
-    std::vector<uint32_t> var_type(bound, 0);        // global OpVariable: pointer type
-    for (size_t i = 5; i < n;) {
-        uint32_t wc = in[i] >> 16, op = in[i] & 0xffff;
-        if (!wc || i + wc > n) return 0;
-        if (op == OpCapability) { if (!first_cap) first_cap = i; if (in[i + 1] == CapDerivativeControl) has_deriv = true; }
-        else if (op == OpEntryPoint) { if (in[i + 1] != ModelFragment) return 0; if (!entry) entry = i; }
-        else if (op == OpDecorate && wc >= 4 && in[i + 2] == DecBuiltIn) {
-            if (in[i + 3] == BuiltInFragCoord) fragcoord = in[i + 1];
-            else if (in[i + 3] == BuiltInSubgroupLocalInvocationId) lane_var = in[i + 1];
-        }
-        if (!first_func) {
-            if (is_global_decl(op) && !first_type) first_type = i;
-            if (op == OpTypeBool) t_bool = in[i + 1];
-            else if (op == OpTypeInt && wc == 4 && in[i + 1] < bound) { types[in[i + 1]] = {op, in[i + 2], in[i + 3]}; if (in[i + 2] == 32) (in[i + 3] ? t_int : t_uint) = in[i + 1]; }
-            else if (op == OpTypeFloat && wc == 3 && in[i + 1] < bound) { types[in[i + 1]] = {op, in[i + 2], 0}; if (in[i + 2] == 32) t_float = in[i + 1]; }
-            else if (op == OpTypeVector && wc == 4 && in[i + 2] && in[i + 2] == t_float && in[i + 3] == 4) t_v4f = in[i + 1];
-            else if (op == OpTypePointer && wc == 4 && in[i + 1] < bound) { types[in[i + 1]] = {op, in[i + 2], in[i + 3]}; if (in[i + 2] == StorageInput && t_v4f && in[i + 3] == t_v4f) t_ptr_in_v4f = in[i + 1]; }
-            else if (op == OpConstant && wc == 4) {
-                if (t_uint && in[i + 1] == t_uint) { if (in[i + 3] == 0 && !c_u0) c_u0 = in[i + 2]; if (in[i + 3] == 1 && !c_u1) c_u1 = in[i + 2]; if (in[i + 3] == 2 && !c_u2) c_u2 = in[i + 2]; }
-                if (t_float && in[i + 1] == t_float && in[i + 3] == 0 && !c_f0) c_f0 = in[i + 2];
-            }
-            else if (op == OpVariable && wc >= 4 && in[i + 2] < bound) var_type[in[i + 2]] = in[i + 1];
-        }
-        if (op == OpFunction && !first_func) first_func = i;
-        if (op == OpGroupNonUniformShuffle && wc == 6 && t_float && in[i + 1] == t_float) shuffles.push_back(i);
-        i += wc;
+const char *xbg_spirv_quad_skip_name(xbg_quad_skip reason) {
+    static const char *const names[]={"malformed","module_contract","non_float","lane_index","control_flow","bit_pattern","integer_flow","unknown_source","unknown_use","memory_flow"};
+    auto index=static_cast<size_t>(reason);return index<static_cast<size_t>(xbg_quad_skip::count)?names[index]:"invalid_reason";
+}
+
+size_t xbg_spirv_quad_derivatives(const uint32_t *in,size_t n,std::vector<uint32_t> &out,xbg_spirv_quad_stats *stats) {
+    out.clear();xbg_spirv_quad_stats local;auto &s=stats?*stats:local;s={};
+    auto skip=[&](xbg_quad_skip reason){++s.skipped[static_cast<size_t>(reason)];};
+    if(!in || n<5 || in[0]!=0x07230203 || !in[3] || in[3]>(1u<<22) || n>(1u<<24)) {skip(xbg_quad_skip::malformed);return 0;}
+    Module m(in,n);if(!parse(m)) {skip(xbg_quad_skip::malformed);return 0;}
+    struct Plan {size_t index;uint32_t mask;};std::vector<Plan> plans;
+    bool contract=m.entry_count==1 && m.fragment && m.origin_upper && m.first_type && m.first_func && m.first_cap && m.t_float && m.t_uint && m.lane_var;
+    const auto *lane=m.def(m.lane_var);
+    contract=contract && lane && lane->op==Variable && lane->type<m.bound && m.types[lane->type].op==TypePointer &&
+        m.types[lane->type].a==Input && m.int_type(m.types[lane->type].b) && m.types[m.types[lane->type].b].a==32;
+    if(m.coord_var) {
+        const auto *coord=m.def(m.coord_var);
+        contract=contract && coord && coord->op==Variable && coord->type<m.bound && m.types[coord->type].op==TypePointer &&
+            m.types[coord->type].a==Input && m.types[coord->type].b==m.t_vec4;
     }
-    if (shuffles.empty() || !entry || !first_cap || !first_type || !first_func || !lane_var || !t_float || !t_uint) return 0;
-    // The lane variable's pointee (uint, or int: then bitcast); an index of int type is bitcast too.
-    uint32_t lane_ptr = var_type[lane_var] < bound ? var_type[lane_var] : 0, lane_t = lane_ptr ? types[lane_ptr].b : 0;
-    if (!lane_t || types[lane_t].op != OpTypeInt || types[lane_t].a != 32) return 0;
-    // Pass 2: new ids for whatever is missing.
-    std::vector<uint32_t> decl, deco;   // global declarations to add before the first function, decorations before the first type
-    auto fresh = [&] { return bound++; };
-    if (!t_uint) { t_uint = fresh(); decl.insert(decl.end(), {inst(OpTypeInt, 4), t_uint, 32, 0}); }
-    if (!t_bool) { t_bool = fresh(); decl.insert(decl.end(), {inst(OpTypeBool, 2), t_bool}); }
-    if (!c_u0) { c_u0 = fresh(); decl.insert(decl.end(), {inst(OpConstant, 4), t_uint, c_u0, 0}); }
-    if (!c_u1) { c_u1 = fresh(); decl.insert(decl.end(), {inst(OpConstant, 4), t_uint, c_u1, 1}); }
-    if (!c_u2) { c_u2 = fresh(); decl.insert(decl.end(), {inst(OpConstant, 4), t_uint, c_u2, 2}); }
-    if (!c_f0) { c_f0 = fresh(); decl.insert(decl.end(), {inst(OpConstant, 4), t_float, c_f0, 0}); }
-    bool new_fragcoord = !fragcoord;
-    if (new_fragcoord) {
-        if (!t_v4f) { t_v4f = fresh(); decl.insert(decl.end(), {inst(OpTypeVector, 4), t_v4f, t_float, 4}); }
-        if (!t_ptr_in_v4f) { t_ptr_in_v4f = fresh(); decl.insert(decl.end(), {inst(OpTypePointer, 4), t_ptr_in_v4f, StorageInput, t_v4f}); }
-        fragcoord = fresh(); decl.insert(decl.end(), {inst(OpVariable, 4), t_ptr_in_v4f, fragcoord, StorageInput});
-        deco.insert(deco.end(), {inst(OpDecorate, 4), fragcoord, DecBuiltIn, BuiltInFragCoord});
-    } else if (!t_v4f) return 0;   // an existing FragCoord needs its vec4 type known
-    // Pass 3: write the module.
-    out.reserve(n + 64 + shuffles.size() * 96);
-    out.insert(out.end(), in, in + 5);
-    size_t next_shuffle = 0;
-    for (size_t i = 5; i < n;) {
-        uint32_t wc = in[i] >> 16;
-        if (i == first_cap && !has_deriv) out.insert(out.end(), {inst(OpCapability, 2), CapDerivativeControl});
-        if (i == first_type) out.insert(out.end(), deco.begin(), deco.end());
-        if (i == first_func) out.insert(out.end(), decl.begin(), decl.end());
-        if (i == entry && new_fragcoord) { out.push_back(inst(OpEntryPoint, wc + 1)); out.insert(out.end(), in + i + 1, in + i + wc); out.push_back(fragcoord); i += wc; continue; }
-        if (next_shuffle < shuffles.size() && i == shuffles[next_shuffle]) {
-            ++next_shuffle;
-            uint32_t res = in[i + 2], val = in[i + 4], idxu = in[i + 5];   // the shuffle's index is an unsigned integer by rule
-            uint32_t lane0 = fresh(), lane = lane0;
-            out.insert(out.end(), {inst(OpLoad, 4), lane_t, lane0, lane_var});
-            if (lane_t != t_uint) { lane = fresh(); out.insert(out.end(), {inst(OpBitcast, 4), t_uint, lane, lane0}); }
-            uint32_t mask = fresh(), mx = fresh(), my = fresh(), hx = fresh(), hy = fresh();
-            out.insert(out.end(), {inst(OpBitwiseXor, 5), t_uint, mask, idxu, lane});
-            out.insert(out.end(), {inst(OpBitwiseAnd, 5), t_uint, mx, mask, c_u1});
-            out.insert(out.end(), {inst(OpBitwiseAnd, 5), t_uint, my, mask, c_u2});
-            out.insert(out.end(), {inst(OpINotEqual, 5), t_bool, hx, mx, c_u0});
-            out.insert(out.end(), {inst(OpINotEqual, 5), t_bool, hy, my, c_u0});
-            uint32_t dx = fresh(), dy = fresh(), fc = fresh(), fx = fresh(), fy = fresh(), ux = fresh(), uy = fresh(), px = fresh(), py = fresh(), rx = fresh(), ry = fresh();
-            out.insert(out.end(), {inst(OpDPdxFine, 4), t_float, dx, val});
-            out.insert(out.end(), {inst(OpDPdyFine, 4), t_float, dy, val});
-            out.insert(out.end(), {inst(OpLoad, 4), t_v4f, fc, fragcoord});
-            out.insert(out.end(), {inst(OpCompositeExtract, 5), t_float, fx, fc, 0});
-            out.insert(out.end(), {inst(OpCompositeExtract, 5), t_float, fy, fc, 1});
-            out.insert(out.end(), {inst(OpConvertFToU, 4), t_uint, ux, fx});
-            out.insert(out.end(), {inst(OpConvertFToU, 4), t_uint, uy, fy});
-            out.insert(out.end(), {inst(OpBitwiseAnd, 5), t_uint, px, ux, c_u1});
-            out.insert(out.end(), {inst(OpBitwiseAnd, 5), t_uint, py, uy, c_u1});
-            out.insert(out.end(), {inst(OpINotEqual, 5), t_bool, rx, px, c_u0});
-            out.insert(out.end(), {inst(OpINotEqual, 5), t_bool, ry, py, c_u0});
-            uint32_t ndx = fresh(), ndy = fresh(), sdx = fresh(), sdy = fresh(), tx = fresh(), ty = fresh(), a = fresh();
-            out.insert(out.end(), {inst(OpFNegate, 4), t_float, ndx, dx});
-            out.insert(out.end(), {inst(OpFNegate, 4), t_float, ndy, dy});
-            out.insert(out.end(), {inst(OpSelect, 6), t_float, sdx, rx, ndx, dx});   // right column: v - dx; left: v + dx
-            out.insert(out.end(), {inst(OpSelect, 6), t_float, sdy, ry, ndy, dy});   // lower row: v - dy; upper: v + dy
-            out.insert(out.end(), {inst(OpSelect, 6), t_float, tx, hx, sdx, c_f0});
-            out.insert(out.end(), {inst(OpSelect, 6), t_float, ty, hy, sdy, c_f0});
-            out.insert(out.end(), {inst(OpFAdd, 5), t_float, a, val, tx});
-            out.insert(out.end(), {inst(OpFAdd, 5), t_float, res, a, ty});
-            i += wc; continue;
+    for(size_t index=0;index<m.instructions.size();++index) {
+        const auto &i=m.instructions[index];if(i.op!=Shuffle)continue;++s.candidates;
+        const auto *p=in+i.offset;
+        if(i.wc!=6) {skip(xbg_quad_skip::malformed);continue;}
+        if(i.type!=m.t_float) {skip(xbg_quad_skip::non_float);continue;}
+        if(!contract) {skip(xbg_quad_skip::module_contract);continue;}
+        if(i.fn!=m.entry_fn || std::find(m.unsafe_functions.begin(),m.unsafe_functions.end(),i.fn)!=m.unsafe_functions.end()) {skip(xbg_quad_skip::control_flow);continue;}
+        xbg_quad_skip reason=xbg_quad_skip::unknown_source;std::vector<uint8_t> visited(m.bound);
+        if(!source_safe(m,p[4],visited,reason)) {skip(reason);continue;}
+        // 来源同时被当作位模式/整数/私有存储使用时也不能推定为纯数值。
+        // A source also consumed as bits, integers or private storage is not proven purely numeric.
+        std::fill(visited.begin(),visited.end(),0);
+        if(!uses_safe(m,p[4],visited,reason)) {skip(reason);continue;}
+        std::fill(visited.begin(),visited.end(),0);
+        if(!uses_safe(m,p[2],visited,reason)) {skip(reason);continue;}
+        uint32_t scope=0,mask=0;const auto *idx=m.def(p[5]);bool index_ok=false;
+        if(m.constant(p[3],scope) && scope==3 && idx && idx->op==BitwiseXor && idx->wc==5) {
+            const auto *q=in+idx->offset;
+            index_ok=(m.lane_value(q[3]) && m.constant(q[4],mask)) || (m.lane_value(q[4]) && m.constant(q[3],mask));
         }
-        out.insert(out.end(), in + i, in + i + wc);
-        i += wc;
+        if(!index_ok || mask<1 || mask>3) {skip(xbg_quad_skip::lane_index);continue;}
+        plans.push_back({index,mask});
     }
-    out[3] = bound;
-    return shuffles.size();
+    if(plans.empty())return 0;
+    uint32_t bound=m.bound;auto fresh=[&](){return bound++;};
+    std::vector<uint32_t> declarations,decorations;
+    if(!m.t_bool) {m.t_bool=fresh();declarations.insert(declarations.end(),{word(TypeBool,2),m.t_bool});}
+    uint32_t one=fresh(),zero=fresh();
+    declarations.insert(declarations.end(),{word(Constant,4),m.t_uint,one,1,word(Constant,4),m.t_uint,zero,0});
+    bool new_coord=!m.coord_var;
+    if(new_coord) {
+        if(!m.t_vec4) {m.t_vec4=fresh();declarations.insert(declarations.end(),{word(TypeVector,4),m.t_vec4,m.t_float,4});}
+        if(!m.t_ptr4) {m.t_ptr4=fresh();declarations.insert(declarations.end(),{word(TypePointer,4),m.t_ptr4,Input,m.t_vec4});}
+        m.coord_var=fresh();declarations.insert(declarations.end(),{word(Variable,4),m.t_ptr4,m.coord_var,Input});
+        decorations.insert(decorations.end(),{word(Decorate,4),m.coord_var,BuiltIn,FragCoord});
+    }
+    if(bound+plans.size()*64>0x3fffff) {skip(xbg_quad_skip::malformed);return 0;}
+    out.insert(out.end(),in,in+5);size_t next=0;
+    auto emit=[&](std::initializer_list<uint32_t> words){out.insert(out.end(),words.begin(),words.end());};
+    auto nonfinite=[&](uint32_t value) {
+        uint32_t nan=fresh(),inf=fresh(),bad=fresh();
+        emit({word(IsNan,4),m.t_bool,nan,value});emit({word(IsInf,4),m.t_bool,inf,value});emit({word(LogicalOr,5),m.t_bool,bad,nan,inf});return bad;
+    };
+    for(size_t index=0;index<m.instructions.size();++index) {
+        const auto &i=m.instructions[index];const auto *p=in+i.offset;
+        if(i.offset==m.first_cap && !m.derivatives)emit({word(Capability,2),51});
+        if(i.offset==m.first_type)out.insert(out.end(),decorations.begin(),decorations.end());
+        if(i.offset==m.first_func)out.insert(out.end(),declarations.begin(),declarations.end());
+        if(i.offset==m.entry_offset && new_coord) {out.push_back(word(EntryPoint,i.wc+1));out.insert(out.end(),p+1,p+i.wc);out.push_back(m.coord_var);continue;}
+        if(next<plans.size() && plans[next].index==index) {
+            uint32_t mask=plans[next++].mask,original=fresh(),coord=fresh();
+            emit({word(Shuffle,6),p[1],original,p[3],p[4],p[5]});
+            emit({word(Load,4),m.t_vec4,coord,m.coord_var});
+            uint32_t value=p[4],bad=nonfinite(value);
+            auto merge_bad=[&](uint32_t v){uint32_t other=nonfinite(v),combined=fresh();emit({word(LogicalOr,5),m.t_bool,combined,bad,other});bad=combined;};
+            auto neighbour=[&](uint32_t source,uint32_t axis) {
+                uint32_t derivative=fresh(),component=fresh(),integer=fresh(),parity=fresh(),odd=fresh(),negative=fresh(),signed_delta=fresh(),result=fresh();
+                emit({word(axis?DPdyFine:DPdxFine,4),m.t_float,derivative,source});
+                emit({word(CompositeExtract,5),m.t_float,component,coord,axis});
+                emit({word(ConvertFToU,4),m.t_uint,integer,component});
+                emit({word(BitwiseAnd,5),m.t_uint,parity,integer,one});
+                emit({word(INotEqual,5),m.t_bool,odd,parity,zero});
+                emit({word(FNegate,4),m.t_float,negative,derivative});
+                emit({word(Select,6),m.t_float,signed_delta,odd,negative,derivative});
+                emit({word(FAdd,5),m.t_float,result,source,signed_delta});
+                merge_bad(derivative);merge_bad(result);return result;
+            };
+            if(mask&1)value=neighbour(value,0);
+            if(mask&2)value=neighbour(value,1);
+            emit({word(Select,6),m.t_float,p[2],bad,original,value});
+            ++s.rewritten;++s.guarded_nonfinite;
+        } else out.insert(out.end(),p,p+i.wc);
+    }
+    out[3]=bound;return s.rewritten;
+}
+size_t xbg_spirv_quad_derivatives(const uint32_t *in,size_t n,std::vector<uint32_t> &out) {
+    return xbg_spirv_quad_derivatives(in,n,out,nullptr);
 }

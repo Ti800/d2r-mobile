@@ -12,6 +12,8 @@
 #include "xbg_framebuffer.h"
 #include "xbg_clear.h"
 #include "xbg_blit.h"
+#include "xbg_bc_policy.h"
+#include "xbg_writeback_policy.h"
 #include "xbg_clear_spv.h"
 #include "xbg_spirv_quad.h"
 #include "xbg_spirv_warp.h"
@@ -424,7 +426,7 @@ void cpu_access(uint64_t address,uint64_t bytes,unsigned why=0);   // resolve pe
 void resolve_pending();
 void resolve_slot_writebacks(const void *slot);
 void resolve_known_reports();
-extern bool resolving_pending;
+extern bool resolving_pending,read_preflight;
 // perf, by caller (0 other, 1 vertex, 2 index, 3 storage, 4 texel, 5 uniform): snap_site_bytes = bytes copied in full,
 // snap_site_req = bytes asked for, before the vertex cache, write tracking and pending-result views (their copies are logged
 // on their own lines: vcache fills, wtrack copied_kb).
@@ -527,7 +529,7 @@ bool no_occlusion_queries=false;uint64_t occlusion_queries=0,samples_reports=0,s
 struct TexelKey{uint64_t base,bytes;uint32_t format;bool operator==(const TexelKey &o)const{return base==o.base&&bytes==o.bytes&&format==o.format;}};
 struct TexelKeyHash{size_t operator()(const TexelKey &k)const{uint64_t x=k.base*0x9E3779B97F4A7C15ull^k.bytes*0xC2B2AE3D27D4EB4Full^k.format;x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
 struct TexelResident{Buffer buffer;VkBufferView view{};uint64_t hash=0,used=0,gen=0,checked=0,check_epoch=0;};   // checked: verified in this submission
-std::unordered_map<TexelKey,TexelResident,TexelKeyHash> texel_resident[2];Arena texel_arena[2];uint64_t texel_hole_bytes[2]={};
+std::unordered_map<TexelKey,TexelResident,TexelKeyHash> texel_resident[2];Arena texel_arena[2];uint64_t texel_hole_bytes[2]={},texel_live_bytes[2]={};
 bool texel_memo_enabled=true;uint64_t texel_gen=0,texel_refreshes=0,texel_fallbacks=0,texel_evictions=0,texel_hits=0;
 // A copy verified earlier in this submission stays valid until an in-stream CPU write overlaps it (snapshot_invalidate
 // bumps texel_write_epoch), so a ~1 MB range bound by 558 draws is hashed once per frame, not per draw.
@@ -895,7 +897,7 @@ constexpr size_t min_bytes=1u<<20;constexpr unsigned max_regions=8,versions=2;bo
 struct Region{std::atomic<uintptr_t> begin{0},end{0};std::atomic<uint8_t> *dirty=nullptr;};
 Region regions[max_regions];std::atomic<unsigned> nregions{0};struct sigaction previous{};bool installed=false,host_hooks=false;
 // Re-enable writes to the tracked pages in [a,a+len) and mark them dirty. Signal-safe: atomics and mprotect only.
-bool unprotect(uintptr_t a,size_t len){bool any=false;unsigned n=nregions.load(std::memory_order_acquire);
+bool unprotect(uintptr_t a,size_t len){if(!len || a>UINTPTR_MAX-len)return false;bool any=false;unsigned n=nregions.load(std::memory_order_acquire);
     for(unsigned i=0;i<n;i++){uintptr_t b=regions[i].begin.load(std::memory_order_relaxed),e=regions[i].end.load(std::memory_order_relaxed);
         uintptr_t lo=std::max(a,b),hi=std::min(a+len,e);if(lo>=hi)continue;size_t p0=(lo-b)>>12,p1=(hi-1-b)>>12;
         if(mprotect(reinterpret_cast<void*>(b+(p0<<12)),(p1-p0+1)<<12,PROT_READ|PROT_WRITE))continue;
@@ -1304,14 +1306,13 @@ void invalidate_cpu_range(uint64_t address,uint64_t bytes){CPU_SCOPE(CpuWrite);
 }
 
 bool resolving_pending=false;
-// gfx-wb-skip (see wb_skip): a later pending writeback covers this one's range, which only the GPU reads.
+// 仅后续写回完整覆盖、池明确不允许CPU读且无图像alias时跳过；半开范围溢出不成立。
+// Skip only when a later writeback fully covers a known CPU_NO_ACCESS range with no image alias; overflowing half-open ranges never qualify.
 bool writeback_superseded(size_t i){
-    if(!wb_skip || !nvn_pool_flags || ab_off("wbskip"))return false;
-    const PendingWriteback &w=pending_writebacks[i];bool newer=false;
-    for(size_t k=i+1;k<pending_writebacks.size() && !newer;k++){const PendingWriteback &n=pending_writebacks[k];newer=n.addr<=w.addr && n.addr+n.bytes>=w.addr+w.bytes;}
-    if(!newer)return false;
-    int flags=nvn_pool_flags(reinterpret_cast<const void*>(uintptr_t(w.addr)),size_t(w.bytes));if(flags<0 || !(flags&NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS))return false;
-    bool image=false;for_images_overlapping(w.addr,w.bytes,[&](Image &){image=true;});return !image;
+    static_assert(NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS==1,"Writeback pool flag contract changed");
+    return xbg_wb_superseded(pending_writebacks,i,wb_skip && nvn_pool_flags && !ab_off("wbskip"),
+        [](uint64_t address,uint64_t bytes){return nvn_pool_flags(reinterpret_cast<const void*>(uintptr_t(address)),size_t(bytes));},
+        [](uint64_t address,uint64_t bytes){bool image=false;for_images_overlapping(address,bytes,[&](Image &){image=true;});return image;});
 }
 // Writebacks of a slot whose fence has signalled can be applied without waiting.
 void resolve_slot_writebacks(const void *slot){
@@ -1354,13 +1355,28 @@ void resolve_pending(){
     apply_ready_events();
     resolving_pending=false;
 }
+// 先完成待写回/报告，再取得命令缓冲、描述符、图像或槽引用；同步会提交并退役槽。
+// Resolve writebacks/reports before acquiring command, descriptor, image or slot references; synchronization submits and retires slots.
+// 保守同步可能减少异步重叠；范围化优化须另验整个调用链。
+// Conservative synchronization may reduce asynchronous overlap; range-based optimization needs whole-call-chain validation.
+// 默认开启，与 main 相同；宿主可设 DM_GFX_READ_PREFLIGHT=0 关闭（标记 gfx-read-preflight 为 1 / 0 时以标记为准）。
+// Android 关闭：延后事件下几乎总有报告待写，每个 draw 前同步会让 GPU 与翻译串行；Redmi K50 Ultra 营地与 Den of Evil
+// 战斗的记录中，没有一次 CPU 读碰到待写回或待写报告（NVN PERF 的 why=a0）。
+// On by default, as on main; a host sets DM_GFX_READ_PREFLIGHT=0 to turn it off (a gfx-read-preflight marker, 1 / 0,
+// wins). Android does: with deferred events a report is nearly always pending, so a sync before every draw would serialize
+// the GPU with translation, and in the Redmi K50 Ultra camp and Den of Evil fight logs no CPU read ever met a pending
+// writeback or report (why=a0 in NVN PERF).
+bool read_preflight=true;
+void preflight_cpu_reads(){if(read_preflight)resolve_pending();}
 void cpu_access(uint64_t address,uint64_t bytes,unsigned why){
+    if(!bytes)return;
+    need(xbg_wb_range_valid(address,bytes),"CPU access range overflow");
     if(resolving_pending)return;
-    for(auto &w:pending_writebacks)if(address<w.addr+w.bytes && address+bytes>w.addr){++perf.why_access;if(why<12)++perf.access_by[why];resolve_pending();return;}
+    for(auto &w:pending_writebacks)if(xbg_wb_overlaps(address,bytes,w.addr,w.bytes)){++perf.why_access;if(why<12)++perf.access_by[why];resolve_pending();return;}
     // GPU reads of counter memory (snapshots) see the last resolved report, i.e.
     // one frame of latency for occlusion-driven effects instead of a full stall.
     if(why==1 || why==2)return;
-    for(auto &r:pending_reports)if(address<r.addr+sizeof(NVNcounterData) && address+bytes>r.addr){++perf.why_access;++perf.access_by[7];resolve_pending();return;}
+    for(auto &r:pending_reports)if(xbg_wb_overlaps(address,bytes,r.addr,sizeof(NVNcounterData))){++perf.why_access;++perf.access_by[7];resolve_pending();return;}
 }
 // Guest fence completion. Work recorded for submitted guest command buffers is
 // complete when every frame slot is retired; deferred results are then resolved.
@@ -1408,10 +1424,12 @@ struct ImgFront{uint64_t serial=0,epoch=0;Image *im=nullptr;};ImgFront img_front
 Image *find_image(uint64_t serial){ImgFront &f=img_front[(serial*0x9E3779B97F4A7C15ull)>>54];if(f.epoch==images_epoch && f.serial==serial)return f.im;
     auto it=images.find(serial);if(it==images.end())return nullptr;f.serial=serial;f.epoch=images_epoch;f.im=it->second.get();return f.im;}
 Image &get_image_slow(const tex_t *t,bool upload);
+Image &get_image_read(const tex_t *t,bool upload);
 // The common case, about 10k times a D2R camp frame: the image is in the front cache, and either nothing is uploaded or it was
 // checked in this submission already, so none of get_image_slow's checks would run. Inline, without the slow path's large
 // frame and timing scope. Provenance logging takes the slow path.
 inline Image &get_image(const tex_t *t,bool upload){
+    if(read_preflight)return get_image_read(t,upload);
     if(img_fast && t && t->serial && t->magic==MAGIC('T','E','X',0) && !provenance_file){
         const ImgFront &front=img_front[(t->serial*0x9E3779B97F4A7C15ull)>>54];
         if(front.epoch==images_epoch && front.serial==t->serial){Image &im=*front.im;
@@ -1512,6 +1530,15 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
         Buffer staging=stream_buffer(linear.size(),linear.data(),linear.size(),false);for(auto &copy:copies)copy.bufferOffset+=staging.offset;Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,copies.size(),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();im.uploaded=true;provenance_write(im,__LINE__);im.cpu_hash=hash_memory(t->mem,t->L.size);im.checked_submission=stats.submissions;
     }
     provenance_image(upload?"GET_UPLOAD":"GET",t,im);return im;
+}
+// read_preflight: main's order (cc91eb1). Copy the descriptor, resolve CPU reads of its storage, then look the image up.
+Image &get_image_read(const tex_t *t,bool upload){
+    need(t && t->serial && t->magic==MAGIC('T','E','X',0),"Invalid NVN texture");
+    need(!t->mem || xbg_wb_range_valid(uint64_t(uintptr_t(t->mem)),t->L.size),"Texture CPU read range overflow or empty");
+    bool read=upload || images.find(t->serial)==images.end();
+    return xbg_image_after_cpu_access(*t,read,
+        [](uint64_t address,uint64_t bytes){cpu_access(address,bytes,9);},
+        [upload](const tex_t &stable)->Image &{return get_image_slow(&stable,upload);});
 }
 const RegisteredTexture &null_texture(const xbg_shader_binding &b){
     // Original host evidence: main+0x1746820 explicitly binds descriptor 0xFFFFF
@@ -1630,13 +1657,20 @@ void validate_capabilities(const std::vector<uint32_t> &w,uint32_t stage){
     need((subgroup.supportedOperations&groups)==groups,"Required subgroup operations unavailable");if(group_operations)need(subgroup.supportedStages&(1u<<stage),"Actual subgroup operation unsupported in shader stage");
 }
 // Fragment-shader quad-neighbour shuffles rewritten to fine derivatives (xbg_spirv_quad.cpp): on Adreno the shuffles read
-// garbage in helper invocations, and in the D2R Den of Evil fight the NaNs became black squares around units. Both module
+// garbage in helper invocations. The conservative correction skips bit patterns and unproved control/index flows. Both module
 // loaders apply it, so the warm-up builds the same modules the game binds. Off unless the host asks
 // (DM_GFX_QUAD_DERIVATIVES, which the Android app sets to 1; marker gfx-quad-derivatives = 1 / 0).
 bool quad_derivatives=false;std::atomic<uint64_t> quad_rewrites{0};
-void quad_rewrite(std::vector<uint32_t> &words,uint32_t stage){
-    if(!quad_derivatives || stage!=4)return;std::vector<uint32_t> out;size_t k=xbg_spirv_quad_derivatives(words.data(),words.size(),out);
+void quad_rewrite(std::vector<uint32_t> &words,uint32_t stage,const char *key,const char *loader){
+    if(!quad_derivatives || stage!=4)return;
+    std::vector<uint32_t> out;xbg_spirv_quad_stats counts;
+    size_t k=xbg_spirv_quad_derivatives(words.data(),words.size(),out,&counts);
     if(k){words.swap(out);quad_rewrites.fetch_add(k,std::memory_order_relaxed);}
+    if(counts.candidates){
+        char line[768];int at=snprintf(line,sizeof(line),"NVN quad shader=%s loader=%s candidates=%zu rewritten=%zu guarded_nonfinite=%zu",key,loader,counts.candidates,k,counts.guarded_nonfinite);
+        for(size_t r=0;r<size_t(xbg_quad_skip::count) && at<int(sizeof(line))-64;++r)if(counts.skipped[r])at+=snprintf(line+at,sizeof(line)-at," skip_%s=%zu",xbg_spirv_quad_skip_name(xbg_quad_skip(r)),counts.skipped[r]);
+        xbg_logf("%s",line);
+    }
 }
 // Compute modules translated for 32-lane warps, on wider subgroups (xbg_spirv_warp.cpp): every 32 lanes act as their own
 // warp, as the Ryujinx translator emits for wider hosts. On Adreno (64-lane subgroups) the clutter, grass, fluid and PPR
@@ -1644,9 +1678,14 @@ void quad_rewrite(std::vector<uint32_t> &words,uint32_t stage){
 // the host asks (DM_GFX_WARP32, which the Android app sets to 1; marker gfx-warp32 = 1 / 0), and only where subgroups are
 // wider than 32 lanes.
 bool warp32=false;std::atomic<uint64_t> warp_rewrites{0};
-void warp_rewrite(std::vector<uint32_t> &words,uint32_t stage){
-    if(!warp32 || stage!=5 || subgroup.subgroupSize<=32)return;std::vector<uint32_t> out;size_t k=xbg_spirv_warp32(words.data(),words.size(),subgroup.subgroupSize,out);
-    if(k){words.swap(out);warp_rewrites.fetch_add(k,std::memory_order_relaxed);}
+void warp_rewrite(std::vector<uint32_t> &words,uint32_t stage,const char *key,const char *loader){
+    if(!warp32 || stage!=5 || subgroup.subgroupSize<=32)return;
+    std::vector<uint32_t> out;size_t k=xbg_spirv_warp32(words.data(),words.size(),subgroup.subgroupSize,out);
+    if(k){
+        // A vote-only module can acquire Ballot capability during rewriting; check the transformed requirements too.
+        validate_capabilities(out,stage);words.swap(out);warp_rewrites.fetch_add(k,std::memory_order_relaxed);
+        xbg_logf("NVN warp32 shader=%s loader=%s subgroupSize=%u rewrites=%zu",key,loader,subgroup.subgroupSize,k);
+    }
 }
 // Two exact clean-ups of the translator's output, after the rewrites above (they match its form), in both module loaders. Each
 // is off unless the host asks; the Android app sets both to 1, and a marker file (1 / 0) still wins.
@@ -1678,7 +1717,7 @@ Shader *load_shader(const void *control){
     xbg_shader_header h;memcpy(&h,bytes.data(),sizeof(h));need(h.magic==0x31534758 && h.version==1 && h.stage<6 && h.binding_count<=256 && h.input_count<=16 && h.c1_bytes<=65536 && h.spirv_bytes%4==0,"Invalid shader bundle header");
     size_t offset=sizeof(h),expected=offset+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes+h.spirv_bytes;need(expected==bytes.size(),"Shader bundle extent mismatch");
     auto p=std::make_unique<Shader>();p->key=key;p->stage=h.stage;p->bindings.resize(h.binding_count);memcpy(p->bindings.data(),bytes.data()+offset,h.binding_count*sizeof(xbg_shader_binding));offset+=h.binding_count*sizeof(xbg_shader_binding);p->inputs.resize(h.input_count);memcpy(p->inputs.data(),bytes.data()+offset,h.input_count*4);offset+=h.input_count*4;p->c1.assign(bytes.begin()+offset,bytes.begin()+offset+h.c1_bytes);offset+=h.c1_bytes;
-    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);validate_capabilities(words,h.stage);quad_rewrite(words,h.stage);warp_rewrite(words,h.stage);tidy_rewrite(words);
+    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);validate_capabilities(words,h.stage);quad_rewrite(words,h.stage,key.c_str(),"runtime");warp_rewrite(words,h.stage,key.c_str(),"runtime");tidy_rewrite(words);
     {auto extent=spirv_uniform_extent(words);uint32_t trimmed=0;for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM){auto e=extent.find(b.binding);uint32_t declared=b.bytes?b.bytes:65536;if(e!=extent.end() && e->second<declared){b.bytes=e->second;++trimmed;}}uniform_trimmed+=trimmed;}
     {bool kill=false;for(size_t i=5;i<words.size();){uint32_t n=words[i]>>16,op=words[i]&0xffff;if(op==252||op==4416||op==5380){kill=true;break;}if(!n)break;i+=n;}p->discards=kill;}
     p->raster=xbg_spirv_raster_facts(words.data(),words.size(),h.stage);
@@ -1789,7 +1828,7 @@ VkShaderModule load_module(const std::string &key){
     fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);if(n<32 || n>16*1024*1024){fclose(f);return VK_NULL_HANDLE;}std::vector<uint8_t> b(static_cast<size_t>(n));bool ok=fread(b.data(),1,b.size(),f)==b.size();fclose(f);if(!ok)return VK_NULL_HANDLE;
     xbg_shader_header h;memcpy(&h,b.data(),sizeof(h));if(h.magic!=0x31534758 || h.version!=1 || h.spirv_bytes%4)return VK_NULL_HANDLE;
     size_t off=sizeof(h)+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes;if(off+h.spirv_bytes!=b.size())return VK_NULL_HANDLE;
-    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(key,w);quad_rewrite(w,h.stage);warp_rewrite(w,h.stage);tidy_rewrite(w);
+    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(key,w);quad_rewrite(w,h.stage,key.c_str(),"warm");warp_rewrite(w,h.stage,key.c_str(),"warm");tidy_rewrite(w);
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=w.size()*4;ci.pCode=w.data();VkShaderModule m;if(vkCreateShaderModule(cfg.device,&ci,nullptr,&m)!=VK_SUCCESS)return VK_NULL_HANDLE;
     std::lock_guard<std::mutex> l(mu);auto ins=modules.emplace(key,m);if(!ins.second){vkDestroyShaderModule(cfg.device,m,nullptr);return ins.first->second;}return m;
 }
@@ -2127,20 +2166,27 @@ Buffer &driver_block(unsigned ns,unsigned bank){uint64_t gen=bank?tex_gen[ns]:bu
 // within the frame falls back to the per-frame snapshot. A memo entry checks the copy's generation, so an evicted and
 // recreated copy is never mistaken for the one its set holds. gfx-no-texel-memo keeps the former per-frame path.
 TexelResident *texel_acquire(uint64_t base,uint64_t bytes,VkFormat fmt){
-    unsigned si=slot_index;auto &map=texel_resident[si];TexelKey key{base,bytes,uint32_t(fmt)};
+    if(!bytes || base>UINT64_MAX-bytes || bytes>64ull*1024*1024){++texel_fallbacks;return nullptr;}
+    // 待写回的数据走原快照路径，不允许驻留命中绕过 GPU 写入或跨槽排空。
+    // Pending results use the original snapshot path; resident hits must not bypass GPU writes or drain across slots.
+    // 任何重叠都算：没有 read_preflight 时，这里可能还有只覆盖一部分范围的待写回。
+    // Any overlap counts: without read_preflight a pending writeback can cover only part of the range here.
+    for(auto &w:pending_writebacks)if(xbg_wb_overlaps(base,bytes,w.addr,w.bytes)){++texel_fallbacks;return nullptr;}
+    for(auto &r:pending_reports)if(base<r.addr+16 && base+bytes>r.addr){++texel_fallbacks;return nullptr;}
+    for(auto *list:{&pending_events,&recording_events})for(auto &e:*list)if(base<e.addr+4 && base+bytes>e.addr){++texel_fallbacks;return nullptr;}
+    unsigned si=slot_index;need(slots[si].recording && !slots[si].pending,"Texel resident requires a retired recording slot");auto &map=texel_resident[si];TexelKey key{base,bytes,uint32_t(fmt)};
     auto it=map.find(key);
     if(it!=map.end() && it->second.checked==slot_serial && it->second.check_epoch==texel_write_epoch){it->second.used=slot_serial;return &it->second;}
-    cpu_access(base,bytes,8);   // pending GPU results land in guest memory first, as for snapshot()
     uint64_t h=hash_memory(reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));
     if(it==map.end()){
-        if(map.size()>=8192){++texel_fallbacks;return nullptr;}
+        if(map.size()>=8192 || texel_live_bytes[si]+texel_hole_bytes[si]+bytes>64ull*1024*1024){++texel_fallbacks;return nullptr;}
         TexelResident r;r.buffer=texel_arena[si].alloc(size_t(bytes));
         VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=r.buffer.buffer;v.offset=r.buffer.offset;v.format=fmt;v.range=bytes;VK(vkCreateBufferView(cfg.device,&v,nullptr,&r.view));
         memcpy(r.buffer.mapped,reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));r.buffer.flush();r.hash=h;r.used=slot_serial;r.gen=++texel_gen;++texel_refreshes;
         r.checked=slot_serial;r.check_epoch=texel_write_epoch;texel_lo=std::min(texel_lo,base);texel_hi=std::max(texel_hi,base+bytes);
-        return &map.emplace(key,r).first->second;}
+        texel_live_bytes[si]+=bytes;return &map.emplace(key,r).first->second;}
     TexelResident &r=it->second;
-    if(r.hash!=h){if(r.used==slot_serial){++texel_fallbacks;return nullptr;}   // this frame already reads the earlier content
+    if(r.hash!=h){if(r.used==slot_serial){++texel_fallbacks;return nullptr;}   // 本帧已读取旧内容 | This frame already reads earlier contents
         memcpy(r.buffer.mapped,reinterpret_cast<const void*>(uintptr_t(base)),size_t(bytes));r.buffer.flush();r.hash=h;++texel_refreshes;}
     r.used=slot_serial;r.checked=slot_serial;r.check_epoch=texel_write_epoch;return &r;
 }
@@ -2151,11 +2197,13 @@ void texel_touch(uint64_t address,uint64_t bytes){
 // While a slot starts recording (its previous submission retired): drop copies unused for ~128 submissions; when the holes they
 // leave in the slot's arena pass 8 MB, start the slot's store over (memo entries then fail their generation check).
 void texel_evict(unsigned si,bool all){
+    need(!slots[si].pending && (!slots[si].recording || !slots[si].ops),"Evict texel residents only after slot retirement");
     auto &map=texel_resident[si];
-    for(auto it=map.begin();it!=map.end();){if(all || it->second.used+128<slot_serial){vkDestroyBufferView(cfg.device,it->second.view,nullptr);texel_hole_bytes[si]+=it->first.bytes;it=map.erase(it);++texel_evictions;}else ++it;}
-    if(all || texel_hole_bytes[si]>8ull*1024*1024){for(auto &e:map)vkDestroyBufferView(cfg.device,e.second.view,nullptr);map.clear();texel_arena[si].release();texel_hole_bytes[si]=0;}
+    for(auto it=map.begin();it!=map.end();){if(all || it->second.used+128<slot_serial){vkDestroyBufferView(cfg.device,it->second.view,nullptr);texel_hole_bytes[si]+=it->first.bytes;texel_live_bytes[si]-=it->first.bytes;it=map.erase(it);++texel_evictions;}else ++it;}
+    if(all || texel_hole_bytes[si]>8ull*1024*1024){for(auto &e:map)vkDestroyBufferView(cfg.device,e.second.view,nullptr);map.clear();texel_arena[si].release();texel_hole_bytes[si]=texel_live_bytes[si]=0;}
 }
 void descriptors(Descriptors &out,Commands &commands,bool compute){
+    need(!read_preflight || (pending_writebacks.empty() && pending_reports.empty()),"Unresolved CPU reads at descriptor entry");
     uint64_t tm0=perf_clock();struct MemoClock{uint64_t t0;~MemoClock(){}} mc{tm0};
     static std::vector<uint64_t> key;key.clear();static std::vector<uint8_t> ktag;ktag.clear();
     // ktag (which part of the key each word is) only feeds the keydiff census, so it is filled on timed frames only (one in
@@ -2613,7 +2661,7 @@ bool async_skippable(const std::vector<VkPipelineColorBlendAttachmentState> &att
     for(unsigned i=0;i<5;i++)if(state.shader[i]){if(!state.shader[i]->storage_writes.empty())return false;for(auto &b:state.shader[i]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)return false;}
     return true;
 }
-void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){CPU_SCOPE(Draw);DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
+void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){preflight_cpu_reads();CPU_SCOPE(Draw);DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
     need(state.rt.n>=0 && state.rt.n<=8,"Invalid draw color target count");
     VkShaderModule modules[5]{};for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=state.shader[i]->module;
     uint32_t active_colors=0;for(int i=0;i<state.rt.n;i++)if(state.rt.color[i])active_colors|=1u<<i;
@@ -2719,7 +2767,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     {DRAW_SCOPE(Writeback);if(capture.active){if(d.needs_writeback())gpu_sync(perf.sync_writeback);d.writeback();}else d.defer_writeback();}stats.draws.fetch_add(1,std::memory_order_relaxed);   // diagnostics only: a seq_cst add (LDADDAL) waits for every earlier store, ~2.7% of the render thread
     if(capture.active){capture_pass(p);d.capture_read_images();capture.active=false;}
 }
-void dispatch(const p_dispatch &p){CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=state.shader[5]->module;ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}vkCmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkCmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());int prof_dispatch=pass_prof_compute_begin(c.command,p);vkCmdDispatch(c.command,p.x,p.y,p.z);pass_prof_complete(c.command,prof_dispatch);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
+void dispatch(const p_dispatch &p){preflight_cpu_reads();CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=state.shader[5]->module;ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}vkCmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkCmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());int prof_dispatch=pass_prof_compute_begin(c.command,p);vkCmdDispatch(c.command,p.x,p.y,p.z);pass_prof_complete(c.command,prof_dispatch);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
 
 struct MaskedClear {
     VkShaderModule vs{},fs{};VkPipelineLayout layout{};VkPipeline pipeline{};
@@ -2746,7 +2794,7 @@ struct MaskedClear {
         if(color)vkCmdPushConstants(c.command,layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,16,color);vkCmdDraw(c.command,3,1,0,0);
     }
 };
-void clear_attachment(const p_clear_color *color,const p_clear_ds *depth,int scalar=0){
+void clear_attachment(const p_clear_color *color,const p_clear_ds *depth,int scalar=0){preflight_cpu_reads();
     VkClearAttachment a{};uint32_t cm=0,sm=0;bool partial=false;p_clear_color converted{};
     if(color){
         need(color->index>=0 && color->index<state.rt.n && state.rt.color[color->index],"Clear color attachment missing");need((uint32_t(color->mask)&~15u)==0,"Invalid color clear mask");cm=uint32_t(color->mask);
@@ -2831,10 +2879,22 @@ bool guest_texture_write(const tex_t *t,unsigned level,unsigned layer,const NVNc
     }
     return true;
 }
-void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
+void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){preflight_cpu_reads();
+    need(request.tex,"Null buffer image texture");
+    tex_t stable=*request.tex;p_copy_b2t p=request;p.tex=&stable;
+    // 同步必须先于Image映射/引用；深度拆平面、BC解码和颜色复制随后才可读源字节。
+    // Synchronize before acquiring any Image mapping/reference; depth-plane splitting, BC decoding and color copying may read source bytes only afterwards.
+    if(p.tex->mem && p.tex->L.size)cpu_access(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size,9);
+    if(!to_buffer){
+        int bw=1,bh=1;int bpb=nvn_fmt_bpb(p.tex->d.format,&bw,&bh);xbg_depth_format depth;
+        if(xbg_depth_format_info(p.tex->d.format,&depth)==0){bw=bh=1;bpb=int(depth.packed_bytes);}
+        size_t row,image,bytes;
+        need(bpb>0 && nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,bw,bh,bpb,state.copy_stride,state.copy_image_stride,&row,&image,&bytes) && bytes<=256ull*1024*1024,"Invalid buffer image CPU read range");
+        cpu_access(p.src,bytes,9);
+    }
     Image &im=get_image(p.tex,to_buffer);
     if(p.has_view && p.view.set_format)(void)im.view_format(&p.view);
-    if(im.samples!=VK_SAMPLE_COUNT_1_BIT || (im.decoded&&to_buffer))   // native BC reads back in its own branch below
+    if(im.samples!=VK_SAMPLE_COUNT_1_BIT || (im.decoded&&to_buffer))   // 原生BC在下方独立读回 | Native BC reads back in its own branch below
         xbg_fatalf("NVN %s format=%#x samples=%u region=%d,%d,%d:%dx%dx%d needs %s",to_buffer?"CopyTextureToBuffer":"CopyBufferToTexture",p.tex->d.format,uint32_t(im.samples),p.r.xoffset,p.r.yoffset,p.r.zoffset,p.r.width,p.r.height,p.r.depth,im.decoded?"compressed readback encoding":"depth/stencil or multisample packing");
     need((p.flags&~NVN_COPY_FLAGS_ENGINE_2D_BIT)==0,"Buffer/texture copy flags not implemented");
     uint32_t level=p.has_view&&p.view.set_levels?p.view.base_level:0,layer=p.has_view&&p.view.set_layers?p.view.min_layer:0;region_check(im,level,layer,p.r);need(p.src,"Null buffer image copy address");
@@ -2864,25 +2924,31 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
         }else im.gpu_written=true,provenance_write(im,__LINE__);
         xbg_logf("NVN depth %s serial=%llu format=%#x level=%u layer=%u region=%dx%dx%d planes=%zu",to_buffer?"readback":"upload",(unsigned long long)p.tex->serial,p.tex->d.format,level,layer,p.r.width,p.r.height,p.r.depth,copies.size());return;
     }
-    if(!im.decoded && p.tex->d.format>=0x41 && p.tex->d.format<=0x50){   // native BC: blocks as they are, both directions
+    if(!im.decoded && p.tex->d.format>=0x41 && p.tex->d.format<=0x50){ // 原生BC保持块编码 | Native BC retains block encoding
         int bw,bh,bpb=nvn_fmt_bpb(p.tex->d.format,&bw,&bh);need(bw==4 && bh==4 && !(p.r.xoffset%4) && !(p.r.yoffset%4),"BC copy origin must be block aligned");
         need(p.r.width%4==0 || uint32_t(p.r.xoffset+p.r.width)==std::max(1u,im.width>>level),"BC copy width must reach a block or mip edge");
         need(p.r.height%4==0 || uint32_t(p.r.yoffset+p.r.height)==std::max(1u,im.height>>level),"BC copy height must reach a block or mip edge");
-        size_t blocks=(size_t(p.r.width)+3)/4,rows=(size_t(p.r.height)+3)/4,tight=blocks*bpb,row=state.copy_stride?state.copy_stride:tight;
-        need(row>=tight && row%bpb==0 && row<=256ull*1024*1024/rows/p.r.depth,"Invalid BC copy row stride/extent");
-        size_t bytes=row*rows*(p.r.depth-1)+row*(rows-1)+tight;
-        if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,bytes,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
-            if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,row*rows)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
-        if(!to_buffer)cpu_access(p.src,bytes,9);
-        Buffer b=to_buffer?readback_buffer(bytes):stream_buffer(bytes,reinterpret_cast<void*>(p.src),bytes,false);
+        XbgBcCopyRows plan{};need(xbg_bc_copy_rows(p.r.width,p.r.height,p.r.depth,bpb,state.copy_stride,state.copy_image_stride,&plan)==0,"Invalid BC copy row/image stride/extent");
+        need(p.src<=UINT64_MAX-plan.guest_bytes,"BC copy address overflow");
+        if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,plan.guest_bytes,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
+            if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),plan.row,plan.image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
+        std::vector<uint8_t> packed;
+        if(!to_buffer){
+            cpu_access(p.src,plan.guest_bytes,9);
+            // 部分覆盖前上传初始全部mip/层；已有GPU内容沿用，不重建或转码。
+            // Upload initial mips/layers before partial writes; retain existing GPU contents without recreation or transcoding.
+            if(!xbg_copy_is_full({im.width,im.height,im.layers,im.levels,level,layer,p.r.xoffset,p.r.yoffset,p.r.zoffset,p.r.width,p.r.height,p.r.depth}))get_image(p.tex,true);
+            packed.resize(plan.packed_bytes);need(xbg_bc_copy_transfer(packed.data(),packed.size(),reinterpret_cast<const void*>(p.src),plan.guest_bytes,plan,false)==0,"BC upload packing failed");
+        }
+        Buffer b=to_buffer?readback_buffer(plan.packed_bytes):stream_buffer(plan.packed_bytes,packed.data(),plan.packed_bytes,false);
         Commands c;im.transition(c.command,to_buffer?VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkBufferImageCopy r{};r.bufferOffset=b.offset;r.bufferRowLength=uint32_t(row/bpb*4);r.bufferImageHeight=uint32_t(rows*4);r.imageSubresource=copy_layers(im,level,layer,p.r);r.imageOffset=copy_offset(im,p.r);r.imageExtent=copy_extent(im,p.r);
+        VkBufferImageCopy r{};r.bufferOffset=b.offset;r.imageSubresource=copy_layers(im,level,layer,p.r);r.imageOffset=copy_offset(im,p.r);r.imageExtent=copy_extent(im,p.r);
         if(to_buffer)vkCmdCopyImageToBuffer(c.command,im.image,im.layout,b.buffer,1,&r);else vkCmdCopyBufferToImage(c.command,b.buffer,im.image,im.layout,1,&r);
         im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();
-        if(to_buffer){gpu_sync(perf.sync_readback);b.invalidate();invalidate_cpu_range(p.src,bytes);   // only the block bytes of each row: the gaps of a wider stride are the guest's
-            for(size_t z=0;z<size_t(p.r.depth);z++)for(size_t y=0;y<rows;y++){size_t o=(z*rows+y)*row;memcpy(reinterpret_cast<uint8_t*>(p.src)+o,static_cast<const uint8_t*>(b.mapped)+o,tight);}}
+        if(to_buffer){gpu_sync(perf.sync_readback);b.invalidate();invalidate_cpu_range(p.src,plan.guest_bytes);
+            need(xbg_bc_copy_transfer(reinterpret_cast<void*>(p.src),plan.guest_bytes,b.mapped,plan.packed_bytes,plan,true)==0,"BC readback unpacking failed");}
         else im.gpu_written=true,provenance_write(im,__LINE__);
-        {static unsigned n=0;if(n++<20)xbg_logf("NVN BC native %s format=%#x level=%u layer=%u region=%dx%dx%d bytes=%zu",to_buffer?"readback":"upload",p.tex->d.format,level,layer,p.r.width,p.r.height,p.r.depth,bytes);}
+        {static unsigned n=0;if(n++<20)xbg_logf("NVN BC native %s format=%#x level=%u layer=%u region=%dx%dx%d bytes=%zu",to_buffer?"readback":"upload",p.tex->d.format,level,layer,p.r.width,p.r.height,p.r.depth,plan.packed_bytes);}
         return;
     }
     if(im.decoded){
@@ -2893,7 +2959,7 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
         need(nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,bw,bh,bpb,state.copy_stride,state.copy_image_stride,&row,&image,&source_bytes) && row%bpb==0 && source_bytes<=256ull*1024*1024,"Invalid BC copy row stride/extent");
         need(p.src<=UINT64_MAX-source_bytes,"BC copy address overflow");
         size_t bytes=size_t(p.r.width)*p.r.height*p.r.depth*im.bpp;
-        if(!im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,source_bytes,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
+        if(!im.gpu_written && !(p.tex->d.flags&0x10)){invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
             if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
         need(bytes<=256ull*1024*1024,"Decoded BC staging exceeds memory bound");std::vector<uint8_t> decoded(bytes);
         int result=xbg_decode_bc_linear(p.tex->d.format,p.r.width,p.r.height,p.r.depth,reinterpret_cast<const void*>(p.src),source_bytes,row,image,decoded.data(),decoded.size());
@@ -2906,14 +2972,14 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
     size_t row,image,n;
     need(nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,1,1,im.bpp,state.copy_stride,state.copy_image_stride,&row,&image,&n) && n<=256ull*1024*1024,"Invalid or oversized color copy stride/extent");
     need(p.src<=UINT64_MAX-n,"Color copy address overflow");
-    if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,n,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
+    if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
         if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
     size_t slice_alignment=4;while(slice_alignment%im.bpp)slice_alignment+=4;
     size_t staging_row=size_t(p.r.width)*im.bpp;
     size_t staging_image=((staging_row*size_t(p.r.height)+slice_alignment-1)/slice_alignment)*slice_alignment,staging_bytes=staging_image*size_t(p.r.depth);
     need(staging_bytes<=256ull*1024*1024,"Color staging exceeds memory bound");
     std::vector<uint8_t> upload;
-    if(!to_buffer){cpu_access(p.src,n,9);upload.resize(staging_bytes);
+    if(!to_buffer){upload.resize(staging_bytes);
         for(int k=0;k<p.r.depth;k++)for(int y=0;y<p.r.height;y++)
             memcpy(upload.data()+size_t(k)*staging_image+size_t(y)*staging_row,reinterpret_cast<const uint8_t*>(p.src)+size_t(k)*image+size_t(y)*row,size_t(p.r.width)*im.bpp);
     }
@@ -2937,23 +3003,23 @@ void copy_texture_buffer(const p_copy_b2t &p,bool to_buffer){
         }
     }else im.gpu_written=true,provenance_write(im,__LINE__);
 }
-void copy_texture(const p_copy_t2t &p){Image &s=get_image(p.src,true),&d=get_image(p.dst,false);{static unsigned n=0;if(n++<60)xbg_logf("NVN COPYT2T src=%llu fmt=%#x %ux%ux%u L%u lv%u -> dst=%llu fmt=%#x %ux%u L%u lv%u decoded=%d/%d region=%d,%d,%d %dx%dx%d -> %d,%d,%d sv=%d/%u/%u dv=%d/%u/%u",(unsigned long long)p.src->serial,p.src->d.format,s.width,s.height,s.depth,s.layers,s.levels,(unsigned long long)p.dst->serial,p.dst->d.format,d.width,d.height,d.layers,d.levels,int(s.decoded),int(d.decoded),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.has_sv?p.sv.base_level:0,p.has_sv?p.sv.min_layer:0,int(p.has_dv),p.has_dv?p.dv.base_level:0,p.has_dv?p.dv.min_layer:0);}
+void copy_texture(const p_copy_t2t &p){preflight_cpu_reads();Image &s=get_image(p.src,true),&d=get_image(p.dst,false);{static unsigned n=0;if(n++<60)xbg_logf("NVN COPYT2T src=%llu fmt=%#x %ux%ux%u L%u lv%u -> dst=%llu fmt=%#x %ux%u L%u lv%u decoded=%d/%d region=%d,%d,%d %dx%dx%d -> %d,%d,%d sv=%d/%u/%u dv=%d/%u/%u",(unsigned long long)p.src->serial,p.src->d.format,s.width,s.height,s.depth,s.layers,s.levels,(unsigned long long)p.dst->serial,p.dst->d.format,d.width,d.height,d.layers,d.levels,int(s.decoded),int(d.decoded),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.has_sv?p.sv.base_level:0,p.has_sv?p.sv.min_layer:0,int(p.has_dv),p.has_dv?p.dv.base_level:0,p.has_dv?p.dv.min_layer:0);}
     if(p.has_sv && p.sv.set_format)(void)s.view_format(&p.sv);
     if(p.has_dv && p.dv.set_format)(void)d.view_format(&p.dv);
-    // No-BC + ASTC pack (iOS copy_t2t_astc): the game copies file textures (now ASTC 4x4) block-for-block into its own BC3 arrays,
-    // which we decode to RGBA8. Same-size NEAREST blit decodes ASTC exactly; sRGB-ness matches on both sides (BC3 sRGB <-> ASTC sRGB).
+    // 已知ASTC-pack源是ASTC4x4，目的BC3及既有RGBA BC目标从建图起解码，不迁移已有内容。
+    // Known ASTC-pack sources use ASTC4x4; BC3 and existing RGBA BC destinations are decoded at creation without migrating contents.
     if(!s.decoded && d.decoded && s.fmt>=VK_FORMAT_ASTC_4x4_UNORM_BLOCK && s.fmt<=VK_FORMAT_ASTC_4x4_SRGB_BLOCK && (d.fmt==VK_FORMAT_R8G8B8A8_UNORM || d.fmt==VK_FORMAT_R8G8B8A8_SRGB)
        && p.sr.width==p.dr.width && p.sr.height==p.dr.height && p.sr.depth==p.dr.depth && s.source.d.target!=2 && d.source.d.target!=2){
         VkFormatProperties sf{},df{};vkGetPhysicalDeviceFormatProperties(cfg.physical,s.fmt,&sf);vkGetPhysicalDeviceFormatProperties(cfg.physical,d.fmt,&df);
-        need((sf.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (df.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_DST_BIT),"ASTC to decoded-BC copy needs blit support");
         uint32_t sl=p.has_sv&&p.sv.set_levels?p.sv.base_level:0,dl=p.has_dv&&p.dv.set_levels?p.dv.base_level:0,sa=p.has_sv&&p.sv.set_layers?p.sv.min_layer:0,da=p.has_dv&&p.dv.set_layers?p.dv.min_layer:0;
         region_check(s,sl,sa,p.sr);region_check(d,dl,da,p.dr);need(&s!=&d,"Same-image copy needs overlap validation");
         bool full_destination=xbg_copy_is_full({d.width,d.height,d.layers,d.levels,dl,da,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,p.dr.width,p.dr.height,p.dr.depth})!=0;
         if(!full_destination)get_image(p.dst,true);
-        VkImageBlit blit{};blit.srcSubresource=copy_layers(s,sl,sa,p.sr);blit.dstSubresource=copy_layers(d,dl,da,p.dr);
-        VkOffset3D so=copy_offset(s,p.sr),dof=copy_offset(d,p.dr);VkExtent3D e=copy_extent(s,p.sr);
-        blit.srcOffsets[0]=so;blit.srcOffsets[1]={so.x+int32_t(e.width),so.y+int32_t(e.height),so.z+1};blit.dstOffsets[0]=dof;blit.dstOffsets[1]={dof.x+int32_t(e.width),dof.y+int32_t(e.height),dof.z+1};
-        Commands c;s.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);d.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdBlitImage(c.command,s.image,s.layout,d.image,d.layout,1,&blit,VK_FILTER_NEAREST);
+        XbgBlitRegion source{s.width,s.height,s.layers,s.levels,sl,sa,p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth};
+        XbgBlitRegion destination{d.width,d.height,d.layers,d.levels,dl,da,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,p.dr.width,p.dr.height,p.dr.depth};
+        VkImageBlit blit{};VkFilter filter{};
+        need(xbg_astc_bc_plan(s.fmt,d.fmt,source,destination,uint32_t(p.flags),sf.optimalTilingFeatures,df.optimalTilingFeatures,&blit,&filter)==0,"ASTC to decoded-BC copy requires matching sRGB, supported regions/flags and blit features");
+        Commands c;s.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);d.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdBlitImage(c.command,s.image,s.layout,d.image,d.layout,1,&blit,filter);
         s.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);d.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();d.gpu_written=true,provenance_write(d,__LINE__);
         {static unsigned n=0;if(n++<8)xbg_logf("NVN ASTC2BC blit src=%llu fmt=%#x -> dst=%llu fmt=%#x %dx%d lv%u/%u layer%u/%u",(unsigned long long)p.src->serial,p.src->d.format,(unsigned long long)p.dst->serial,p.dst->d.format,p.sr.width,p.sr.height,sl,dl,sa,da);}
         return;
@@ -3003,7 +3069,7 @@ void partial_clear_texture(Image &im,const p_clear_tex &request,uint32_t level,u
     }
     im.gpu_written=true,provenance_write(im,__LINE__);
 }
-void clear_texture(const p_clear_tex &input){
+void clear_texture(const p_clear_tex &input){preflight_cpu_reads();
     p_clear_tex p=input;
     Image &im=get_image(p.tex,false);need((uint32_t(p.mask)&~15u)==0,"Invalid texture clear mask");if(!p.mask)return;
     uint32_t level=p.has_view&&p.view.set_levels?p.view.base_level:0,layer=p.has_view&&p.view.set_layers?p.view.min_layer:0;
@@ -3048,7 +3114,9 @@ void clear_texture(const p_clear_tex &input){
 }
 // Buffer copy whose source is a pending GPU result: copy on the GPU and keep
 // the destination pending too, instead of stalling for the CPU memmove.
-bool gpu_buffer_copy(uint64_t src,uint64_t dst,uint64_t n){
+// 保守门暂时使 pending-view 链接回退CPU；恢复前须证明源readback跨退役仍存活。
+// The conservative gate temporarily falls back to CPU for pending-view chains; restore only after proving source readback lifetime across retirement.
+bool gpu_buffer_copy(uint64_t src,uint64_t dst,uint64_t n){preflight_cpu_reads();
     if(!n || (src<dst+n && dst<src+n))return false;
     for(auto &w:pending_writebacks)if(dst<w.addr+w.bytes && dst+n>w.addr)return false;
     Buffer view;if(!pending_view(src,n,1,view))return false;
@@ -3057,7 +3125,7 @@ bool gpu_buffer_copy(uint64_t src,uint64_t dst,uint64_t n){
     VkBufferCopy region{view.offset,b.offset,n};vkCmdCopyBuffer(s.cmd,view.buffer,b.buffer,1,&region);full_barrier(s.cmd);
     pending_writebacks.push_back({dst,n,b,&s});return true;
 }
-void resolve_texture(const p_copy_t2t &p){
+void resolve_texture(const p_copy_t2t &p){preflight_cpu_reads();
     Image &s=get_image(p.src,true),&d=get_image(p.dst,false);
     need(s.samples!=VK_SAMPLE_COUNT_1_BIT && d.samples==VK_SAMPLE_COUNT_1_BIT && s.fmt==d.fmt,"Resolve requires matching MS source / single-sample destination");
     need(s.aspects==VK_IMAGE_ASPECT_COLOR_BIT && d.aspects==VK_IMAGE_ASPECT_COLOR_BIT,"Depth/stencil resolve mode is not yet verified against original NVN");
@@ -3085,7 +3153,7 @@ void execute_draw_call(const xbg_draw_call &p){
         draw(p.primitive,0,p.count,&indexed);
     }
 }
-void execute_indirect(const xbg_indirect &p,bool single){
+void execute_indirect(const xbg_indirect &p,bool single){preflight_cpu_reads();
     need(p.arguments && p.max_count>=0 && p.max_count<=1000000,"Invalid indirect draw request");
     uint32_t count=1;
     if(!single){
@@ -3274,6 +3342,8 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
       xbg_logf("NVN superseded storage writebacks skipped=%d pool_flags=%d (marker gfx-wb-skip)",int(wb_skip),int(nvn_pool_flags!=nullptr));}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-memo").c_str(),"rb");pipe_memo=false;pipe_memo_valid=false;if(m){pipe_memo=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_PIPE_MEMO"))pipe_memo=atoi(e)!=0;
       xbg_logf("NVN pipeline memo for repeated draw state=%d (marker gfx-pipe-memo)",int(pipe_memo));}
+     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-read-preflight").c_str(),"rb");read_preflight=true;if(m){read_preflight=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_READ_PREFLIGHT"))read_preflight=atoi(e)!=0;
+      xbg_logf("NVN CPU reads resolved before each operation=%d (marker gfx-read-preflight)",int(read_preflight));}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-async-pipelines").c_str(),"rb");warm::async_on=false;if(m){warm::async_on=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_ASYNC_PIPELINES"))warm::async_on=atoi(e)!=0;
       xbg_logf("NVN background builds for skippable draws=%d (marker gfx-async-pipelines)",int(warm::async_on));}
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
@@ -3411,8 +3481,8 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     return fence<=completed;
 }
 extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(initialized,"Queue finish before Vulkan initialization");++perf.why_finish;complete_all();VK(vkQueueWaitIdle(cfg.queue));}
-static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}if(r)xbg_fatalf("Game presentation failed: %d",r);++stats.presents;if(pass_prof_enabled && stats.presents.load()==pass_prof_frame)xbg_logf("NVN GPASS boundary frame=%llu slots=%u skipped_slots=%u reserved_queries=%u max_queries=%u max_slots=%u",(unsigned long long)pass_prof_frame,pass_prof_slots,pass_prof_skipped_slots,pass_prof_queries,pass_prof_query_limit,pass_prof_slot_limit);perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
-extern "C" void xbg_legacy_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyRegion *r,uint8_t *dst,size_t row,size_t image){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(t&&r&&dst,"Invalid ReadTexels arguments");auto found=images.find(t->serial);if(found==images.end() || !found->second->gpu_written){int bw,bh,bpp=nvn_fmt_bpb(t->d.format,&bw,&bh);need(bpp && r->xoffset==0 && r->yoffset==0 && r->zoffset==0 && r->depth==1 && uint32_t(r->width)==std::max(1u,t->d.width>>level) && uint32_t(r->height)==std::max(1u,t->d.height>>level),"CPU ReadTexels partial region unsupported");need(!(t->d.flags&0x10),"Linear CPU ReadTexels not implemented");need(nvn_deswizzle(&t->d,level,layer,t->mem,dst,row)==0,"ReadTexels deswizzle failed");}
+static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}if(r)xbg_fatalf("Game presentation failed: %d",r);++stats.presents;if(pass_prof_enabled && stats.presents.load()==pass_prof_frame)xbg_logf("NVN GPASS boundary frame=%llu slots=%u skipped_slots=%u reserved_queries=%u max_queries=%u max_slots=%u",(unsigned long long)pass_prof_frame,pass_prof_slots,pass_prof_skipped_slots,pass_prof_queries,pass_prof_query_limit,pass_prof_slot_limit);perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
+extern "C" void xbg_legacy_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyRegion *r,uint8_t *dst,size_t row,size_t image){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();need(t&&r&&dst,"Invalid ReadTexels arguments");auto found=images.find(t->serial);if(found==images.end() || !found->second->gpu_written){int bw,bh,bpp=nvn_fmt_bpb(t->d.format,&bw,&bh);need(bpp && r->xoffset==0 && r->yoffset==0 && r->zoffset==0 && r->depth==1 && uint32_t(r->width)==std::max(1u,t->d.width>>level) && uint32_t(r->height)==std::max(1u,t->d.height>>level),"CPU ReadTexels partial region unsupported");need(!(t->d.flags&0x10),"Linear CPU ReadTexels not implemented");need(nvn_deswizzle(&t->d,level,layer,t->mem,dst,row)==0,"ReadTexels deswizzle failed");}
     else{p_copy_b2t p{};p.src=uint64_t(dst);p.tex=t;p.has_view=1;p.view.set_levels=p.view.set_layers=1;p.view.base_level=level;p.view.nlevels=1;p.view.min_layer=layer;p.view.nlayers=1;p.r=*r;int64_t old=state.copy_stride,old_image=state.copy_image_stride;state.copy_stride=row;state.copy_image_stride=image;copy_texture_buffer(p,true);state.copy_stride=old;state.copy_image_stride=old_image;}}
 
 // ---- public entry points (queued in order on the graphics thread) ----

@@ -40,10 +40,11 @@ int xbg_game_initialize(const xbg_game_config *config,char *error,size_t error_b
  * or VkPhysicalDeviceVulkan12Features.samplerMirrorClampToEdge enabled (1.2+).
  * Supported-but-not-enabled is false. Default false; existing config ABI intact. */
 int xbg_game_set_sampler_mirror_clamp_to_edge(VkBool32 enabled);
-/* Resolve a deferred command-buffer SignalEvent on this address before the CPU reads it (nvnEventGetValue). */
+/* CPU访问事件前解析覆盖该地址的延后SignalEvent。
+ * Resolve deferred SignalEvents covering this address before CPU event access. */
 void xbg_game_event_read(const void *addr);
-/* Write-tracked storage snapshots with a host-owned SIGSEGV handler: call use_host_hooks once, then route
- * faults (returns 1 if the address was a tracked page) and host writes into guest memory here. */
+/* 宿主管SIGSEGV时先注册use_host_hooks；fault返回是否命中跟踪页，宿主写客体前调用prepare。
+ * With host-owned SIGSEGV, register use_host_hooks first; fault reports tracked-page hits and prepare precedes host writes into guest memory. */
 void xbg_wtrack_use_host_hooks(void);
 int xbg_wtrack_fault(void *addr);
 void xbg_wtrack_prepare(void *addr,size_t len);
