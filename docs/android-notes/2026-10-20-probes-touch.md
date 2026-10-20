@@ -62,4 +62,33 @@ The user played 2.5 minutes on `a0b961c` with production defaults (dynamic scale
 
 ## A second phone: OnePlus 13 (Adreno 830)
 
-PJZ110, Snapdragon 8 Elite (SM8750), Android 17, 2376 × 1080 at 120 Hz, 4 KB pages. It runs the game from the same files as the Redmi (`06ac8b59…`, pre-touch overlay): character select at 60 fps with GPU about 10.5 ms and render-thread CPU about 5.5 ms; camp at fixed 0.75 at 59.1–59.7 fps, render-thread CPU 10.8–11.2 ms, GPU 13.3–14.2 ms. ColorOS caps its CPUs when the app is not in its Games app (the 4.32 GHz cores at 1.2–1.7 GHz during the run), so its CPU numbers are not yet comparable. ColorOS also refuses `adb install`, so APKs are installed by hand there.
+PJZ110, Snapdragon 8 Elite (SM8750), Android 17, 2376 × 1080 at 120 Hz, 4 KB pages. It runs the game from the same files as the Redmi (`06ac8b59…`, pre-touch overlay): character select at 60 fps with GPU about 10.5 ms and render-thread CPU about 5.5 ms; camp at fixed 0.75 at 59.1–59.7 fps, render-thread CPU 10.8–11.2 ms, GPU 13.3–14.2 ms. ColorOS caps its CPUs when the app is not in its Games app (the 4.32 GHz cores at 1.2–1.7 GHz during the run), so its CPU numbers are not yet comparable. ColorOS refuses `adb install` while the screen is locked; once it is unlocked the install goes through.
+
+With `88e3e959…` (merged `linux-build` with the touch overlay) and production defaults the camp runs at 59.5–60.3 fps at 3D scale 0.75, with render-thread CPU 10.7–12.2 ms and GPU 13.2–13.6 ms. The user then played the level-40 Sorceress below for 93 s in the camp and the Blood Moor. Per 1 s window: fps median 59.9, 10th percentile 57.5; GPU median 11.2 ms (maximum 13.9); render-thread CPU median 7.1 ms (90th percentile 9.6), with the CPU caps moving between 1.2 and 4.3 GHz. Of the 12 windows below 58 fps, 4 fall in the first 10 s after entering the game and 3 at the two area changes; the other 5 coincide with first-time pipeline builds for the new spell effects (22–50 ms each, up to 157 ms in one second). The warm-up list records those pipelines, so later runs build them at start. The battery stayed at 33–34 °C.
+
+## A level-40 test character, levelled by the game itself
+
+The host's test switches (`files/dm/env`) give a test character a full set of skills without editing its save:
+
+| Line | Effect |
+|---|---|
+| `DM_TEST_STAT=13=17270791` | at tick 30, experience set to the level-40 mark (`experience.txt`; `k_exp[39]` in `dm_hud_exp.h`) |
+| `DM_TEST_SPAWN=50:19:3,3` | at tick 50, a Fallen pack (class 19) next to the player |
+| `DM_TEST_MON_KILL=19@10` | 10 ticks later, the game's own kill function with the player as the attacker |
+| `DM_TEST_SAVE_AT=250` | the game's own timed save |
+
+The kills' 18 experience points pushed the total past the mark, and the game's own level-up took the Sorceress from level 1 to 40 in one tick: 195 stat points, 39 skill points, life 40 → 79, mana 35 → 113. Skills then go in through the original add-skill-point packet 0x3b. `DM_TEST_SKILL_ADD` sends up to 12 skills a run, prerequisites first, and `DM_TEST_C2S` up to 8 more (`3b`, the skill id in 2 bytes, `00 00`). Two runs gave all 30 Sorceress skills one point each and left 9 skill points; `DM_TEST_GIVE=mp5:2:8,rvl:2:4` with `DM_TEST_GIVE_INV=1` added potions. The character moves between phones as its two save folders (`files/save/<name>` and `files/save.work/<name>`, 7 files each).
+
+## Open: one-frame black lighting tiles at a new point light (OnePlus 13)
+
+The user saw black squares while moving. Screen recordings of walks in the camp show them at each strike of Charsi's hammer: on the frame the strike's spark light appears, the ground in the 2 tiles of the engine's 32 × 20 light-culling grid around it renders black (the edges fall on whole tiles: columns 9.97–10.99 and rows 0.00–2.04 of 1488 × 675), with Charsi, the anvil and the flash drawn over it. The next frame is correct. There were 4 hits in 13 s near the forge. None on the Redmi so far, though Charsi never hammered in view in its runs.
+
+Ruled out:
+
+- **The quad-swap rewrite's gaps.** All 22 helper calls in the 108 fragment shaders of the session carry floats in uniform control flow, by the call-site analysis of PR #27.
+- **The 32-lane-warp rewrite.** It covers both compute shaders with subgroup operations, at 64 and 128 lanes.
+- **NaN handling of min / max / clamp.** With their NaN-safe forms in 118 shaders (through `spv-override`) the tiles remain.
+- **The engine's newer features.** With all of them off (sync mode, about 24 fps) the tiles remain.
+- **Float-to-integer conversion.** Both GPUs saturate and map NaN to 0 as Maxwell does (a compute probe).
+
+Ready for the next try: overrides that turn NaN colour outputs white (is it a NaN at all?), and branch `android/robust2` (`2e9e589`), which with marker `gfx-robust2` enables `robustBufferAccess2` so that reads past a binding return zero as on the Switch.
