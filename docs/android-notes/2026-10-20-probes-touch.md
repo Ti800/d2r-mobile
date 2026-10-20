@@ -66,6 +66,21 @@ PJZ110, Snapdragon 8 Elite (SM8750), Android 17, 2376 × 1080 at 120 Hz, 4 KB pa
 
 With `88e3e959…` (merged `linux-build` with the touch overlay) and production defaults the camp runs at 59.5–60.3 fps at 3D scale 0.75, with render-thread CPU 10.7–12.2 ms and GPU 13.2–13.6 ms. The user then played the level-40 Sorceress below for 93 s in the camp and the Blood Moor. Per 1 s window: fps median 59.9, 10th percentile 57.5; GPU median 11.2 ms (maximum 13.9); render-thread CPU median 7.1 ms (90th percentile 9.6), with the CPU caps moving between 1.2 and 4.3 GHz. Of the 12 windows below 58 fps, 4 fall in the first 10 s after entering the game and 3 at the two area changes; the other 5 coincide with first-time pipeline builds for the new spell effects (22–50 ms each, up to 157 ms in one second). The warm-up list records those pipelines, so later runs build them at start. The battery stayed at 33–34 °C.
 
+## Where the scale-1.0 frame goes: barriers and the driver's shader statistics
+
+On the saturated bench (fixed 3D scale 1.0, camp, 17.3 ms of GPU a frame) the main pass takes 6.9 ms, the depth pre-pass 1.16 ms, two compute passes 0.70 and 0.48 ms, and 14 single-draw full-screen post passes about 4.5 ms together. Comparing passes of 1000 × 450 and 2000 × 900 with similar shaders gives about 40 µs per pass plus about 170 µs per million pixels.
+
+**Barriers are not that fixed cost.** Every game barrier and every compute dispatch records a full `ALL_COMMANDS` barrier, about 99 a frame (66 game barriers, 26 at dispatches). Branch `android/barrier-ab` (`bd02b78`) adds diagnostic A/B targets whose off phases end the pass but record no barrier. In-process A/B, 10 s phases, GPU on − off:
+
+| Target | Barriers skipped per frame | GPU on − off |
+|---|---|---|
+| `gamebar` | 66 | +0.44 ± 0.65 ms (12 pairs) |
+| `dispbar` | 26 | −0.44 ± 0.54 ms (13 pairs); no pass moved by more than 50 µs |
+
+Narrower barriers could at best recover what skipping them all does, so they are not worth writing. Image layouts are not it either: the engine keeps images in `GENERAL` and transitions only around uploads and copies.
+
+**The main-pass fragment shaders are heavy and run at the lowest occupancy.** With `gfx-pipe-stats` the driver reports, for the most-used main-pass fragment shader (`38f344ad…`, 133 draws a frame), 3,614 instructions, 1,872 32-bit ALU instructions, 11 16-bit ones and a footprint of 22 registers, with `Max_active_invocations` 1; the other three main-pass shaders are alike (17–21 registers, 1). Post-chain shaders have 33–260 instructions, 2–5 registers and 3. The SPIR-V of `38f344ad…` holds 775 multiplies, 527 FMAs, 166 adds, 30 inverse square roots and about 40 exp / log against 26 texture operations: real lighting work, nearly all of it 32-bit. An exact rewrite has little to take out; half precision would, but it changes the image.
+
 ## A level-40 test character, levelled by the game itself
 
 The host's test switches (`files/dm/env`) give a test character a full set of skills without editing its save:
