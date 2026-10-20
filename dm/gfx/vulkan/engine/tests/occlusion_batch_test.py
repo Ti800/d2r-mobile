@@ -30,7 +30,10 @@ def main():
     reset = balanced(source, source.index('case OP_RESET_COUNTER:'))
     assert reset.index('end_occlusion_query(') < reset.index('++counter_epoch')
     report = balanced(source, source.index('case OP_REPORT_COUNTER:'))
-    assert report.index('Commands c') < report.index('epochs[counter_epoch].size()')
+    # 样本报告在任何后续 draw 之前用非 draw 的 Commands 结束计数段；时间戳报告不结束 pass，以免切开 tiling pass。
+    # A samples report ends the open run with a non-draw Commands before any later draw; a timestamp report keeps the pass,
+    # so that it does not split a tiling pass.
+    assert 'else{Commands c;' in report and report.index('epochs[counter_epoch].size()') < report.index('else{Commands c;')
     commands = balanced(source, source.index('struct Commands '))
     assert 'end_open_pass()' in commands
     clear = balanced(source, source.index('void clear_attachment('))
@@ -58,8 +61,10 @@ void vkCmdEndQuery(unsigned cmd,unsigned pool,unsigned index){
  unsigned id=pool*256+index;if(active_id!=id || active_cmd!=cmd || pass_cmd!=cmd)failure=4;
  records[id].ended=true;active_id=active_cmd=0;++ends;
 }
-struct OpenPass{unsigned cmd=0;} open_pass;
+struct OpenPass{unsigned cmd=0;bool depth_attached=false,depth_used=false;} open_pass;
 void pass_prof_end(unsigned){}
+// end_open_pass's per-op pass-end and idle-depth counters (diagnostics only).
+uint64_t depth_idle_passes=0,pass_end_by[64]={};unsigned cur_op=0;void pass_prof_depth_idle(unsigned){}
 void vkCmdEndRenderPass(unsigned cmd){if(active_id || pass_cmd!=cmd)failure=7;}
 '''
     model = r'''
