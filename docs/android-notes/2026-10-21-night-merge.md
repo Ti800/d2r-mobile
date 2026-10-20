@@ -122,3 +122,42 @@ Tests: all of main's engine tests run here now (the CPU ones, and the WASM ones 
 Four were adapted to this branch (`test_read_preflight_order`, `pipeline_memo_source_test`, `resident_texel_test`,
 `occlusion_batch_test`) and one fixed (`texture_cache_regression`: stubs for the dirty-page tracker its extracted code
 calls; it had failed on this branch since `e1c5366`).
+
+## Morning: the three open leads (09:00-11:10)
+
+### Where the occlusion queries' 1.75 ms comes from
+
+The per-pass profile on the saturated bench (camp, fixed scale 1.0, one profiled frame in 600; P1 with the queries, P2
+with marker `gfx-no-occlusion`) puts it in the main 3D pass: 6.46 ms a frame with the queries, 7.70 ms without. A
+3-target pass of 34 draws took 0.66 against 1.00 ms. The depth pre-pass, which has the main pass's draws and vertices,
+did not move (1.21 against 1.19 ms), nor did the shadow map or the compute dispatches. The HUD pass (744 four-vertex
+draws) took 0.82 ms with the queries and 0.52 ms without, but leaving the queries out of four-vertex draws alone (A/B
+target `occquad`, E5) changed nothing (GPU −0.07 ± 0.12 ms), so that difference comes with the queries elsewhere. No
+query placement worth changing was found.
+
+### The race between the slots' readback arenas, closed
+
+Two ways of moving the producer's buffers out of the reader's way both cost CPU: a second readback arena 1.72 ± 0.21 ms
+a frame, and the other half of the same chunks 1.85 ± 0.22 ms. About 145 memoized descriptor sets a frame bind read-only
+storage at a fixed buffer and offset, and those missed every frame.
+
+`gfx-xview-guard` (`f03bdf7`) leaves the buffers where they are. A new readback buffer that overlaps a range the reader
+viewed is not written by the CPU: its contents go to a stream buffer, and a prologue command buffer submitted ahead of
+the slot's own copies them in after a barrier that orders the reader's work first. In-process (XG, camp, 20 pairs) it
+wrote 6 buffers, 1.37 MB, a frame from the GPU at no measurable cost: CPU −0.15 ± 0.21 ms, GPU −0.17 ± 0.15 ms. It is on
+by default in the Android app (`4529e08`) and replaces `gfx-xview-arena`. Whether it changes the one-frame black tiles on
+the OnePlus 13 is still to be seen there.
+
+### A first launch: a seed for the warm-up list
+
+A Den of Evil fight as a first launch (`DM_GAME_SEED=12345`, driver pipeline cache removed), from the warp on:
+
+| Run | warm-up list | pipelines built in the fight | long frames | ≥ 50 ms | ≥ 100 ms | worst | p1 fps |
+|---|---|---|---|---|---|---|---|
+| W0 | none | 226 (3.5 s) | 39 | 13 | 6 | 207 ms | 30.7 |
+| W1 | the list file | 0 | 12 | 0 | 0 | 45 ms | 44.4 |
+| W2 | from the seed | 0 | 82 | 2 | 0 | 52 ms | 48.5 |
+
+With a list the warm-up threads built its 392 pipelines at start-up (9.8 s of compile time on 3 threads, none failed).
+`9dec4ac` copies `shaders/vk-pipeline-list.seed` to `files/dm/vk-pipeline-list.bin` while that file does not exist: make
+the seed from devices' lists with `dm/android/tools/merge_warm_lists.py` and ship it with the shaders.
