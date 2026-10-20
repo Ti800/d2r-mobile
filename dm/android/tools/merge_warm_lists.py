@@ -19,7 +19,7 @@ MAX_WORDS = 4096
 
 
 def records(data):
-    """(create-info key bytes, record bytes) for each good record, stopping at the first bad one."""
+    """每条好记录的（建管线信息键字节, 记录字节），到第一条坏记录为止 | (create-info key bytes, record bytes) for each good record, stopping at the first bad one."""
     i, out = 0, []
 
     def get():
@@ -52,7 +52,7 @@ def records(data):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split('\n')[3])
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('lists', nargs='+', help='vk-pipeline-list.bin files, first one first')
     ap.add_argument('-o', '--output', required=True)
     a = ap.parse_args()
