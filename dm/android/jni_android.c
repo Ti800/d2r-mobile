@@ -224,6 +224,12 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // wins). With deferred events a report is nearly always pending, so it would sync the GPU before every draw; in the camp
     // and the Den of Evil fight no CPU read ever met a pending result (NVN PERF why=a0).
     setenv("DM_GFX_READ_PREFLIGHT", "0", 0);
+    // 另一个槽还在读的回读缓冲改由 GPU 在它之后写入（引擎的 gfx-xview-guard；标记文件仍优先）：营地、Den of Evil、奶牛关每帧都有一次
+    // 这种重用；Redmi K50 Ultra 上每帧约 6 个、1.37 MB，进程内对比测不出代价。
+    // Readback buffers the other slot still reads are written by the GPU after it (the engine's gfx-xview-guard; a marker
+    // file still wins): such a reuse happens once a frame in the camp, the Den of Evil and the Cow Level; on the Redmi K50
+    // Ultra about 6 buffers, 1.37 MB, a frame, at no cost measurable in-process.
+    setenv("DM_GFX_XVIEW_GUARD", "1", 0);
     // 顶点与索引的跨帧副本缺省开（引擎的 gfx-vcache；靠 nvn_dirty.c 的写保护脏页跟踪，标记文件仍优先）：营地 CPU 少约 0.7 ms。
     // Cross-frame vertex and index copies on by default (the engine's gfx-vcache, through nvn_dirty.c's write-protect
     // tracking; a marker file still wins): about 0.7 ms less CPU per camp frame on the Redmi K50 Ultra.
