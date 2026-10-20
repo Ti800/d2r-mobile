@@ -114,12 +114,14 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (ext == null) { showStartError(getString(R.string.dmandroidstorage)); return; }
         nativeSurface(view.getHolder().getSurface(), view.getWidth(), view.getHeight());
         updateRefresh();
-        // 资源目录缺省 Download/S2X/D2R Mobile/data；那里没有 .build.config、而早先的 Download/data 有时沿用早先的位置，已装好的手机不必搬数据。
-        // The resource directory defaults to Download/S2X/D2R Mobile/data; when that has no .build.config but the earlier
-        // Download/data does, the earlier one is kept, so existing installs need not move their data.
+        // 资源目录缺省 Download/S2X/D2R Mobile/data；没有这个目录、而早先的 Download/data 在时沿用早先的位置，已装好的手机不必搬数据。
+        // 按目录判断而不按 .build.config：它也可以由导入的覆盖层提供，资源目录里就没有。
+        // The resource directory defaults to Download/S2X/D2R Mobile/data; when that directory does not exist but the earlier
+        // Download/data does, the earlier one is kept, so existing installs need not move their data. The test is the directory,
+        // not .build.config: the imported overlay can provide that file, and then the resource directory has none.
         File downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
         File data = new File(downloads, "S2X/D2R Mobile/data"), earlier = new File(downloads, "data");
-        if (!new File(data, ".build.config").isFile() && new File(earlier, ".build.config").isFile()) data = earlier;
+        if (!data.isDirectory() && earlier.isDirectory()) data = earlier;
         String src = data.getAbsolutePath();
         int result = nativeStart(getFilesDir().getAbsolutePath(), ext.getAbsolutePath(), src, Locale.getDefault().toLanguageTag());
         if (result < 0) {
