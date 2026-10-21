@@ -62,6 +62,8 @@ APK 和 Git 仓库均不含游戏程序、着色器、游戏美术或存档。�
 - **6,927 个是游戏自己着色器的翻译。** 它们出自游戏文件，所以不进 Git、PR 和 APK。本仓还不能从头到尾做出它们：`dm/gfx/tools/dmsh_xlate` 把每个着色器翻译成面向 Vulkan 的 SPIR-V（`<键>.spv` 与 `<键>.res.json`），`dm/gfx/tools/pack_game_shaders.py --bundle <目录> --output <目录>` 把成对的 `<键>.vk.json` + `<键>.spv` 打成包，但两者之间的导出步骤还缺。目前测试用的包由 biglawine 的鸿蒙着色器流程做出。
 - **4 个是 main 程序本体内嵌的查询核**（`q_val0`、`q_val8`、`q_dlt0`、`q_dlt8`；Mac 与 iOS 用 `dm/gfx/nvn/nvn_builtin.h` 里的 MSL 版）。它们是手写的，能从源码做：`python3 dm/gfx/tools/pack_builtin_queries.py --output <新目录>` 用 `glslc`（NDK 的 `shader-tools/` 下就有）编译 `dm/gfx/vulkan/kernels/builtin_queries.comp`，写出这 4 个文件。
 
+一套包还可以附带 `vk-pipeline-list.seed`。首次启动、还没有 `files/dm/vk-pipeline-list.bin` 时，引擎在启动期间编好种子里列出的管线，种子覆盖的地方第一次去就不会因为现编管线而卡。`dm/android/tools/merge_warm_lists.py` 把几台设备的 `files/dm/vk-pipeline-list.bin` 合成一个种子。种子只能和录它时的那套包一起用，所以随包发放。实测见 `docs/android-notes/2026-10-22-first-play-stutter.zh-CN.md`。
+
 ## 验证与剩余工作
 
 执行根目录贡献检查及 `:app:lintDebug`。纯 Java 输入测试不需要手机：

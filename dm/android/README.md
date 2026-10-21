@@ -107,6 +107,14 @@ locations, the c1 bytes, then the SPIR-V (`xbg_shader_header` in
   directory>` compiles `dm/gfx/vulkan/kernels/builtin_queries.comp` with
   `glslc` (the NDK has it under `shader-tools/`) and writes the 4 files.
 
+A bundle set can also carry `vk-pipeline-list.seed`. On a first launch, before
+`files/dm/vk-pipeline-list.bin` exists, the engine builds the pipelines the seed
+lists during start-up, so a first visit to the places it covers does not
+stutter while pipelines build. `dm/android/tools/merge_warm_lists.py` merges
+several devices' `files/dm/vk-pipeline-list.bin` into one seed. A seed only
+works with the bundles it was recorded with, so it ships with them. The
+measurements are in `docs/android-notes/2026-10-22-first-play-stutter.md`.
+
 ## Validation and remaining work
 
 Run the root contribution checks, plus `:app:lintDebug`. The pure Java input
