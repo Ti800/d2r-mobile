@@ -231,12 +231,19 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // Ultra about 6 buffers, 1.37 MB, a frame, at no cost measurable in-process.
     setenv("DM_GFX_XVIEW_GUARD", "1", 0);
     // 本次提交还没用过的图像，整份上传排到提交之前（引擎的 gfx-upload-prologue；标记文件仍优先），不再在帧中间打断通道：Redmi K50 Ultra
-    // 进营地的第一帧 GPU 少约 20 ms（106-114 对 85-95 ms），这一帧的上传 CPU 由约 20 ms 降到 12 ms；平常的帧没有上传，不受影响。
+    // 进营地时打断通道的上传由每次 382-558 个变为 0，第一帧 GPU 85-107 ms（8 次，均值约 96）对关时 106-115 ms（3 次，均值约 109），
+    // 这一帧的上传 CPU 由约 20 ms 降到 12 ms；平常的帧没有上传，不受影响。
     // Whole uploads of images the current submission has not used yet go ahead of it (the engine's gfx-upload-prologue; a
-    // marker file still wins) instead of breaking the open pass mid-frame: on the Redmi K50 Ultra the camp's first frame takes
-    // about 20 ms less GPU time (106-114 against 85-95 ms) and its upload CPU drops from about 20 to 12 ms; ordinary frames
-    // upload nothing and are unaffected.
+    // marker file still wins) instead of breaking the open pass mid-frame: entering the camp on the Redmi K50 Ultra, uploads that
+    // broke a pass went from 382-558 a run to 0, the first frame took 85-107 ms of GPU time (8 runs, mean about 96) against
+    // 106-115 ms off (3 runs, mean about 109), and its upload CPU dropped from about 20 to 12 ms; ordinary frames upload nothing.
     setenv("DM_GFX_UPLOAD_PROLOGUE", "1", 0);
+    // 着色器载入直接用预热线程改写好的 SPIR-V（引擎的 gfx-shader-reuse；标记文件仍优先）：与现场改写逐字相同，每次进营地少约 100 ms 的
+    // 改写 CPU（菜单、进营地、新怪物或新法术出现的帧）；代价是预热留着的、这一局没用到的着色器，约 6-13 MB。
+    // Shader loads take the SPIR-V the warm-up threads already rewrote (the engine's gfx-shader-reuse; a marker file still wins):
+    // word for word what rewriting on the spot gives, it saves about 100 ms of rewrite CPU per camp entry (menus, entering the
+    // camp, frames where a new monster or spell appears); the cost is the kept shaders a session does not load, about 6-13 MB.
+    setenv("DM_GFX_SHADER_REUSE", "1", 0);
     // 顶点与索引的跨帧副本缺省开（引擎的 gfx-vcache；靠 nvn_dirty.c 的写保护脏页跟踪，标记文件仍优先）：营地 CPU 少约 0.7 ms。
     // Cross-frame vertex and index copies on by default (the engine's gfx-vcache, through nvn_dirty.c's write-protect
     // tracking; a marker file still wins): about 0.7 ms less CPU per camp frame on the Redmi K50 Ultra.
