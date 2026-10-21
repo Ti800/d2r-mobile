@@ -99,8 +99,22 @@ that appears at the top edge of the screen, the same signature as the 2026-10-20
 hammer flashes never show them. That light appeared in 5 of today's 13 walks; the other 8 (6 with the guard on) never got
 it.
 
+## What the camp's first frame does on the GPU
+
+A pass profile of frames 2115-2174 (marker `gfx-pass-profile` holding `2115 1 60`, P3) caught it: 100.3 ms of work in a
+100.8 ms span (no idle gaps), 261 passes and dispatches against 64 in an ordinary frame (14.9 ms).
+
+- Compute 64.3 ms, of which one shader, `0f715b1a5e03f11f`, takes 58.6 ms in 196 dispatches of 16 × 16 groups (8 × 8
+  threads, so 128 × 128 a dispatch, about 0.3 ms each). It reads 9 textures with 35 explicit-LOD samples, partly in
+  loops, writes 4 storage images (formatless), and is 43k words long; it runs only in this frame and is not one of the
+  two warp32 shaders. It looks like the game baking the area's ground materials once.
+- Passes 36.0 ms: the main 3D pass took 20.1 ms (618 draws; about 5-6 ms in an ordinary frame), the pre-pass 4.1 ms, the
+  shadow maps 2.7 and 1.2 ms.
+
+So the hitch after entering is the game's own one-time work; making it shorter would mean making that shader faster on
+Adreno.
+
 ## Still open
 
-- The camp's first frame takes 85-107 ms of GPU time, now the whole of the hitch after entering. Next: a pass profile of
-  that frame.
+- The camp's first frame: the bake shader `0f715b1a5e03f11f` (58.6 ms) and the first frame's slow main pass.
 - The black tiles at a new light (OnePlus 13).
