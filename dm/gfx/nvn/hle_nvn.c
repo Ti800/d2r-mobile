@@ -457,7 +457,12 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (mtl_wait(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
     return mtl_wait(o->fence, timeout) ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
-__attribute__((weak)) void mtl_event_read(const volatile uint32_t *val);
+// CPU 访问事件前解析覆盖该地址的延后 SignalEvent（安卓 Vulkan 后端 dm/gfx/vulkan/nvn_vk.c 给强定义）。这里是空的弱定义、不是弱声明：
+// 苹果的链接器要求弱引用在链接时也要有定义，否则 Mac 宿主与 iOS 链接失败（_mtl_event_read 未定义）
+// Resolves deferred SignalEvents covering the address before the CPU accesses an event (the Android Vulkan backend dm/gfx/vulkan/nvn_vk.c
+// gives the strong definition). This is an empty weak definition, not a weak declaration: Apple's linker requires even a weak reference
+// to resolve at link time, or the Mac host and the iOS app fail to link (_mtl_event_read undefined)
+__attribute__((weak)) void mtl_event_read(const volatile uint32_t *val) { (void)val; }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }
 NVN(nvnEventInitialize, NVNboolean, NVNevent *e, const NVNeventBuilder *b) {
