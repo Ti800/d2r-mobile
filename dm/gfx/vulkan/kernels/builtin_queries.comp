@@ -1,7 +1,12 @@
 #version 450
-// Standalone offline feasibility sample derived from sw/gfx/nvn/nvn_builtin.h.
-// Not wired into any product, not an automatic Maxwell translation, not GPU-tested.
-// MODE 0=q_val0, 1=q_val8, 2=q_dlt0, 3=q_dlt8.
+// main 程序本体内嵌的 4 个查询计算核的 GLSL 版，供 Vulkan 后端用；照 dm/gfx/nvn/nvn_builtin.h 的 MSL 版写，不是 Maxwell 自动翻译。
+// 作者 biglawine（鸿蒙移植，biglawine/d2r-mobile codex/harmony-port 544c66c）。
+// MODE 0=q_val0，1=q_val8，2=q_dlt0，3=q_dlt8；dm/gfx/tools/pack_builtin_queries.py 按 MODE 编出 4 个 .xgs。
+// 地址偏移都保留原来的 32 位回绕；用一对 uint，不用 Int64。
+// GLSL versions of the 4 query compute kernels embedded in the main program, for the Vulkan backend; written after the
+// MSL versions in dm/gfx/nvn/nvn_builtin.h, not an automatic Maxwell translation.
+// By biglawine (HarmonyOS port, biglawine/d2r-mobile codex/harmony-port 544c66c).
+// MODE 0=q_val0, 1=q_val8, 2=q_dlt0, 3=q_dlt8; dm/gfx/tools/pack_builtin_queries.py compiles the 4 .xgs by MODE.
 // All address offsets retain the original 32-bit wrap. uint pairs avoid Int64.
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 layout(std140, set = 0, binding = 0) uniform Count { uint n; } count;

@@ -1,4 +1,15 @@
-"""Pack verified .vk.json/.spv into runtime XGS1 files (original bytes external)."""
+# 把导出的 <键>.vk.json（反射）与同名 <键>.spv 打成 XGS1 着色器包 <键>.xgs，Vulkan 后端运行时从 files/dm/shaders/ 读。
+# 出自 biglawine 的鸿蒙移植：biglawine/d2r-mobile codex/harmony-port 544c66c 的 dm/harmony/graphics/pack_game_shaders.py。
+# 包的格式见 dm/gfx/vulkan/engine/xbg_game.h 的 xbg_shader_header：文件头、各绑定、顶点输入位置、c1 字节，然后是 SPIR-V。
+# 游戏着色器的 .vk.json 来自 dmsh_xlate 翻译之后的导出步骤，那一步还不在本仓；4 个查询核的由 pack_builtin_queries.py 现做。
+# Packs an exported <key>.vk.json (reflection) and the <key>.spv of the same name into the XGS1 shader bundle <key>.xgs,
+# which the Vulkan backend reads from files/dm/shaders/ at run time.
+# From biglawine's HarmonyOS port: dm/harmony/graphics/pack_game_shaders.py in biglawine/d2r-mobile codex/harmony-port 544c66c.
+# Bundle layout: see xbg_shader_header in dm/gfx/vulkan/engine/xbg_game.h: the header, the bindings, the vertex input
+# locations, the c1 bytes, then the SPIR-V.
+# For the game's shaders the .vk.json comes from an export step after the dmsh_xlate translation, which is not in this
+# repository yet; for the 4 query kernels pack_builtin_queries.py makes it.
+"""把校验过的 .vk.json/.spv 打成运行时 XGS1 文件（原始字节留在仓外）。 | Pack verified .vk.json/.spv into runtime XGS1 files (original bytes external)."""
 import argparse, hashlib, json, pathlib, struct
 
 TYPES = {'sampler':0,'combined_image_sampler':1,'sampled_image':2,'storage_image':3,
@@ -21,6 +32,7 @@ def pack(path):
         else: raise ValueError(f'unmapped descriptor {b["name"]}: {s}')
         size=1392 if source==1 else b.get('block',{}).get('bytes',0)
         sampler=n.get('sampler_slot'); sampler=0xffffffff if sampler is None else sampler
+        # 没给单独的采样器槽时，用 NVN 组合句柄里的采样器。
         # Without an explicit sampler slot use the sampler in the combined NVN handle.
         flags=0
         if b['type'] in ('storage_image','storage_texel_buffer') and b.get('image',{}).get('format')==0:

@@ -84,6 +84,29 @@ The overlay generator `dm/ios/tools/gen_romfs_overlay.py` supports
 output contains only changes and references the original archives; it must not
 replace the original resource directory.
 
+### Shader bundles
+
+`files/dm/shaders/` holds one `<key>.xgs` for each shader the game uses; the
+key is the first 16 hexadecimal digits of the SHA-256 of the shader's control
+section. A bundle is an XGS1 file: a header, the bindings, the vertex input
+locations, the c1 bytes, then the SPIR-V (`xbg_shader_header` in
+`dm/gfx/vulkan/engine/xbg_game.h`). The set tested so far has 6,931 bundles:
+
+- **6,927 are translations of the game's own shaders.** They are derived from
+  game files, so they stay out of Git, PRs and the APK. This repository cannot
+  make them from start to finish yet. `dm/gfx/tools/dmsh_xlate` translates each
+  shader to SPIR-V for Vulkan (`<key>.spv` and `<key>.res.json`), and
+  `dm/gfx/tools/pack_game_shaders.py --bundle <dir> --output <dir>` packs
+  `<key>.vk.json` + `<key>.spv` pairs into bundles, but the export step between
+  the two is missing. The bundles tested so far were made with biglawine's
+  HarmonyOS shader pipeline.
+- **4 are the query kernels embedded in the main program** (`q_val0`,
+  `q_val8`, `q_dlt0`, `q_dlt8`; Mac and iOS use the MSL versions in
+  `dm/gfx/nvn/nvn_builtin.h`). They are hand-written, so they can be built from
+  source: `python3 dm/gfx/tools/pack_builtin_queries.py --output <new
+  directory>` compiles `dm/gfx/vulkan/kernels/builtin_queries.comp` with
+  `glslc` (the NDK has it under `shader-tools/`) and writes the 4 files.
+
 ## Validation and remaining work
 
 Run the root contribution checks, plus `:app:lintDebug`. The pure Java input
