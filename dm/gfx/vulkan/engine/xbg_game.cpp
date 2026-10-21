@@ -15,6 +15,7 @@
 #include "xbg_bc_policy.h"
 #include "xbg_writeback_policy.h"
 #include "xbg_clear_spv.h"
+#include "xbg_bright_spv.h"
 #include "xbg_spirv_quad.h"
 #include "xbg_spirv_warp.h"
 #include "xbg_spirv_ldc.h"
@@ -30,6 +31,9 @@ __attribute__((weak)) void nvn_dirty_protect(const void *addr,size_t len);
 __attribute__((weak)) uint64_t nvn_dirty_now(void);
 __attribute__((weak)) int nvn_dirty_since(const void *addr,size_t len,uint64_t stamp);
 __attribute__((weak)) void nvn_dirty_slot_stats(int *live,int *used_slots,uint64_t *adds_total);
+// 3D 画面加亮的曝光 k（宿主 dm/host/dm_bright.c）；弱：不链宿主的图形单测不加亮
+// Exposure k of the 3D picture brightening (the host's dm/host/dm_bright.c); weak: graphics unit tests without the host do not brighten
+__attribute__((weak)) float dm_bright_k(void);
 }
 #include <algorithm>
 #include <array>
@@ -848,6 +852,9 @@ void save_pipeline_cache(){
     cache_saver=std::thread([unsaved]{setpriority(PRIO_PROCESS,0,10);write_pipeline_cache(unsaved);cache_save_busy=false;});
 }
 extern bool tex_dirty;extern uint64_t tex_dirty_tracked,tex_dirty_checks,tex_dirty_changed;   // texture checks through the dirty tracker (get_image)
+// 3D 画面加亮的读数（定义在 dispatch 前的 namespace bright）
+// Readings of the 3D picture brightening (defined in namespace bright before dispatch)
+namespace bright{extern bool enabled;extern uint64_t applied;extern float last_k;}
 void perf_frame(){
     {texel_distinct+=texel_frame_keys.size();for(auto k:texel_frame_keys)if(texel_prev_keys.count(k))++texel_reused;texel_prev_keys.swap(texel_frame_keys);texel_frame_keys.clear();}
     if(perf_frame_timed)++perf_timed_frames;perf_frame_timed=perf_sample && stats.presents.load()%perf_sample==0;   // the next frame
@@ -874,6 +881,7 @@ void perf_frame(){
     xbg_logf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f requested vertex=%.2f index=%.2f storage=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f,snap_site_req[1]/1048576.0/f,snap_site_req[2]/1048576.0/f,snap_site_req[3]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;for(auto &b:snap_site_req)b=0;
     xbg_logf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed));
     xbg_logf("NVN PERF snapfront front_hits=%.1f map_hits=%.1f invalidations=%.1f erased=%.1f",snap_front_hits/f,snap_map_hits/f,snap_invalidations/f,snap_invalidated/f);xbg_logf("NVN PERF textures bc_native=%llu bc_decoded=%llu live_images=%.1fMB bc_images=%.1fMB bc_payload=%.1fMB",(unsigned long long)native_bc_images,(unsigned long long)decoded_bc_images,image_bytes_live/1048576.0,bc_image_bytes_live/1048576.0,bc_data_bytes_live/1048576.0);snap_front_hits=snap_map_hits=snap_invalidations=snap_invalidated=0;
+    if(bright::enabled){xbg_logf("NVN PERF bright applied=%.2f k=%.2f",bright::applied/f,bright::last_k);bright::applied=0;}
     if(tex_dirty){xbg_logf("NVN PERF texdirty tracked=%.1f checks=%.1f changed=%.1f",tex_dirty_tracked/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_tracked=tex_dirty_checks=tex_dirty_changed=0;}
     if(vcache::enabled){xbg_logf("NVN PERF vcache hits=%.1f (%.2fMB) fills=%.1f (%.2fMB) refills=%.2f volatile=%llu untracked=%llu flushes=%llu entries=%zu arena=%.1fMB pools=%d",vcache::hits/f,vcache::hit_bytes/1048576.0/f,vcache::fills/f,vcache::fill_bytes/1048576.0/f,vcache::refills/f,(unsigned long long)vcache::volatiles,(unsigned long long)vcache::untracked,(unsigned long long)vcache::flushes,vcache::live(),vcache::arena_bytes()/1048576.0,[]{int live=0,used=0;uint64_t adds=0;if(nvn_dirty_slot_stats)nvn_dirty_slot_stats(&live,&used,&adds);return used;}());vcache::hits=vcache::hit_bytes=vcache::fills=vcache::fill_bytes=vcache::refills=0;}
     {static uint64_t pm=0,pe=0;xbg_logf("NVN PERF pipelines_new=%llu evicted=%llu warm_hits=%llu created=%llu create_ms=%.1f create_max_ms=%.1f warm_built=%llu warm_failed=%llu warm_ms=%.0f async_skips=%llu async_built=%llu",(unsigned long long)(pipeline_counts.misses-pm),(unsigned long long)(pipeline_counts.evictions-pe),(unsigned long long)warm::hits,(unsigned long long)warm::creates,warm::create_ns/1e6,warm::create_max_ns/1e6,(unsigned long long)warm::built.load(),(unsigned long long)warm::failed.load(),warm::build_ns.load()/1e6,(unsigned long long)warm::async_skips.exchange(0),(unsigned long long)warm::async_built.load());warm::hits=warm::creates=warm::create_ns=warm::create_max_ns=0;pm=pipeline_counts.misses;pe=pipeline_counts.evictions;}
@@ -2934,7 +2942,100 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     {DRAW_SCOPE(Writeback);if(capture.active){if(d.needs_writeback())gpu_sync(perf.sync_writeback);d.writeback();}else d.defer_writeback();}stats.draws.fetch_add(1,std::memory_order_relaxed);   // diagnostics only: a seq_cst add (LDADDAL) waits for every earlier store, ~2.7% of the render thread
     if(capture.active){capture_pass(p);d.capture_read_images();capture.active=false;}
 }
-void dispatch(const p_dispatch &p){preflight_cpu_reads();CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=state.shader[5]->module;ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}vkCmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkCmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());int prof_dispatch=pass_prof_compute_begin(c.command,p);vkCmdDispatch(c.command,p.x,p.y,p.z);pass_prof_complete(c.command,prof_dispatch);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
+// 3D 画面加亮（iOS dm/gfx/nvn/nvn_mtl.m bright_lut 的 Vulkan 版；#112 vickwv fe7b655 在 Android 上做过同样的移植）：游戏每帧用
+// 计算着色器 552f45c348a61b86 算色调映射的 32^3 调色表；那次派发之后把表拷一份，用 xbg_bright_lut.comp 按宿主 dm_bright_k() 给的
+// 曝光 k 原地重写。k ≈ 1（局外、正午）不动。只碰 3D 世界：UI、文字、血球在色调映射之后才合成。
+// 开关 gfx-bright / DM_GFX_BRIGHT（缺省开），A/B 目标 bright；DM_BRIGHT_K=<k>（宿主）固定曝光。
+// 3D picture brightening (the Vulkan version of bright_lut in iOS dm/gfx/nvn/nvn_mtl.m; #112, vickwv fe7b655, ported the same idea
+// to Android): every frame the game computes tone mapping's 32^3 color table with compute shader 552f45c348a61b86; after that
+// dispatch the table is copied and rewritten in place by xbg_bright_lut.comp with the exposure k from the host's dm_bright_k().
+// Nothing changes at k ~= 1 (out of game, noon). Only the 3D world changes: UI, text and the orbs are composited after tone mapping.
+// Switch gfx-bright / DM_GFX_BRIGHT (on by default), A/B target bright; DM_BRIGHT_K=<k> (host) fixes the exposure.
+namespace bright {
+bool enabled=true,failed=false;uint64_t applied=0;float last_k=1;
+VkDescriptorSetLayout set_layout{};VkPipelineLayout layout{};VkPipeline pipeline{};VkSampler sampler{};VkDescriptorPool pool{};
+// 每个帧槽 8 套描述符：一帧里可能派发不止一次，录进命令缓冲的套在提交完成前不能再改
+// 8 descriptor sets per frame slot: a frame may dispatch more than once, and a set recorded into a command buffer must not change before that submission completes
+constexpr unsigned SETS=8;VkDescriptorSet sets[2][SETS]{};unsigned used[2]{};uint64_t used_serial[2]{};
+VkImage tmp{};VkDeviceMemory tmp_memory{};VkImageView tmp_view{};VkFormat tmp_format{};uint32_t tmp_w=0,tmp_h=0,tmp_d=0;bool tmp_general=false;
+void shutdown(){
+    if(tmp_view)vkDestroyImageView(cfg.device,tmp_view,nullptr);if(tmp)vkDestroyImage(cfg.device,tmp,nullptr);if(tmp_memory)vkFreeMemory(cfg.device,tmp_memory,nullptr);
+    if(pipeline)vkDestroyPipeline(cfg.device,pipeline,nullptr);if(layout)vkDestroyPipelineLayout(cfg.device,layout,nullptr);if(pool)vkDestroyDescriptorPool(cfg.device,pool,nullptr);
+    if(set_layout)vkDestroyDescriptorSetLayout(cfg.device,set_layout,nullptr);if(sampler)vkDestroySampler(cfg.device,sampler,nullptr);
+    tmp_view={};tmp={};tmp_memory={};tmp_w=tmp_h=tmp_d=0;tmp_general=false;pipeline={};layout={};pool={};set_layout={};sampler={};for(auto &s:sets)for(auto &x:s)x={};used[0]=used[1]=0;used_serial[0]=used_serial[1]=0;failed=false;
+}
+bool prepare(){
+    if(pipeline)return true;
+    if(!cfg.enabled_core.shaderStorageImageWriteWithoutFormat){xbg_logf("NVN bright: off (shaderStorageImageWriteWithoutFormat not enabled)");return false;}
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};si.magFilter=si.minFilter=VK_FILTER_LINEAR;si.mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST;si.addressModeU=si.addressModeV=si.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VK(vkCreateSampler(cfg.device,&si,nullptr,&sampler));
+    VkDescriptorSetLayoutBinding b[2]{};b[0]={0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};b[1]={1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
+    VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};dl.bindingCount=2;dl.pBindings=b;VK(vkCreateDescriptorSetLayout(cfg.device,&dl,nullptr,&set_layout));
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT,0,4};VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};li.setLayoutCount=1;li.pSetLayouts=&set_layout;li.pushConstantRangeCount=1;li.pPushConstantRanges=&push;
+    VK(vkCreatePipelineLayout(cfg.device,&li,nullptr,&layout));
+    VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2*SETS},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2*SETS}};VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pi.maxSets=2*SETS;pi.poolSizeCount=2;pi.pPoolSizes=sizes;
+    VK(vkCreateDescriptorPool(cfg.device,&pi,nullptr,&pool));
+    VkDescriptorSetLayout layouts[2*SETS];for(auto &l:layouts)l=set_layout;VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};ai.descriptorPool=pool;ai.descriptorSetCount=2*SETS;ai.pSetLayouts=layouts;
+    VK(vkAllocateDescriptorSets(cfg.device,&ai,&sets[0][0]));
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};mi.codeSize=sizeof(xbg_bright_lut_cs);mi.pCode=xbg_bright_lut_cs;VkShaderModule module{};VK(vkCreateShaderModule(cfg.device,&mi,nullptr,&module));
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=module;ci.stage.pName="main";ci.layout=layout;
+    VkResult r=vkCreateComputePipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pipeline);vkDestroyShaderModule(cfg.device,module,nullptr);
+    if(r!=VK_SUCCESS){pipeline={};xbg_logf("NVN bright: off (compute pipeline result=%d)",int(r));return false;}
+    xbg_logf("NVN bright: ready (color table rewrite, exposure from dm_bright_k)");return true;
+}
+bool prepare_tmp(const Image &lut){
+    if(tmp && tmp_format==lut.fmt && tmp_w==lut.width && tmp_h==lut.height && tmp_d==lut.depth)return true;
+    if(tmp){VkImage i=tmp;VkImageView v=tmp_view;VkDeviceMemory m=tmp_memory;retire_handle([i,v,m]{vkDestroyImageView(cfg.device,v,nullptr);vkDestroyImage(cfg.device,i,nullptr);vkFreeMemory(cfg.device,m,nullptr);});tmp={};tmp_view={};tmp_memory={};}
+    VkFormatProperties fp{};vkGetPhysicalDeviceFormatProperties(cfg.physical,lut.fmt,&fp);
+    if(!(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)){xbg_logf("NVN bright: off (color table format %d cannot be sampled linearly)",int(lut.fmt));return false;}
+    VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};ic.imageType=VK_IMAGE_TYPE_3D;ic.format=lut.fmt;ic.extent={lut.width,lut.height,lut.depth};ic.mipLevels=1;ic.arrayLayers=1;ic.samples=VK_SAMPLE_COUNT_1_BIT;
+    ic.tiling=VK_IMAGE_TILING_OPTIMAL;ic.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT;ic.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
+    if(vkCreateImage(cfg.device,&ic,nullptr,&tmp)!=VK_SUCCESS){tmp={};return false;}
+    VkMemoryRequirements mr;vkGetImageMemoryRequirements(cfg.device,tmp,&mr);VkMemoryAllocateInfo ma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ma.allocationSize=mr.size;ma.memoryTypeIndex=memory_type(mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};vi.image=tmp;vi.viewType=VK_IMAGE_VIEW_TYPE_3D;vi.format=lut.fmt;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    if(vkAllocateMemory(cfg.device,&ma,nullptr,&tmp_memory)!=VK_SUCCESS || vkBindImageMemory(cfg.device,tmp,tmp_memory,0)!=VK_SUCCESS || vkCreateImageView(cfg.device,&vi,nullptr,&tmp_view)!=VK_SUCCESS){
+        if(tmp_view)vkDestroyImageView(cfg.device,tmp_view,nullptr);vkDestroyImage(cfg.device,tmp,nullptr);if(tmp_memory)vkFreeMemory(cfg.device,tmp_memory,nullptr);tmp={};tmp_view={};tmp_memory={};return false;}
+    tmp_format=lut.fmt;tmp_w=lut.width;tmp_h=lut.height;tmp_d=lut.depth;tmp_general=false;
+    xbg_logf("NVN bright: color table %ux%ux%u format=%d",tmp_w,tmp_h,tmp_d,int(tmp_format));return true;
+}
+// 计算着色器在储存图像槽上绑的那张图（调色表）；认不出返回 nullptr
+// The image bound at the compute shader's storage image slot (the color table); nullptr when it cannot be identified
+Image *bound_storage_image(){
+    for(const auto &b:state.shader[5]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && b.source==XBG_SOURCE_IMAGE && b.slot<16){
+        int id=int(state.img[5][b.slot]&0xfffff);if(!id || (state.texture_pool.n>0 && id>=state.texture_pool.n))return nullptr;
+        auto pool=textures.find(pool_key(&state.texture_pool));auto &table=pool==textures.end()?legacy_textures:pool->second;auto tex=table.find(id);if(tex==table.end())return nullptr;
+        return &get_image(&tex->second.texture,true);}
+    return nullptr;
+}
+// 在调色表那次派发之后、同一个非绘制命令段里调用（前后都有全屏障）
+// Called after the color table's dispatch, inside the same non-draw command span (full barriers before and after)
+void after_dispatch(Commands &c){
+    if(!enabled || failed || !dm_bright_k || state.shader[5]->key.compare(0,16,"552f45c348a61b86") || ab_off("bright"))return;
+    float k=dm_bright_k();last_k=k;if(!(k>1.005f))return;if(k>4.0f)k=4.0f;
+    Image *lut=bound_storage_image();
+    if(!lut || lut->depth<2 || lut->levels!=1 || lut->aspects!=VK_IMAGE_ASPECT_COLOR_BIT || !(lut->usage&VK_IMAGE_USAGE_STORAGE_BIT) || !(lut->usage&VK_IMAGE_USAGE_TRANSFER_SRC_BIT)){
+        static bool told=false;if(!told){told=true;xbg_logf("NVN bright: color table not recognised (image=%p), not brightening",(void*)lut);}return;}
+    if(!prepare() || !prepare_tmp(*lut)){failed=true;return;}
+    unsigned si=unsigned(&recording_slot()-slots)&1;if(used_serial[si]!=slot_serial){used_serial[si]=slot_serial;used[si]=0;}
+    if(used[si]>=SETS)return;VkDescriptorSet set=sets[si][used[si]++];
+    VkCommandBuffer cmd=c.command;
+    if(lut->layout!=VK_IMAGE_LAYOUT_GENERAL)lut->transition(cmd,VK_IMAGE_LAYOUT_GENERAL);
+    if(!tmp_general){VkImageMemoryBarrier t{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};t.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;t.newLayout=VK_IMAGE_LAYOUT_GENERAL;t.image=tmp;t.srcQueueFamilyIndex=t.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        t.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};t.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&t);tmp_general=true;}
+    full_barrier(cmd);
+    VkImageCopy region{};region.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.dstSubresource=region.srcSubresource;region.extent={lut->width,lut->height,lut->depth};
+    vkCmdCopyImage(cmd,lut->image,VK_IMAGE_LAYOUT_GENERAL,tmp,VK_IMAGE_LAYOUT_GENERAL,1,&region);
+    full_barrier(cmd);
+    VkDescriptorImageInfo ii[2]{};ii[0]={sampler,tmp_view,VK_IMAGE_LAYOUT_GENERAL};ii[1]={VK_NULL_HANDLE,lut->view(nullptr,false,true),VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[2]{};for(int i=0;i<2;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=set;w[i].dstBinding=uint32_t(i);w[i].descriptorCount=1;w[i].descriptorType=i?VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;w[i].pImageInfo=&ii[i];}
+    vkUpdateDescriptorSets(cfg.device,2,w,0,nullptr);
+    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,layout,0,1,&set,0,nullptr);vkCmdPushConstants(cmd,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&k);
+    vkCmdDispatch(cmd,(lut->width+3)/4,(lut->height+3)/4,(lut->depth+3)/4);
+    full_barrier(cmd);
+    ++applied;
+}
+}
+void dispatch(const p_dispatch &p){preflight_cpu_reads();CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=state.shader[5]->module;ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}vkCmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkCmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());int prof_dispatch=pass_prof_compute_begin(c.command,p);vkCmdDispatch(c.command,p.x,p.y,p.z);pass_prof_complete(c.command,prof_dispatch);bright::after_dispatch(c);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
 
 struct MaskedClear {
     VkShaderModule vs{},fs{};VkPipelineLayout layout{};VkPipeline pipeline{};
@@ -3489,7 +3590,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}else if(const char *e=getenv("DM_GFX_DEFER_EVENTS")){int v=atoi(e);defer_events=v==1?1:v==2?2:0;}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *eg=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-event-guard").c_str(),"rb");evguard::enabled=eg!=nullptr;if(eg)fclose(eg);if(evguard::enabled)xbg_logf("NVN event guard on (marker gfx-event-guard)");}{FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-vcache").c_str(),"rb");vcache::enabled=false;if(v){vcache::enabled=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_VCACHE"))vcache::enabled=atoi(e)!=0;xbg_logf("NVN vertex/index cross-frame cache=%d tracker=%d (marker gfx-vcache)",int(vcache::enabled),int(nvn_dirty_since!=nullptr));}
      {FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-tex-dirty").c_str(),"rb");tex_dirty=false;if(v){tex_dirty=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_TEX_DIRTY"))tex_dirty=atoi(e)!=0;
       xbg_logf("NVN texture checks through the dirty tracker=%d (marker gfx-tex-dirty)",int(tex_dirty));}{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc)",int(native_bc));}
-     {FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-noload").c_str(),"rb");noload_enabled=false;if(b){noload_enabled=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NOLOAD"))noload_enabled=atoi(e)!=0;xbg_logf("NVN proven full-overwrite first draws skip the color load=%d (marker gfx-noload; A/B target noload)",int(noload_enabled));}{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=32;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=32;fclose(m);}else if(const char *e=getenv("DM_GFX_PERF_SAMPLE"))perf_sample=unsigned(atoi(e));perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
+     {FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-noload").c_str(),"rb");noload_enabled=false;if(b){noload_enabled=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NOLOAD"))noload_enabled=atoi(e)!=0;xbg_logf("NVN proven full-overwrite first draws skip the color load=%d (marker gfx-noload; A/B target noload)",int(noload_enabled));}{FILE *q=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-bright").c_str(),"rb");bright::enabled=true;if(q){bright::enabled=fgetc(q)!='0';fclose(q);}else if(const char *e=getenv("DM_GFX_BRIGHT"))bright::enabled=atoi(e)!=0;xbg_logf("NVN 3D brightening=%d (marker gfx-bright; A/B target bright)",int(bright::enabled));}{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=32;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=32;fclose(m);}else if(const char *e=getenv("DM_GFX_PERF_SAMPLE"))perf_sample=unsigned(atoi(e));perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
     for(auto &sl:slots)sl=Slot{};slot_index=0;pass_prof_enabled=false;pass_prof_next=300;pass_prof_period=600;pass_prof_until=UINT64_MAX;pass_prof_frame=UINT64_MAX;pass_prof_draws=0;pass_prof_queries=pass_prof_slots=pass_prof_skipped_slots=0;perf=Perf{};for(auto &c:perf_timing_before)c=XbgCpuTiming::Counter{};static_arena.cached=false;support_static.clear();format_property_cache.clear();for(auto &k:format_flat_known)k=false;
     VkPhysicalDeviceShaderDrawParametersFeatures draw_parameters{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};features.pNext=&draw_parameters;vkGetPhysicalDeviceFeatures2(cfg.physical,&features);if(cfg.enabled_shader_draw_parameters && !draw_parameters.shaderDrawParameters){if(error&&bytes)snprintf(error,bytes,"shaderDrawParameters unsupported");return -1;}
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;VkResult r=vkCreateCommandPool(cfg.device,&cp,nullptr,&command_pool);if(r!=VK_SUCCESS){if(error&&bytes)snprintf(error,bytes,"vkCreateCommandPool=%d",r);return r;}
@@ -3613,7 +3714,7 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();bright::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
 extern "C" void xbg_game_frame_counters(xbg_frame_counters *out){if(out)*out={hud::pipelines.load(),hud::pipeline_ns.load(),hud::shaders.load(),hud::shader_ns.load(),hud::uploads.load(),hud::reuploads.load(),hud::upload_bytes.load(),hud::upload_ns.load()};}
 extern "C" void xbg_game_set_frame(uint64_t frame){hud::frame.store(frame,std::memory_order_relaxed);}
