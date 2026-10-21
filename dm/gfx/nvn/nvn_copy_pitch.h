@@ -1,11 +1,9 @@
-// 共享纹理字节间距检查，依据上游 9393b00e 的 U3 拷贝语义。
-// Shared byte-pitch validation based on upstream 9393b00e U3 copy semantics.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
 
 // 两个方向共享字节间距；零表示紧排，在访问内存池前拒绝无效或溢出的范围。
-// Both directions share byte strides; zero means tight; reject invalid or overflowing ranges before pool access.
+// Both copy directions use the same recorded byte strides. Zero selects tight
 static inline int nvn_copy_pitch(int width, int height, int depth, int bw, int bh,
                                 int bpb, int64_t row_stride, int64_t image_stride,
                                 size_t *row, size_t *image, size_t *extent) {

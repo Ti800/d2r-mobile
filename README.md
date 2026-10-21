@@ -12,9 +12,9 @@ The upstream project introduction is preserved below. Its iOS/macOS performance 
 
 This is not a tech demo that "sort of runs". It is a mobile version polished for daily play, from your first character all the way through the endgame.
 
-Platforms: iPhone / iPad (iOS 26 and later; iOS 18 – 25 with the older-API build) · Mac (Apple silicon, macOS 26 or later; macOS 15 – 25 with the older-API build) · Apple TV 4K (3rd generation, A15; community port, developer preview) · Game version: Switch release with Reign of the Warlock, 1.0.34.0 (corresponds to PC version 3.3.94012) · English / 中文 · License: MIT · **Bring your own game files**
+Platforms: iPhone / iPad (iOS 26 and later; iOS 18 – 25 with the older-API build) · Mac (Apple silicon, macOS 26 or later; macOS 15 – 25 with the older-API build) · Apple TV 4K (3rd generation, A15; community port, developer preview) · Game version: Switch release with Reign of the Warlock, 1.0.34.0 (corresponds to PC version 3.3.94012) · English / 中文 / Español / Русский · License: MIT · **Bring your own game files**
 
-中文: [README.zh-CN.md](README.zh-CN.md)
+中文: [README.zh-CN.md](README.zh-CN.md) · Español: [README.es.md](README.es.md)
 
 <p align="center">
   <img src="https://github.com/jhaizhou-ops/d2r-mobile/releases/download/assets/hero_en.jpg" width="100%" alt="The game filling the whole edge-to-edge screen of an iPhone: Harrogath on Hell, with the red portal to the Greater Rift">
@@ -166,9 +166,9 @@ Most features can be toggled one by one in game under Options → Custom.
   <img src="https://github.com/jhaizhou-ops/d2r-mobile/releases/download/assets/en_map.jpg" width="33%" alt="The full-screen map">
 </p>
 
-### English and Chinese
+### English, Chinese, Spanish and Russian
 
-The whole game switches between English and Chinese under Options → Custom; after a restart, both the interface and the voice acting are in the language you chose. In English, items, skills and monsters use the original Diablo II wording, and everything we added — Greater Rift, Chronicle, the settings page, controller prompts — is in English too.
+The whole game switches between English, Chinese, Spanish and Russian under Options → Custom; after a restart, the interface is in the language you chose. On first launch it follows your device language (Spanish from Spain uses the game's esES text, other Spanish regions use the Latin American esMX text). In English, Spanish and Russian, items, skills and monsters use the original Diablo II wording, and everything we added — Greater Rift, Chronicle, the settings page, gesture prompts, map name plates — is translated too (item notes are translated for Chinese and Spanish only). Russian is the game's single ruRU text, with no regional variants. Voice acting: Chinese UI gets Chinese voices; Russian gets the original Russian voices when your game files include them (a package built from the complete game data does), otherwise English; everything else is English.
 
 <p align="center">
   <img src="https://github.com/jhaizhou-ops/d2r-mobile/releases/download/assets/en_game.jpg" width="58%" alt="Gameplay with the English interface">
@@ -205,7 +205,7 @@ Minimum: **an A14 / M1 chip or later** — the graphics layer needs Metal 3, whi
 |---|---|---|---|
 | **iPhone / iPad, A17 Pro and later** (iPhone 15 Pro and later, iPhone 16 and later, iPads with M-series chips) | Yes | iOS 26 or later: the default shell / default build; iOS 18 – 25: the iOS 18 shell / [older-API build](docs/OLDER_SYSTEMS.md) | Main devices, played daily |
 | **iPhone / iPad, A16 and earlier** (all iPhone 14 models, iPhone 15 / 15 Plus, iPhone 13 series and so on) | Yes, with one extra step | Make a Legacy Device Pack from your own game files as in [docs/LEGACY_DEVICES.md](docs/LEGACY_DEVICES.md) and include it when making the install package; the system split is the same as the row above | Played by players: iPhone 14 Pro Max (A16, 6 GB) at 60 fps; iPhone 13 Pro Max (A15, 6 GB) in the 30 fps mode |
-| **Devices with 4 GB of RAM** (such as the 4th-generation iPad Air) | Not supported yet (we are reducing memory use and will update this when there is progress) | — | Tested by a player: on an iPad Air 4 (A14, 4 GB) with the Legacy Device Pack, the system ends the app a few seconds after launch because the device runs out of memory |
+| **Devices with 4 GB of RAM** (such as the 6th-generation iPad mini or the 4th-generation iPad Air) | Runs, but memory is very tight (we are still reducing memory use) | Same as the A16-and-earlier row (with the Legacy Device Pack) | Tested by a player: on an iPad mini 6 (A15, 4 GB, iPadOS 27) a few minutes of Act I ran at 50–58 fps after automatic quality reduction, with constant system memory warnings and only about 560 MB below the system memory limit — busy scenes with many monsters and effects may be ended by the system; on an earlier version an iPad Air 4 (A14, 4 GB) was ended by the system a few seconds after launch |
 | **A14 chips with 6 GB of RAM or more** (such as iPhone 12 Pro / 12 Pro Max) | No reports yet | Same as the A16-and-earlier row | If you have tried, please open an Issue and tell us |
 | **A13 and earlier chips** (such as the iPhone 11 series and the 2020 iPad Pro) | Not supported | — | The graphics chip does not support Metal 3 (tested by a player on an iPad Pro with A12Z; Apple's references are above the table); the app says so at launch instead of crashing |
 | **Mac, Apple silicon** | Yes (native macOS App) | macOS 26 or later: the default build; macOS 15 – 25: the [older-API build](docs/OLDER_SYSTEMS.md). Keyboard, mouse and gamepad all work; what each can do is in [docs/MAC.md](docs/MAC.md) | A player has played the older-API build on macOS 15.7.7 |

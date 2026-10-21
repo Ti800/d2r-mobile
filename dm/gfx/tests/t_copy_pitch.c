@@ -1,5 +1,3 @@
-// 验证共享拷贝间距，依据上游 U3 的压缩块与填充层契约。
-// Validate shared copy pitches against the upstream U3 compressed-block and padded-layer contract.
 #include "../nvn/nvn_copy_pitch.h"
 #include <assert.h>
 #include <stdio.h>

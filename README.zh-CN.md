@@ -12,9 +12,9 @@
 
 这不是一个「勉强能跑」的技术演示，而是一个打磨到可以天天玩、从开荒一路玩到终局的移动版。
 
-平台：iPhone / iPad（iOS 26 起；iOS 18 – 25 用老接口版）· Mac（Apple 芯片，macOS 26 及以上；macOS 15 – 25 用老接口版）· Apple TV 4K（第三代 A15，社区移植，开发者预览）· 游戏版本：Switch 版「术士君临」1.0.34.0（对应 PC 版 3.3.94012）· 中文 / English · 许可证：MIT · **需要自备游戏文件**
+平台：iPhone / iPad（iOS 26 起；iOS 18 – 25 用老接口版）· Mac（Apple 芯片，macOS 26 及以上；macOS 15 – 25 用老接口版）· Apple TV 4K（第三代 A15，社区移植，开发者预览）· 游戏版本：Switch 版「术士君临」1.0.34.0（对应 PC 版 3.3.94012）· 中文 / English / Español / Русский · 许可证：MIT · **需要自备游戏文件**
 
-English: [README.md](README.md)
+English: [README.md](README.md) · Español: [README.es.md](README.es.md)
 
 <p align="center">
   <img src="https://github.com/jhaizhou-ops/d2r-mobile/releases/download/assets/hero_zh.jpg" width="100%" alt="iPhone 上全面屏铺满的游戏画面：地狱难度的哈洛加斯，红门通往秘境">
@@ -166,9 +166,9 @@ iPhone 与 iPad 共用一个安装包。
   <img src="https://github.com/jhaizhou-ops/d2r-mobile/releases/download/assets/map.jpg" width="33%" alt="全屏地图">
 </p>
 
-### 中文与英文
+### 中文、英文、西班牙语与俄语
 
-整个游戏可在「选项 → 自定义」里切换为英文，重启后界面与语音都是英文：物品、技能、怪物名沿用原版英文，我们新增的内容——秘境、编年史、设置页、手柄提示——也全部配了英文。
+整个游戏可在「选项 → 自定义」里切换中文、英文、西班牙语或俄语，重启后界面就是所选语言；第一次打开时跟随设备语言（西班牙的西语用原版 esES 文字，其他地区的西语用拉美 esMX 文字；俄语用原版 ruRU 文字）。英文、西语和俄语下，物品、技能、怪物名沿用原版译名，我们新增的内容——秘境、编年史、设置页、手势提示、地图名牌——也全部配了对应语言（物品注释只有中文与西语）。语音：中文界面配中文语音；俄语界面在你的游戏文件里带俄语配音时（用完整游戏数据出的包都带）配原版俄语语音，否则配英文；其余配英文语音。
 
 <p align="center">
   <img src="https://github.com/jhaizhou-ops/d2r-mobile/releases/download/assets/en_game.jpg" width="58%" alt="英文界面下的游戏画面">
@@ -205,7 +205,7 @@ flowchart LR
 |---|---|---|---|
 | **iPhone / iPad，A17 Pro 及以后**（iPhone 15 Pro 起、iPhone 16 起、M 系列芯片的 iPad） | 直接玩 | iOS 26 及以上用缺省的壳 / 缺省构建；iOS 18 – 25 用 iOS 18 的壳 / [老接口版](docs/OLDER_SYSTEMS.zh-CN.md) | 主力机型，日常在玩 |
 | **iPhone / iPad，A16 及更早**（iPhone 14 全系、iPhone 15 / 15 Plus、iPhone 13 系列等） | 可以玩，多一步 | 按 [docs/LEGACY_DEVICES.zh-CN.md](docs/LEGACY_DEVICES.zh-CN.md) 用自己的游戏文件做一份老机型补充包，做安装包时带上它；系统同上一行分 iOS 26 / iOS 18 – 25 | 已有玩家实测：iPhone 14 Pro Max（A16，6 GB）60 帧；iPhone 13 Pro Max（A15，6 GB）30 帧档 |
-| **4 GB 内存的设备**（如 iPad Air 第 4 代） | 暂不支持（在优化内存，有进展更新） | — | 已有玩家实测：iPad Air 4（A14，4 GB）带上老机型补充包后，启动几秒即因整机内存不足被系统结束 |
+| **4 GB 内存的设备**（如 iPad mini 第 6 代、iPad Air 第 4 代） | 能进游戏，内存很紧（在继续优化内存） | 同 A16 及更早那一行（带老机型补充包） | 已有玩家实测：iPad mini 6（A15，4 GB，iPadOS 27）第一幕实际玩了几分钟，画质自动降低后 50–58 帧，但一直收到系统内存告警、离系统内存上限只剩约 560 MB，怪多特效多的场景可能被系统结束；更早的版本上 iPad Air 4（A14，4 GB）启动几秒即被系统结束 |
 | **A14 芯片、6 GB 及以上内存**（如 iPhone 12 Pro / 12 Pro Max） | 尚无报告 | 同 A16 及更早那一行 | 欢迎试过的人开 Issue 告诉我们结果 |
 | **A13 及更早的芯片**（如 iPhone 11 系列、2020 年的 iPad Pro） | 不支持 | — | 图形芯片不支持 Metal 3（玩家在 iPad Pro A12Z 上实测；苹果依据见表上方）；App 启动时会直接提示，不会闪退 |
 | **Mac，Apple 芯片** | 直接玩（原生 macOS App） | macOS 26 及以上用缺省出法；macOS 15 – 25 用[老接口出法](docs/OLDER_SYSTEMS.zh-CN.md)。键盘、鼠标、手柄都能玩，各自能做什么见 [docs/MAC.zh-CN.md](docs/MAC.zh-CN.md) | 已有玩家在 macOS 15.7.7 上实际玩过老接口版 |
