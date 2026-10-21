@@ -481,6 +481,10 @@ struct Slot {
     // buffers from the GPU in a prologue command buffer submitted ahead of cmd.
     struct XRange{VkBuffer buffer;VkDeviceSize begin,end;};struct ProOp{VkBuffer src,dst;VkDeviceSize src_off,dst_off,size;};
     std::vector<XRange> viewed,guard;std::vector<ProOp> pro_ops;VkCommandBuffer pro{};
+    // gfx-upload-prologue：序言命令缓冲里整份上传的图像（from：这次提交开始时它的布局）。
+    // gfx-upload-prologue: whole image uploads the prologue command buffer performs (from: the image's layout when this submission starts).
+    struct ProImage{VkImage image;VkImageLayout from;VkImageAspectFlags aspects;uint32_t levels,layers;VkBuffer buffer;std::vector<VkBufferImageCopy> copies;};
+    std::vector<ProImage> pro_images;
     std::map<std::vector<uint64_t>,VkFramebuffer> framebuffers;
     std::map<std::array<uint64_t,4>,VkBufferView> texel_views; // per-frame texel views (same snapshot -> one view)
     Buffer query_results;size_t query_copied=0; // occlusion results copied by the GPU at the end of the frame
@@ -504,6 +508,13 @@ Slot slots[2];unsigned slot_index=0;
 // buffers stay where they were: moving them to another arena or another half of the chunk cost 1.72-1.85 ms of CPU a frame,
 // because about 145 memoized descriptor sets a frame bind read-only storage at a fixed buffer and offset.
 uint64_t xviews=0,xview_races=0,xview_guarded=0,xview_guarded_bytes=0;bool xview_guard=false;
+// gfx-upload-prologue（标记 1 / 0，否则 DM_GFX_UPLOAD_PROLOGUE；A/B 目标 uppro）：这次提交里还没用过的图像，整份上传改由序言命令缓冲在提交之前做，
+// 不再在帧中间结束打开的通道再加两道全屏障（每结束一次，分块 GPU 就要把通道的附件写出再读回）。计数：进序言的、仍在命令缓冲里做的、其中打断了通道的。
+// gfx-upload-prologue (marker 1 / 0, else DM_GFX_UPLOAD_PROLOGUE; A/B target uppro): a whole upload of an image not yet used in this
+// submission is done by the prologue command buffer ahead of it, instead of ending the open pass in mid-frame with two full barriers
+// (each end makes a tiling GPU write the pass's attachments out and read them back). Counted: uploads in the prologue, uploads still in
+// the command buffer, and those of them that ended an open pass.
+uint64_t uploads_prologue=0,uploads_inpass=0,uploads_broke_pass=0;bool upload_prologue=false;
 // Command pool resets off the render thread. vkResetCommandPool took ~0.4 ms of every frame on the Redmi K50 Ultra's render
 // thread. After a slot is submitted, the reset thread waits for its fence and resets its pool; retiring the slot first waits
 // for that job, so vkResetFences never overlaps the thread's wait (concurrent waits are allowed), and reusing the slot skips
@@ -723,7 +734,7 @@ Slot &recording_slot(){
         // From here on this slot reuses its readback arena while the other slot, still in flight, may read it through pending
         // views (xview): its GPU reads then race the CPU copies of this submission.
         {const Slot &o=slots[slot_index^1];if(o.pending && o.xview)++xview_races;
-         s.guard.clear();if(o.pending && xview_guard && !ab_off("xguard"))s.guard.swap(s.viewed);s.viewed.clear();s.pro_ops.clear();}
+         s.guard.clear();if(o.pending && xview_guard && !ab_off("xguard"))s.guard.swap(s.viewed);s.viewed.clear();s.pro_ops.clear();s.pro_images.clear();}
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
         s.stream.trim();s.readback.keep_chunks=s.guard.empty()?1:s.readback.chunks.size();s.readback.trim();
@@ -766,13 +777,24 @@ void submit_slots(bool wait){
         if(s.timestamps)vkCmdWriteTimestamp(s.cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,s.timestamps,1);
         VK(vkEndCommandBuffer(s.cmd));
         VkCommandBuffer cbs[2]{s.cmd,VK_NULL_HANDLE};uint32_t ncb=1;
-        if(!s.pro_ops.empty()){
+        if(!s.pro_ops.empty() || !s.pro_images.empty()){
             if(!s.pro){VkCommandBufferAllocateInfo pa{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};pa.commandPool=s.pool?s.pool:command_pool;pa.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;pa.commandBufferCount=1;VK(vkAllocateCommandBuffers(cfg.device,&pa,&s.pro));}
             VkCommandBufferBeginInfo pb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};pb.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;VK(vkBeginCommandBuffer(s.pro,&pb));
             // Earlier submissions first (the other slot still reads these ranges), then the copies, then this submission.
             VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};before.srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;before.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
             vkCmdPipelineBarrier(s.pro,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&before,0,nullptr,0,nullptr);
             for(const auto &op:s.pro_ops){VkBufferCopy r{op.src_off,op.dst_off,op.size};vkCmdCopyBuffer(s.pro,op.src,op.dst,1,&r);}
+            // gfx-upload-prologue：所有图像一道屏障转成传输目标、各自拷贝、再一道屏障回到 GENERAL。
+            // gfx-upload-prologue: one barrier takes every image to a transfer destination, the copies, then one barrier back to GENERAL.
+            if(!s.pro_images.empty()){
+                std::vector<VkImageMemoryBarrier> ib(s.pro_images.size(),VkImageMemoryBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER});
+                for(size_t i=0;i<ib.size();i++){const auto &u=s.pro_images[i];auto &b=ib[i];b.oldLayout=u.from;b.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;b.image=u.image;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+                    b.subresourceRange={u.aspects,0,u.levels,0,u.layers};b.srcAccessMask=u.from==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;}
+                vkCmdPipelineBarrier(s.pro,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,uint32_t(ib.size()),ib.data());
+                for(const auto &u:s.pro_images)vkCmdCopyBufferToImage(s.pro,u.buffer,u.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,uint32_t(u.copies.size()),u.copies.data());
+                for(auto &b:ib){b.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;b.newLayout=VK_IMAGE_LAYOUT_GENERAL;b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;}
+                vkCmdPipelineBarrier(s.pro,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,uint32_t(ib.size()),ib.data());
+                s.pro_images.clear();}
             VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};after.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;after.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
             vkCmdPipelineBarrier(s.pro,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&after,0,nullptr,0,nullptr);
             VK(vkEndCommandBuffer(s.pro));cbs[0]=s.pro;cbs[1]=s.cmd;ncb=2;s.pro_ops.clear();}
@@ -870,6 +892,7 @@ void perf_frame(){
      xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;depth_idle_passes=0;}
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
     xbg_logf("NVN PERF xview views=%.2f races=%.2f guarded=%.2f guarded_kb=%.1f",xviews/f,xview_races/f,xview_guarded/f,xview_guarded_bytes/1024.0/f);xviews=xview_races=xview_guarded=xview_guarded_bytes=0;
+    if(uploads_prologue || uploads_inpass){xbg_logf("NVN PERF uploads window prologue=%llu inpass=%llu broke_pass=%llu",(unsigned long long)uploads_prologue,(unsigned long long)uploads_inpass,(unsigned long long)uploads_broke_pass);uploads_prologue=uploads_inpass=uploads_broke_pass=0;}
     if(wb_skip){xbg_logf("NVN PERF wbskip ab=%d skipped=%.1f (%.2fMB)",int(ab_frame_on),wb_skipped/f,wb_skipped_bytes/1048576.0/f);wb_skipped=wb_skipped_bytes=0;}
     if(pipe_memo){xbg_logf("NVN PERF pipememo ab=%d hits=%.1f misses=%.1f",int(ab_frame_on),pipe_memo_hits/f,pipe_memo_misses/f);pipe_memo_hits=pipe_memo_misses=0;}
     perf=Perf{};perf.window_start=now;perf_timed_frames=0;
@@ -1217,6 +1240,10 @@ struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;VkImageCreateInfo create{}; // create: as created (no pNext), for upgrade_mutable
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;int64_t mem_bytes=0,bc_bytes=0,bc_data=0;
+    // 最近一次经 get_image 取用时的 slot_serial：等于当前值，说明这次提交里已有命令用过它（gfx-upload-prologue 据此判断能否提前上传）。
+    // slot_serial at the last get_image of this image: equal to the current value means a command of this submission already used it
+    // (gfx-upload-prologue decides by it whether an upload may go ahead of the submission).
+    uint64_t slot_use=0;
     uint64_t dirty_stamp=0,dirty_seen=0;   // tex_dirty: the tracker stamp of the checked content (0: not tracked yet) and the tracker generation last checked
     std::map<std::array<uint32_t,8>,VkImageView> views;std::vector<std::vector<uint64_t>> fb_keys; // fb_keys: persistent framebuffers using these views
     ~Image(){image_bytes_live-=mem_bytes;bc_image_bytes_live-=bc_bytes;bc_data_bytes_live-=bc_data;forget_framebuffers(*this);for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
@@ -1513,7 +1540,7 @@ inline Image &get_image(const tex_t *t,bool upload){
     if(img_fast && t && t->serial && t->magic==MAGIC('T','E','X',0) && !provenance_file){
         const ImgFront &front=img_front[(t->serial*0x9E3779B97F4A7C15ull)>>54];
         if(front.epoch==images_epoch && front.serial==t->serial){Image &im=*front.im;
-            if(!upload || (im.checked_submission==stats.submissions && (im.uploaded || im.gpu_written)))return im;}}
+            if(!upload || (im.checked_submission==stats.submissions && (im.uploaded || im.gpu_written))){im.slot_use=slot_serial;return im;}}}
     return get_image_slow(t,upload);
 }
 Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
@@ -1608,10 +1635,18 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
             else need(nvn_deswizzle(&t->d,level,layer,t->mem,linear.data()+begin,size_t(w)*im.bpp)==0,"Texture deswizzle failed");
             VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);
         }
-        Buffer staging=stream_buffer(linear.size(),linear.data(),linear.size(),false);for(auto &copy:copies)copy.bufferOffset+=staging.offset;Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,copies.size(),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();im.uploaded=true;provenance_write(im,__LINE__);im.cpu_hash=hash_memory(t->mem,t->L.size);im.checked_submission=stats.submissions;
+        Buffer staging=stream_buffer(linear.size(),linear.data(),linear.size(),false);for(auto &copy:copies)copy.bufferOffset+=staging.offset;
+        // gfx-upload-prologue：这次提交里还没有命令用过这张图，它的新内容可以排在整个提交之前，前面没有读到旧内容的命令。
+        // gfx-upload-prologue: no command of this submission used this image yet, so its new contents can go ahead of the whole
+        // submission; no earlier command read the old contents.
+        if(upload_prologue && im.slot_use!=slot_serial && !ab_off("uppro")){Slot &s=recording_slot();
+            s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++uploads_prologue;}
+        else{++uploads_inpass;if(open_pass.cmd)++uploads_broke_pass;
+            Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,copies.size(),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
+        im.uploaded=true;provenance_write(im,__LINE__);im.cpu_hash=hash_memory(t->mem,t->L.size);im.checked_submission=stats.submissions;
         if(reupload)++hud::reuploads;else ++hud::uploads;hud::upload_bytes+=linear.size();hud::upload_ns+=timing_clock()-up_t0;
     }
-    provenance_image(upload?"GET_UPLOAD":"GET",t,im);return im;
+    provenance_image(upload?"GET_UPLOAD":"GET",t,im);im.slot_use=slot_serial;return im;
 }
 // read_preflight: main's order (cc91eb1). Copy the descriptor, resolve CPU reads of its storage, then look the image up.
 Image &get_image_read(const tex_t *t,bool upload){
@@ -3452,6 +3487,8 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-cache-save").c_str(),"rb");sync_cache_save=false;if(m){sync_cache_save=fgetc(m)=='1';fclose(m);}}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-xview-guard").c_str(),"rb");xview_guard=false;if(m){xview_guard=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_XVIEW_GUARD"))xview_guard=atoi(e)!=0;
       xbg_logf("NVN readback buffers the other slot reads are written by the GPU=%d (marker gfx-xview-guard)",int(xview_guard));}
+     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-upload-prologue").c_str(),"rb");upload_prologue=false;if(m){upload_prologue=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_UPLOAD_PROLOGUE"))upload_prologue=atoi(e)!=0;
+      xbg_logf("NVN whole uploads of images not yet used in a submission go ahead of it=%d (marker gfx-upload-prologue)",int(upload_prologue));}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-async-pipelines").c_str(),"rb");warm::async_on=false;if(m){warm::async_on=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_ASYNC_PIPELINES"))warm::async_on=atoi(e)!=0;
       xbg_logf("NVN background builds for skippable draws=%d (marker gfx-async-pipelines)",int(warm::async_on));}
      {uint32_t n=0;vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr);std::vector<VkExtensionProperties> ext(n);vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data());
