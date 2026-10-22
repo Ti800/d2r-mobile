@@ -5,7 +5,7 @@
 // files/save, separate from the old saves in files/saves.
 import dm from 'libdm.so';
 import { fileIo, fileUri, picker } from '@kit.CoreFileKit';
-import { zlib } from '@kit.BasicServicesKit';
+import { zlib, BusinessError } from '@kit.BasicServicesKit';
 import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { display } from '@kit.ArkUI';
@@ -60,7 +60,7 @@ struct Index {
       // -2 没有游戏数据，-3 没有执行映像，-4 没有着色器，-5 缺 build.config，-9/-10 overlay 缺或不符：都可以用「导入游戏资源」补齐
       // -2 no game data, -3 no execution images, -4 no shaders, -5 missing build.config, -9/-10 overlay missing or mismatched: all fixed by importing resources
       this.canImport = [-2, -3, -4, -5, -9, -10].indexOf(rc) >= 0;
-      this.error = `${this.t('dmAndroidStartFailed') || '启动失败'} (${rc})${!this.canImport ? '' : [-2, -5].indexOf(rc) >= 0 ? '\n缺少游戏数据：请把游戏的 data 文件夹放进手机上一个文件夹（例如「D2R Mobile」）里，再点下面的按钮选中那个文件夹' : '\n缺少运行组件：这个版本没有内置组件，请把 dm 文件夹（out、shaders、overlay、ui-art）和 data 放进同一个文件夹，再点下面的按钮选中它'}
+      this.error = `${(this.t('dmAndroidStartFailed') || '启动失败（%d）').replace('%d', String(rc))}${!this.canImport ? '' : rc === -10 ? (this.lang.startsWith('zh') ? '\n运行包与这版应用不配套（覆盖层版本对不上）：请用与这版应用同一版本的工具重新生成 dm 文件夹，再点下面的按钮导入' : '\nThe runtime pack does not match this version of the app (overlay version mismatch): regenerate the dm folder with the tools of the same version, then import it with the button below') : [-2, -5].indexOf(rc) >= 0 ? '\n缺少游戏数据：请把游戏的 data 文件夹放进手机上一个文件夹（例如「D2R Mobile」）里，再点下面的按钮选中那个文件夹' : '\n缺少运行组件：这个版本没有内置组件，请把 dm 文件夹（out、shaders、overlay、ui-art）和 data 放进同一个文件夹，再点下面的按钮选中它'}
 可执行内存自检 / exec self-test: ${dm.execProbe()}`;
     }
   }
@@ -112,9 +112,11 @@ struct Index {
       this.importing = '正在检查文件夹…';
       const parts: string[][] = [['data', this.files + '/romfs'], ['dm/out', this.files + '/dm'], ['dm/shaders', this.files + '/dm'], ['dm/overlay', this.files + '/dm'], ['dm/ui-art', this.files + '/dm']];
       let copied = 0;
+      const failed: string[] = [];
       for (const part of parts) {
         const src = root + '/' + part[0];
-        fileIo.mkdirSync(part[1], true);
+        // 目录已存在时 mkdirSync 抛 13900015（同 preparePack）| mkdirSync throws 13900015 when the directory exists (as in preparePack)
+        if (!fileIo.accessSync(part[1])) { fileIo.mkdirSync(part[1], true); }
         const name = part[0].split('/').pop() as string, target = part[1] + '/' + name;
         try {
           await fileIo.copy(src, fileUri.getUriFromPath(target), {
@@ -122,11 +124,19 @@ struct Index {
               this.importing = `正在导入 ${part[0]}：${Math.floor(p.processedSize / 1048576)} / ${Math.floor(p.totalSize / 1048576)} MB`;
             }
           });
-        } catch (e) { hilog.warn(0xD2E0, 'XblImport', 'skip %{public}s: %{public}s', part[0], JSON.stringify(e)); continue; }
+        } catch (e) {
+          // 13900002 = 选中的文件夹里没有这一项（只导入 data 或只导入 dm 都可以）；其余错误算导入失败，不启动，免得新旧组件混用
+          // 13900002 = the picked folder has no such entry (importing only data or only dm is fine); any other error fails the import without starting, so old and new parts never mix
+          const code = (e as BusinessError).code;
+          hilog.warn(0xD2E0, 'XblImport', 'copy %{public}s: %{public}s', part[0], JSON.stringify(e));
+          if (code !== 13900002) { failed.push(`${part[0]} (${code})`); }
+          continue;
+        }
         // 有的系统把源目录拷成目标目录下的子目录：拉平 | Some systems copy the source directory as a subdirectory of the target: flatten it
         try { if (fileIo.accessSync(target + '/' + name)) { const inner = target + '/' + name; for (const f of fileIo.listFileSync(inner)) { fileIo.renameSync(inner + '/' + f, target + '/' + f); } fileIo.rmdirSync(inner); } } catch (e) { }
         copied++;
       }
+      if (failed.length) { this.importing = `导入没有完成（${failed.join('、')}），请检查手机存储空间后重新导入`; return; }
       if (!copied) { this.importing = '这个文件夹里没有 data 或 dm，请选中「装着它们的那个文件夹」（例如「D2R Mobile」）'; return; }
       this.importing = '导入完成，正在启动…'; this.error = ''; this.canImport = false;
       this.boot(); this.importing = '';

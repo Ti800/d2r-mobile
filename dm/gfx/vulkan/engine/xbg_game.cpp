@@ -3856,7 +3856,8 @@ static void xbg_submit_now(int n,const uint64_t *handles){std::lock_guard<std::r
    TimingRoot timing_root;CPU_SCOPE(Other);need(initialized && !failed,"Game Vulkan backend not initialized/healthy");uint64_t begin=timing_clock();snapshot_reset();uint64_t budget=0;for(int i=0;i<n;i++)execute(reinterpret_cast<const uint8_t*>(handles[i]),0,budget);++stats.submissions;++submitted;if(sync_mode)complete_all();perf.submit_cpu_ns+=timing_clock()-begin;}
 extern "C" uint64_t xbg_legacy_last_fence(){return gfx_async?gfx_enqueued.load():[]{std::lock_guard<std::recursive_mutex> lock(mutex);return submitted;}();}
 extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
-    if(fence<=completed.load())return 1;
+    // 不取锁的提前返回只用于新写法；旧写法（非鸿蒙缺省）先判 failed，与原来逐条相同 | the lock-free early return is new-path only; the old path (default off HarmonyOS) checks failed first, exactly as before
+    if(!legacy_waitall && fence<=completed.load())return 1;
     const bool completion_path=completion_wait_enabled && timeout && !legacy_waitall;
     // 新路径的唯一总预算含初锁、重锁与四轮后的回退；旧路径保留原时限语义。
     // One new-path budget includes initial lock, relock and the post-four-round fallback; preserve the old path's timeout semantics.

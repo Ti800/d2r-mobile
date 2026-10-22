@@ -139,4 +139,8 @@ extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes){
     }
     if(report&&bytes)snprintf(report,bytes,"NVN COMPLETION_WAIT_SELFTEST PASS cases=%zu assertions=%u max_wait_ms=%.3f",cases,assertions,double(max_wait_ns.load())/1e6);return 0;
 }
+// 独立运行（dm/gfx/tests/Makefile 用 -DDM_COMPLETION_WAIT_MAIN 编）：打印报告，失败返回非 0 | Standalone run (built by dm/gfx/tests/Makefile with -DDM_COMPLETION_WAIT_MAIN): prints the report, non-zero on failure
+#ifdef DM_COMPLETION_WAIT_MAIN
+int main(){char report[256];const int r=xbg_completion_wait_selftest(report,sizeof report);puts(report);return r;}
+#endif
 #endif
