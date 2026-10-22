@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.xiao.boluo",
     "vendor": "xiaoboluo",
-    "versionCode": 118,
-    "versionName": "0.19.1",
+    "versionCode": 120,
+    "versionName": "0.19.3",
     "icon": "$media:layered_image",
     "label": "$string:app_name"
   }

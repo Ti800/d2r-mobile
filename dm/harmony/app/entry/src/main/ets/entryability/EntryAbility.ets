@@ -5,8 +5,11 @@ import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import dm from 'libdm.so';
+import { refreshForms } from '../entryformability/EntryFormAbility';
 
 export default class EntryAbility extends UIAbility {
+  // 退到后台时刷新桌面卡片（存档此时已写完）| Refresh the home-screen cards when going to the background (the saves are written by then)
+  onBackground(): void { refreshForms(this.context.filesDir); }
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     AppStorage.setOrCreate('filesDir', this.context.filesDir);
     AppStorage.setOrCreate('lang', this.context.config.language ?? 'zh');
