@@ -89,17 +89,29 @@ static int kbd_swap_ok(uint8_t *b) {
     return !(*(volatile uint8_t *)(b + 0x2d5ff51) | *(volatile uint8_t *)(b + 0x2d5ff67)) && !dm_ui_panel_state();
 }
 #endif
+// PlayStation 手柄（DualSense / DualShock 4，dm_gamepad.m 按系统给的产品类别认）的键帽：手柄版布局不变，只把取键位图标的路径换到覆盖层里那套 PS 图
+// （gen_romfs_overlay.py，原版 ControllerButtons/ps5/ 按游戏键排，文件名「<平台>P<名字>」）。只在写前缀时看：换了手柄类型，下一次手柄 / 触屏（Mac：键盘 / 手柄）切换才换图
+// Key caps for PlayStation controllers (DualSense / DualShock 4, recognised by dm_gamepad.m from the product category the system reports): the controller layout is unchanged, only the path the key icons are taken from is switched to the overlay's PS set
+// (gen_romfs_overlay.py, the original ControllerButtons/ps5/ arranged by game button, file names "<platform>P<name>"). Only read when the prefixes are written: after a change of controller type the icons change at the next controller / touch (Mac: keyboard / controller) switch
+#define PS_GLYPH_OFF 0x1d0f5b8
+static const char k_ps_glyph[] = "Ztouch_controller_buttons_ui/%sP%s";
+static _Atomic int g_ps;
+void dm_padmode_glyph_ps(int ps) { atomic_store(&g_ps, ps ? 1 : 0); }   // 前端（任意线程）：最近有输入的实体手柄是不是 PlayStation 手柄 | front end (any thread): whether the physical controller that last had input is a PlayStation one
 static int pfx_write(uint8_t *b, int pad) {
     for (unsigned i = 0; i < sizeof k_pfx / sizeof *k_pfx; i++) { const char *p = (const char *)(b + k_pfx[i].off);
+        if (k_pfx[i].off == PS_GLYPH_OFF && !strcmp(p, k_ps_glyph)) continue;
 #if TARGET_OS_OSX
         if (k_pfx[i].off == KBD_GLYPH_OFF && !strcmp(p, k_kbd_glyph)) continue;
 #endif
         if (strcmp(p, k_pfx[i].pad) && strcmp(p, k_pfx[i].touch)) { LOG("【红】手柄 / 触屏布局：main+%#x 不是预期的「%s」（是「%.32s」），不改", k_pfx[i].off, k_pfx[i].pad, p); return 0; } }
     for (unsigned i = 0; i < sizeof k_pfx / sizeof *k_pfx; i++) memcpy(b + k_pfx[i].off, pad ? k_pfx[i].pad : k_pfx[i].touch, strlen(k_pfx[i].pad));
+    _Static_assert(sizeof k_ps_glyph == sizeof "Controller/ControllerButtons/%s/%s", "PS 键帽路径要与原版路径等长");
+    if (pad && atomic_load(&g_ps)) memcpy(b + PS_GLYPH_OFF, k_ps_glyph, sizeof k_ps_glyph - 1);
 #if TARGET_OS_OSX
     _Static_assert(sizeof k_kbd_glyph == sizeof "Controller/ControllerButtons/%s/%s", "键盘键帽路径要与原版路径等长");
     if (pad && g_kbd_next) memcpy(b + KBD_GLYPH_OFF, k_kbd_glyph, sizeof k_kbd_glyph - 1);
 #endif
+    if (!memcmp(b + PS_GLYPH_OFF, k_ps_glyph, sizeof k_ps_glyph - 1)) LOG("手柄 / 触屏布局：键位图标用 PlayStation 键帽");   // Mac 用着键盘时键盘键帽优先，PS 键帽没生效就不记 | on the Mac the keyboard caps win while the keyboard is in use; nothing is logged when the PS caps did not take effect
     return 1;
 }
 enum { NSTR = 160 };   // 中 / 英 / esES / esMX / ruRU 各一套（去重后 114 条） | One set each for Chinese / English / esES / esMX / ruRU (114 entries after dedup)

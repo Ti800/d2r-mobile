@@ -51,6 +51,19 @@ with tempfile.TemporaryDirectory() as t:
     import merc_slots; REPL.update(merc_slots.build(romfs,t,REPL))   # 佣兵面板加六个装备位（底图 + 布局；要在 build_ingame 给它插关闭钮之后） | Add six equipment slots to the mercenary panel (base image + layout; must come after build_ingame has inserted the close button into it)
     REPL.update(touch_layout.build_cursor(romfs,t))   # 面板里的手柄光标圆环换成透明 | The controller cursor ring in panels replaced with a transparent one
     REPL.update(touch_layout.build_glyphs(romfs,t))   # 22 张手柄键图标换成透明 | 22 controller button icons replaced with transparent ones
+    # PlayStation 手柄的键位图标：原版 ControllerButtons/ps5/ 那套，文件名「<平台>p<名字>」（宿主 dm_padmode.c 的 Ztouch_controller_buttons_ui/%sP%s）。
+    # 图标按游戏键取名（switch/ButtonRight = 游戏 A）；PS 手柄系统按菱形位置给（下 ✕ = A、右 ○ = B、左 □ = X、上 △ = Y，dm_padmap.h），所以四个面键换位取图；
+    # ps5 没有的取它不带 Rectangle 的同名图，再没有的（十字键、刷新小图标）用原图
+    # Icons for PlayStation controllers: the original ControllerButtons/ps5/ set, file names "<platform>p<name>" (the host dm_padmode.c path Ztouch_controller_buttons_ui/%sP%s).
+    # Icons are named per game button (switch/ButtonRight = game A); the system reports PS controllers by diamond position (bottom ✕ = A, right ○ = B, left □ = X, top △ = Y, dm_padmap.h), so the four face buttons take swapped images;
+    # names ps5 lacks take its same-named image without Rectangle, and the rest (D-pad, the small refresh icon) keep the original image
+    import romfs_art
+    man=[l.rstrip('\n').split('|') for l in open(os.path.join(romfs,'data','build_manifest.psv'),encoding='utf-8') if not l.startswith('#')]
+    have={f[9].lower().split(':',1)[-1] for f in man if len(f)>=11}; cb='data/hd/global/ui/controller/controllerbuttons/'
+    face={'buttonright':'buttonbottom','buttonbottom':'buttonright','buttontop':'buttonleft','buttonleft':'buttontop'}
+    for nm in sorted(p[len(cb)+7:] for p in have if p.startswith(cb+'switch/')):
+        src=face.get(nm[:-7],nm[:-7])+'.sprite'; q=next(p for p in (cb+'ps5/'+src, cb+'ps5/'+src.replace('rectangle',''), cb+'switch/'+nm) if p in have)
+        o=os.path.join(t,'ps_'+nm); open(o,'wb').write(romfs_art.read(romfs,q)); REPL['data/hd/global/ui/ztouch_controller_buttons_ui/switchp'+nm]=o
     if os.environ.get('DM_OVERLAY_MAC'):   # Mac App：再出一套键盘键帽，放在触屏键帽同一个目录、文件名「<平台>k<名字>」（宿主 dm_padmode.c 的键盘键帽路径 Ztouch_controller_buttons_ui/%sK%s） | Mac App: additionally produce a set of keyboard key caps, placed in the same directory as the touch key caps with file names "<platform>k<name>" (the keyboard key-cap path of the host's dm_padmode.c is Ztouch_controller_buttons_ui/%sK%s)
         import kbd_glyphs; REPL.update({'data/hd/global/ui/ztouch_controller_buttons_ui/switchk'+os.path.basename(k):v for k,v in kbd_glyphs.build(romfs,t).items()})
     REPL.update(touch_layout.build_profile(romfs,t))   # 大字号 | Large font size
