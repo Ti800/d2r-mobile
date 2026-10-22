@@ -22,6 +22,16 @@ static dm_sem sem_new(void) { return dispatch_semaphore_create(0); }
 static void sem_up(dm_sem s) { dispatch_semaphore_signal(s); }
 static void sem_down(dm_sem s) { dispatch_semaphore_wait(s, DISPATCH_TIME_FOREVER); }
 static void sem_free(dm_sem s) { dispatch_release(s); }
+#elif defined(__OHOS__)
+#include <ohaudio/native_audiorenderer.h>
+#include <ohaudio/native_audiostreambuilder.h>
+#include <semaphore.h>
+typedef OH_AudioRenderer *dm_audev;
+typedef sem_t *dm_sem;
+static dm_sem sem_new(void) { dm_sem s = malloc(sizeof *s); if (!s || sem_init(s, 0, 0)) die("音频信号量"); return s; }
+static void sem_up(dm_sem s) { sem_post(s); }
+static void sem_down(dm_sem s) { while (sem_wait(s)) {} }
+static void sem_free(dm_sem s) { sem_destroy(s); free(s); }
 #else
 #include <aaudio/AAudio.h>
 #include <semaphore.h>
@@ -94,6 +104,9 @@ static void notify_release(aout *a) {
 static void *event_notify(void *p) {
     aout *a = p; int applied = -1;
     if (g_nq_base == QOS_CLASS_UNSPECIFIED) g_nq_base = qos_class_self();
+#ifdef __OHOS__
+    { void front_gtx_register(int); front_gtx_register(2); }   // OpenGTX 关键线程 | OpenGTX key thread
+#endif
     for (;;) {
         int ph = nq_phase();
         if (ph != applied) {   // 换相：先报上一相这段的读数，再改本线程 QoS | Phase switch: first report the readings of the previous phase's segment, then change this thread's QoS
@@ -219,6 +232,66 @@ static int au_open(aout *a) {   // 0 = 声卡开好了；-1 = 开不了（a->au 
 static int dev_start(aout *a) { return AudioOutputUnitStart(a->au) ? -1 : 0; }
 static void dev_stop(aout *a) { AudioOutputUnitStop(a->au); }
 static void dev_close(aout *a) { AudioUnitUninitialize(a->au); AudioComponentInstanceDispose(a->au); a->au = NULL; }
+#elif defined(__OHOS__)
+// 鸿蒙：OHAudio 低时延渲染流（16 位、48 kHz、游戏用途），写数据回调直接调 render。
+// 系统报错（音频服务重启等）时与安卓一样交给普通线程关掉重开，原来在播就接着播；路由切换（耳机、蓝牙）由 OHAudio 自行跟随。
+// HarmonyOS: OHAudio low-latency renderer (16-bit, 48 kHz, game usage); the write-data callback calls render directly.
+// On a system error (e.g. the audio service restarting) an ordinary thread closes and reopens it, as on Android, resuming if it
+// was playing; route changes (headphones, Bluetooth) are followed by OHAudio itself.
+static int32_t oh_write(OH_AudioRenderer *r, void *ctx, void *data, int32_t length) {
+    (void)r; render(ctx, data, (uint32_t)length); return 0;
+}
+static int32_t oh_event(OH_AudioRenderer *r, void *ctx, OH_AudioStream_Event e) { (void)r; (void)ctx; LOG("audio：OHAudio 流事件 %d", (int)e); return 0; }
+static int32_t oh_interrupt(OH_AudioRenderer *r, void *ctx, OH_AudioInterrupt_ForceType t, OH_AudioInterrupt_Hint h) {
+    (void)r; (void)ctx; LOG("audio：音频焦点中断 type=%d hint=%d", (int)t, (int)h); return 0;
+}
+static void *null_sink(void *p);
+static int au_open(aout *a);
+static void *oh_reopen(void *p) {
+    aout *a = p;
+    pthread_mutex_lock(&g_aos_lock);
+    if (a->au) {
+        int playing = !g_suspended && atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED;
+        OH_AudioRenderer_Release(a->au); a->au = NULL;
+        if (au_open(a)) { LOG("【红】音频流出错后重开失败：这一路改用静音接收端（不出声）");
+                          if (playing) { atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); } }
+        else if (playing && OH_AudioRenderer_Start(a->au) != AUDIOSTREAM_SUCCESS) LOG("【红】音频流重开后启动失败");
+        else LOG("audio：音频流出错，已重开");
+    }
+    pthread_mutex_unlock(&g_aos_lock);
+    return NULL;
+}
+static int32_t oh_error(OH_AudioRenderer *r, void *ctx, OH_AudioStream_Result err) {
+    (void)r; LOG("【红】OHAudio 流错误 %d，交给线程重开", (int)err);
+    pthread_t th; if (!pthread_create(&th, NULL, oh_reopen, ctx)) pthread_detach(th);
+    return 0;
+}
+static int au_open(aout *a) {   // 0 = 声卡开好了；-1 = 开不了（a->au 置空，调用方走静音接收端） | 0 = open; -1 = cannot open (a->au set to null, the caller uses the silent sink)
+    a->mix = a->ch == 6; if (a->mix && !a->mixbuf) a->mixbuf = malloc(MIXMAX * 12);   // 5.1：我们自己下混，声卡只收双声道 | 5.1: we downmix ourselves
+    if (a->mix && !a->mixbuf) { a->au = NULL; LOG("【红】下混暂存申请不到：这一路改用静音接收端（不出声）"); return -1; }
+    int och = a->mix ? 2 : a->ch;
+    OH_AudioStreamBuilder *b = NULL;
+    if (OH_AudioStreamBuilder_Create(&b, AUDIOSTREAM_TYPE_RENDERER) != AUDIOSTREAM_SUCCESS) { a->au = NULL; LOG("【红】OHAudio 建不出来：这一路改用静音接收端（不出声）"); return -1; }
+    OH_AudioStreamBuilder_SetSamplingRate(b, RATE);
+    OH_AudioStreamBuilder_SetChannelCount(b, och);
+    OH_AudioStreamBuilder_SetSampleFormat(b, AUDIOSTREAM_SAMPLE_S16LE);
+    OH_AudioStreamBuilder_SetEncodingType(b, AUDIOSTREAM_ENCODING_TYPE_RAW);
+    OH_AudioStreamBuilder_SetRendererInfo(b, AUDIOSTREAM_USAGE_GAME);
+    OH_AudioStreamBuilder_SetLatencyMode(b, AUDIOSTREAM_LATENCY_MODE_FAST);
+    OH_AudioRenderer_Callbacks cb = {.OH_AudioRenderer_OnWriteData = oh_write, .OH_AudioRenderer_OnStreamEvent = oh_event,
+                                     .OH_AudioRenderer_OnInterruptEvent = oh_interrupt, .OH_AudioRenderer_OnError = oh_error};
+    OH_AudioStreamBuilder_SetRendererCallback(b, cb, a);
+    OH_AudioStream_Result r = OH_AudioStreamBuilder_GenerateRenderer(b, &a->au);
+    OH_AudioStreamBuilder_Destroy(b);
+    if (r != AUDIOSTREAM_SUCCESS) { a->au = NULL; LOG("【红】OHAudio 打开失败 %d：这一路改用静音接收端（不出声）", (int)r); return -1; }
+    if (a->mix) LOG("audio：游戏给 6 声道（5.1）→ 交给声卡前自己下混成双声道（中置 / 后环绕 ×0.707 并入左右，低音不并入，整体 −3 dB、饱和截断）");
+    int32_t rate = 0, chn = 0, fpc = 0; OH_AudioRenderer_GetSamplingRate(a->au, &rate); OH_AudioRenderer_GetChannelCount(a->au, &chn); OH_AudioRenderer_GetFrameSizeInCallback(a->au, &fpc);
+    LOG("audio：OHAudio 流 %d Hz %d 声道，每次回调 %d 帧", (int)rate, (int)chn, (int)fpc);
+    return 0;
+}
+static int dev_start(aout *a) { return OH_AudioRenderer_Start(a->au) == AUDIOSTREAM_SUCCESS ? 0 : -1; }
+static void dev_stop(aout *a) { OH_AudioRenderer_Stop(a->au); }
+static void dev_close(aout *a) { OH_AudioRenderer_Release(a->au); a->au = NULL; }
 #else
 // 安卓：AAudio 低延迟输出流（16 位、48 kHz、游戏用途），回调直接调 render。
 // 流断开（耳机插拔、蓝牙切换、系统音频服务重启）时 AAudio 在错误回调里通知：回调里不能关流，交给一条普通线程关掉重开，原来在播就接着播。

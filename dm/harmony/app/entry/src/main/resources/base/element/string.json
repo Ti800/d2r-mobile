@@ -1,0 +1,36 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "D2R Mobile 平台检测"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "平台能力检测（不含游戏内容）"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "D2R Mobile"
+    },
+    {
+      "name": "widget_display_name",
+      "value": "小菠萝2"
+    },
+    {
+      "name": "widget_desc",
+      "value": "最近游玩的角色"
+    },
+    {
+      "name": "EntryFormAbility_label",
+      "value": "小菠萝2 卡片"
+    },
+    {
+      "name": "EntryFormAbility_desc",
+      "value": "显示最近游玩的角色"
+    },
+    {
+      "name": "sync_reason",
+      "value": "在你登录同一华为账号的设备之间同步游戏存档"
+    }
+  ]
+}
