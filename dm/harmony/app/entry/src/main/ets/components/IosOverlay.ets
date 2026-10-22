@@ -1,11 +1,11 @@
 // 触控覆盖层：iOS DmTouchOverlay.m（drawRect / drawV4）与 DmTouchControlArt.h 的逐段搬运，画在 ArkUI Canvas 上。
 // 状态全部来自原生（touch_ohos.c 的绘图快照，与 iOS 同一个触控状态机 dm_touch_controls.c）；触点原样交原生，不在这里判手势。
-// 素材同 iOS：底栏 v4（overlay/hud_v4_ui）、技能图集（overlay/touchart）及其银色剪影（ui-art/sil_*，生成时已按 dm_skill_silver 去色）、
+// 素材同 iOS：底栏 v4（overlay/hud_v4_ui）、技能图集（overlay/touchart）及其银色剪影（ui-art/sil_*，解出时按 dm_skill_silver 去色，见 silver）、
 // 技能键标签（ui-art/lbl_*）、通用槽底（安装包 rawfile dm_mobile_socket_neutral.png = dm_mobile_socket.png 按 dm_socket_neutralize 去色）。
 // ArkUI Canvas 没有 saturation / luminosity 混合：去色都在素材生成时做好，效果同 iOS。
 // Touch overlay: a section-by-section port of iOS DmTouchOverlay.m (drawRect / drawV4) and DmTouchControlArt.h onto an ArkUI Canvas.
 // All state comes from native code (the drawing snapshot of touch_ohos.c, the same touch state machine dm_touch_controls.c as iOS); touches go to native unchanged, no gesture logic here.
-// Art as iOS: bottom bar v4 (overlay/hud_v4_ui), skill atlases (overlay/touchart) and their silver silhouettes (ui-art/sil_*, desaturated at generation as dm_skill_silver),
+// Art as iOS: bottom bar v4 (overlay/hud_v4_ui), skill atlases (overlay/touchart) and their silver silhouettes (ui-art/sil_*, desaturated on decode as dm_skill_silver, see silver),
 // skill button labels (ui-art/lbl_*), the generic socket (package rawfile dm_mobile_socket_neutral.png = dm_mobile_socket.png desaturated as dm_socket_neutralize).
 // ArkUI Canvas has no saturation / luminosity blend modes: the desaturation is baked in when the art is generated, same result as iOS.
 import dm from 'libdm.so';
@@ -102,7 +102,20 @@ export struct IosOverlay {
     let pm: image.PixelMap | null = null;
     try { if (fileIo.accessSync(path)) { const src = image.createImageSource(path); pm = src.createPixelMapSync({ desiredRegion: { x: x, y: y, size: { width: w, height: h } } }); src.release(); } } catch (e) { pm = null; hilog.warn(0xD2E0, 'XblOverlay', 'frame decode failed %{public}s %{public}s', key, JSON.stringify(e)); }
     if (!pm) { hilog.warn(0xD2E0, 'XblOverlay', 'frame missing %{public}s', key); }
+    else if (path.indexOf('/sil_') >= 0) { this.silver(pm); }
     this.frames.set(key, pm); return pm;
+  }
+  // 技能剪影去色（同 iOS dm_skill_silver：饱和度混合成灰，保留明暗）；导入包里是彩色原图，解出时做一次，已是灰度的旧包结果不变
+  // Desaturate skill silhouettes (as iOS dm_skill_silver: saturation blend to gray, shading kept); the import pack carries the colour originals, done once when
+  // decoded; packs that are already grayscale come out unchanged
+  private silver(pm: image.PixelMap): void {
+    try {
+      const buf = new ArrayBuffer(pm.getPixelBytesNumber()); pm.readPixelsToBufferSync(buf);
+      const p = new Uint8Array(buf), bgra = pm.getImageInfoSync().pixelFormat === image.PixelMapFormat.BGRA_8888;
+      const wr = bgra ? .11 : .3, wb = bgra ? .3 : .11;
+      for (let i = 0; i + 3 < p.length; i += 4) { const y = Math.round(p[i] * wr + p[i + 1] * .59 + p[i + 2] * wb); p[i] = y; p[i + 1] = y; p[i + 2] = y; }
+      pm.writeBufferToPixelsSync(buf);
+    } catch (e) { hilog.warn(0xD2E0, 'XblOverlay', 'silver failed %{public}s', JSON.stringify(e)); }
   }
   // skillImage:held:——银色剪影优先（不裁边），没有剪影退回原图集（裁 8%）| Silver silhouette first (no trim); without it fall back to the atlas (8% trim)
   private skillImage(g: number): image.PixelMap | null {

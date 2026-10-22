@@ -183,6 +183,28 @@ static void *host_thread(void *arg) {
     return NULL;
 }
 
+// 导入包配套检查：pack_info.txt（d2rm_android.py --target ohos 写出）的 PRODUCT 要等于编进来的 dm/PRODUCT，TARGET 要是 ohos。
+// 返回 1 = 配套或没有这个文件（调试版内置包与旧包不带它，照旧放行），0 = 不配套（why 写原因）
+// Import pack match: PRODUCT in pack_info.txt (written by d2rm_android.py --target ohos) must equal the compiled-in dm/PRODUCT and TARGET must be ohos.
+// Returns 1 = matching or no such file (the debug builds' bundled pack and older packs have none and still start), 0 = mismatch (reason in why)
+static int pack_info_ok(char *why, size_t n) {
+    char p[1200]; snprintf(p, sizeof p, "%s/pack_info.txt", g_runtime);
+    FILE *f = fopen(p, "rb"); if (!f) return 1;
+    char line[256], product[128] = "", target[32] = "";
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!strncmp(line, "PRODUCT=", 8)) snprintf(product, sizeof product, "%s", line + 8);
+        else if (!strncmp(line, "TARGET=", 7)) snprintf(target, sizeof target, "%s", line + 7);
+    }
+    fclose(f);
+    if (strcmp(target, "ohos")) { snprintf(why, n, "TARGET=%s, want ohos", target); return 0; }
+    if (strcmp(product, DM_PRODUCT)) { snprintf(why, n, "PRODUCT=%s, want %s", product, DM_PRODUCT); return 0; }
+    return 1;
+}
+// 公共读表接口（dm/host/dm_derived_rt.h）：鸿蒙由平台层设好 DM_DERIVED 后显式读；弱引用，没有这个接口的构建跳过
+// Shared table loader (dm/host/dm_derived_rt.h): on HarmonyOS the platform layer reads explicitly after setting DM_DERIVED; weak, skipped in builds without it
+__attribute__((weak)) int dm_derived_reload(void);
+
 // start(files, ext, src, lang) → 链接的资源文件数（>0）或负数错误码（同安卓 nativeStart）
 // start(files, ext, src, lang) → number of linked resource files (>0) or a negative error code (as Android nativeStart)
 static napi_value js_start(napi_env env, napi_callback_info info) {
@@ -264,6 +286,12 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
     DIR *sh = opendir(required); int have_shader = 0;
     if (sh) { struct dirent *e; while ((e = readdir(sh))) { size_t len = strlen(e->d_name); if (len > 4 && !strcmp(e->d_name + len - 4, ".xgs")) { have_shader = 1; break; } } closedir(sh); }
     if (!have_shader) { LOG("boot: no shader bundles in %s", required); return ret_int(env, -4); }
+    // -11 导入包与这版应用不配套；-12 三张衍生表没读全（壳版要从导入包的 derived.tsv 读） | -11 import pack does not match this app; -12 the three derived tables
+    // were not all read (the shell build reads them from the import pack's derived.tsv)
+    { char why[256]; if (!pack_info_ok(why, sizeof why)) { LOG("boot: import pack mismatch: %s", why); return ret_int(env, -11); } }
+    snprintf(required, sizeof required, "%s/derived.tsv", g_runtime);
+    setenv("DM_DERIVED", required, 1);
+    if (dm_derived_reload && dm_derived_reload()) { LOG("boot: derived tables incomplete (%s)", required); return ret_int(env, -12); }
     snprintf(required, sizeof required, "%s/overlay", g_runtime);
     char reason[256];
     dm_overlay_result ov = dm_overlay_validate(required, DM_OVERLAY_SOURCE_SHA256, reason, sizeof reason);

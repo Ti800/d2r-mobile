@@ -57,10 +57,10 @@ struct Index {
         this.lastPresents = n; this.lastFpsAt = t;
       }, 1000);
     } else {
-      // -2 没有游戏数据，-3 没有执行映像，-4 没有着色器，-5 缺 build.config，-9/-10 overlay 缺或不符：都可以用「导入游戏资源」补齐
-      // -2 no game data, -3 no execution images, -4 no shaders, -5 missing build.config, -9/-10 overlay missing or mismatched: all fixed by importing resources
-      this.canImport = [-2, -3, -4, -5, -9, -10].indexOf(rc) >= 0;
-      this.error = `${(this.t('dmAndroidStartFailed') || '启动失败（%d）').replace('%d', String(rc))}${!this.canImport ? '' : rc === -10 ? (this.lang.startsWith('zh') ? '\n运行包与这版应用不配套（覆盖层版本对不上）：请用与这版应用同一版本的工具重新生成 dm 文件夹，再点下面的按钮导入' : '\nThe runtime pack does not match this version of the app (overlay version mismatch): regenerate the dm folder with the tools of the same version, then import it with the button below') : [-2, -5].indexOf(rc) >= 0 ? '\n缺少游戏数据：请把游戏的 data 文件夹放进手机上一个文件夹（例如「D2R Mobile」）里，再点下面的按钮选中那个文件夹' : '\n缺少运行组件：这个版本没有内置组件，请把 dm 文件夹（out、shaders、overlay、ui-art）和 data 放进同一个文件夹，再点下面的按钮选中它'}
+      // -2 没有游戏数据，-3 没有执行映像，-4 没有着色器，-5 缺 build.config，-9/-10 overlay 缺或不符，-11 导入包与应用不配套，-12 衍生表没读全：都可以用「导入游戏资源」补齐
+      // -2 no game data, -3 no execution images, -4 no shaders, -5 missing build.config, -9/-10 overlay missing or mismatched, -11 import pack does not match the app, -12 derived tables incomplete: all fixed by importing resources
+      this.canImport = [-2, -3, -4, -5, -9, -10, -11, -12].indexOf(rc) >= 0;
+      this.error = `${(this.t('dmAndroidStartFailed') || '启动失败（%d）').replace('%d', String(rc))}${!this.canImport ? '' : (rc === -10 || rc === -11) ? (this.lang.startsWith('zh') ? '\n导入包与这版应用不配套：请用与这版应用同一版本的工具重新生成 dm 文件夹，再点下面的按钮导入' : '\nThe import pack does not match this version of the app: regenerate the dm folder with the tools of the same version, then import it with the button below') : rc === -12 ? (this.lang.startsWith('zh') ? '\n导入包缺少 derived.tsv 或内容不全：请用这版工具重新生成 dm 文件夹，再点下面的按钮导入' : '\nThe import pack lacks a complete derived.tsv: regenerate the dm folder with this version of the tools, then import it with the button below') : [-2, -5].indexOf(rc) >= 0 ? '\n缺少游戏数据：请把游戏的 data 文件夹放进手机上一个文件夹（例如「D2R Mobile」）里，再点下面的按钮选中那个文件夹' : '\n缺少运行组件：这个版本没有内置组件，请把 dm 文件夹（out、shaders、overlay、ui-art）和 data 放进同一个文件夹，再点下面的按钮选中它'}
 可执行内存自检 / exec self-test: ${dm.execProbe()}`;
     }
   }
@@ -110,7 +110,7 @@ struct Index {
       if (!uris || uris.length === 0) { return; }
       const root = uris[0];
       this.importing = '正在检查文件夹…';
-      const parts: string[][] = [['data', this.files + '/romfs'], ['dm/out', this.files + '/dm'], ['dm/shaders', this.files + '/dm'], ['dm/overlay', this.files + '/dm'], ['dm/ui-art', this.files + '/dm']];
+      const parts: string[][] = [['data', this.files + '/romfs'], ['dm/out', this.files + '/dm'], ['dm/shaders', this.files + '/dm'], ['dm/overlay', this.files + '/dm'], ['dm/ui-art', this.files + '/dm'], ['dm/derived.tsv', this.files + '/dm'], ['dm/pack_info.txt', this.files + '/dm']];
       let copied = 0;
       const failed: string[] = [];
       for (const part of parts) {
@@ -118,6 +118,8 @@ struct Index {
         // 目录已存在时 mkdirSync 抛 13900015（同 preparePack）| mkdirSync throws 13900015 when the directory exists (as in preparePack)
         if (!fileIo.accessSync(part[1])) { fileIo.mkdirSync(part[1], true); }
         const name = part[0].split('/').pop() as string, target = part[1] + '/' + name;
+        // 单个文件（derived.tsv、pack_info.txt）先删旧的再拷 | single files (derived.tsv, pack_info.txt): remove the old one before copying
+        if (name.indexOf('.') >= 0) { try { fileIo.unlinkSync(target); } catch (e) { } }
         try {
           await fileIo.copy(src, fileUri.getUriFromPath(target), {
             progressListener: (p: fileIo.Progress) => {

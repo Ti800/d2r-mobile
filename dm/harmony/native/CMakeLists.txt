@@ -13,6 +13,14 @@ set(AND ${DM}/android)
 # emutls 本就经 musl 读 TPIDR_EL0，换原生 TLS 不新增依赖 | native ELF TLS (the default emutls makes every thread_local access call
 # __emutls_get_address → pthread_getspecific, ~10% of the translation thread in hiperf); emutls already reads TPIDR_EL0 via musl
 add_compile_options(-fno-emulated-tls)
+# 本机路径不进安装包：源码、构建与生成目录都映射成相对名（同安卓），由 check_release_clean.py 检查 | keep machine paths out of the package: the source, build and
+# generated directories map to relative names (as Android); checked by check_release_clean.py
+get_filename_component(DM_ROOT_ABS ${DM}/.. ABSOLUTE)
+add_compile_options(-ffile-prefix-map=${DM_ROOT_ABS}=. -ffile-prefix-map=${CMAKE_BINARY_DIR}=build)
+if(DM_GEN_DIR)
+  get_filename_component(DM_GEN_ABS ${DM_GEN_DIR} ABSOLUTE)
+  add_compile_options(-ffile-prefix-map=${DM_GEN_ABS}=gen)
+endif()
 add_subdirectory(${DM}/gfx/vulkan ${CMAKE_CURRENT_BINARY_DIR}/vulkan)
 # 调试构建可显式运行同一等待 helper 的并发回归；默认不运行，发布包不编入。
 # Debug-only concurrency regression for the production wait helper; opt-in at runtime, omitted from release.
@@ -80,6 +88,10 @@ add_library(dm SHARED $<TARGET_OBJECTS:dm_app_main> ${CMAKE_CURRENT_SOURCE_DIR}/
 target_include_directories(dm BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/android_shim)
 target_include_directories(dm PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${AND})
 target_compile_options(dm PRIVATE $<$<COMPILE_LANGUAGE:C>:${DM_CFLAGS} -std=gnu17>)
+# 导入包配套：pack_info.txt 的 PRODUCT 要等于 dm/PRODUCT 第一行（安卓编进 BuildConfig.DM_PRODUCT） | import pack match: PRODUCT in pack_info.txt must equal the
+# first line of dm/PRODUCT (Android compiles it into BuildConfig.DM_PRODUCT)
+file(STRINGS ${DM}/PRODUCT DM_PRODUCT_LINE LIMIT_COUNT 1)
+target_compile_definitions(dm PRIVATE DM_PRODUCT="${DM_PRODUCT_LINE}")
 target_link_libraries(dm PRIVATE -Wl,--whole-archive dmplatform dmcore -Wl,--no-whole-archive dm_vulkan_engine
   ace_napi.z ace_ndk.z hilog_ndk.z hitrace_ndk.z native_window native_display_manager ohaudio qos vulkan m dl)
 target_link_options(dm PRIVATE -Wl,--no-undefined -Wl,-z,nostart-stop-gc -Wl,-Bsymbolic)
