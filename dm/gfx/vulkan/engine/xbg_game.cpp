@@ -580,7 +580,7 @@ bool slot_pools_enabled=true,readback_cached=false;
 // samples_report_seen: the game has recorded a samples-passed report (D2R never does: its ~8 pending reports a frame are
 // all timestamps).
 bool heavy_timestamps=false;extern uint64_t pass_fast_hits;   // gfx-heavy-timestamps = '1': timestamp reports end the pass with full barriers, as before
-bool no_occlusion_queries=false,samples_report_seen=false;uint64_t samples_reports=0,samples_reported=0,counter_ops[3]={};extern uint64_t pipeline_fast_hits;extern bool pipe_memo;extern uint64_t pipe_memo_hits,pipe_memo_misses;extern uint64_t snap_front_hits,snap_map_hits,snap_invalidations,snap_invalidated;extern std::atomic<uint64_t> quad_rewrites,warp_rewrites,ldc_folds,temps_forwarded;namespace vcache{extern bool enabled;extern uint64_t hits,hit_bytes,fills,fill_bytes,refills,volatiles,untracked,flushes;size_t live();VkDeviceSize arena_bytes();}   // counter_ops: resets, timestamp reports, samples reports recorded
+bool no_occlusion_queries=false,samples_report_seen=false;uint64_t samples_reports=0,samples_reported=0,counter_ops[3]={};extern uint64_t pipeline_fast_hits;extern bool pipe_memo;extern uint64_t pipe_memo_hits,pipe_memo_misses;extern uint64_t snap_front_hits,snap_map_hits,snap_invalidations,snap_invalidated;extern std::atomic<uint64_t> quad_rewrites,warp_rewrites,ldc_folds,temps_forwarded,nan_minmax_swaps;namespace vcache{extern bool enabled;extern uint64_t hits,hit_bytes,fills,fill_bytes,refills,volatiles,untracked,flushes;size_t live();VkDeviceSize arena_bytes();}   // counter_ops: resets, timestamp reports, samples reports recorded
 // Resident uniform texel copies (texel_acquire, before descriptors()).
 struct TexelKey{uint64_t base,bytes;uint32_t format;bool operator==(const TexelKey &o)const{return base==o.base&&bytes==o.bytes&&format==o.format;}};
 struct TexelKeyHash{size_t operator()(const TexelKey &k)const{uint64_t x=k.base*0x9E3779B97F4A7C15ull^k.bytes*0xC2B2AE3D27D4EB4Full^k.format;x^=x>>29;return size_t(x*0xBF58476D1CE4E5B9ull);}};
@@ -879,7 +879,7 @@ void perf_frame(){
     xbg_logf("NVN PERF storage_snapshots_per_frame=%.1f union_mb_per_frame=%.2f",storage_snap_count/f,storage_pages.size()*4096.0/1048576.0/tf);storage_pages.clear();storage_snap_count=0;
     xbg_logf("NVN PERF wtrack copied_kb_per_frame=%.1f dirty_pages_per_frame=%.1f mismatches=%llu fallbacks=%llu",wtrack::copied_bytes/1024.0/f,wtrack::dirty_pages/f,(unsigned long long)wtrack::mismatches,(unsigned long long)wtrack::fallbacks);wtrack::copied_bytes=wtrack::dirty_pages=0;
     xbg_logf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f requested vertex=%.2f index=%.2f storage=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f,snap_site_req[1]/1048576.0/f,snap_site_req[2]/1048576.0/f,snap_site_req[3]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;for(auto &b:snap_site_req)b=0;
-    xbg_logf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed));
+    xbg_logf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu nan_minmax=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed),(unsigned long long)nan_minmax_swaps.load(std::memory_order_relaxed));
     xbg_logf("NVN PERF snapfront front_hits=%.1f map_hits=%.1f invalidations=%.1f erased=%.1f",snap_front_hits/f,snap_map_hits/f,snap_invalidations/f,snap_invalidated/f);xbg_logf("NVN PERF textures bc_native=%llu bc_decoded=%llu live_images=%.1fMB bc_images=%.1fMB bc_payload=%.1fMB",(unsigned long long)native_bc_images,(unsigned long long)decoded_bc_images,image_bytes_live/1048576.0,bc_image_bytes_live/1048576.0,bc_data_bytes_live/1048576.0);snap_front_hits=snap_map_hits=snap_invalidations=snap_invalidated=0;
     if(bright::enabled){xbg_logf("NVN PERF bright applied=%.2f k=%.2f",bright::applied/f,bright::last_k);bright::applied=0;}
     if(tex_dirty){xbg_logf("NVN PERF texdirty tracked=%.1f checks=%.1f changed=%.1f",tex_dirty_tracked/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_tracked=tex_dirty_checks=tex_dirty_changed=0;}
@@ -1837,8 +1837,27 @@ void warp_rewrite(std::vector<uint32_t> &words,uint32_t stage,const char *key,co
 // Redmi K50 Ultra camp at scale 0.75 with both: GPU 15.70 -> 14.34 ms a frame; the shadow map 1,498 -> 711 us, the main pass
 // 6,019 -> 5,435 us, the depth pre-pass 1,356 -> 1,059 us. Either one alone changed nothing measurable.
 bool ldc_fold=false,forward_temps=false;std::atomic<uint64_t> ldc_folds{0},temps_forwarded{0};
+// Maxwell 的浮点 min / max 与饱和（FMNMX、.SAT）遇 NaN 取另一个操作数（饱和得 0）；翻译器出的是 GLSL.std.450 的 FMin / FMax /
+// FClamp，有 NaN 操作数时结果 Vulkan 不作规定，驱动可以把 NaN 传下去，写进 UNORM 目标就成了黑块。DM_GFX_NAN_MINMAX（标记
+// gfx-nan-minmax）把它们原位换成 NMin / NMax / NClamp：操作数不变，非 NaN 时结果相同，遇 NaN 时与 Maxwell 一致。
+// Maxwell's float min / max and saturation (FMNMX, .SAT) take the other operand when one is NaN (saturation gives 0); the
+// translator emits GLSL.std.450 FMin / FMax / FClamp, whose result with a NaN operand Vulkan leaves undefined, so a driver may
+// pass the NaN on, and written to a UNORM target it comes out black. DM_GFX_NAN_MINMAX (marker gfx-nan-minmax) swaps them in
+// place for NMin / NMax / NClamp: the same operands, the same result for values that are not NaN, and Maxwell's result for NaN.
+bool nan_minmax=false;std::atomic<uint64_t> nan_minmax_swaps{0};
+size_t nan_minmax_swap(std::vector<uint32_t> &w){
+    uint32_t glsl=0;size_t k=0;
+    for(size_t i=5;i<w.size();){
+        uint32_t op=w[i]&0xFFFFu,n=w[i]>>16;if(!n || i+n>w.size())break;
+        if(op==11 && n>=5 && !memcmp(&w[i+2],"GLSL.std.450",13))glsl=w[i+1];
+        else if(op==12 && n>=5 && glsl && w[i+3]==glsl){uint32_t &e=w[i+4];if(e==37){e=79;++k;}else if(e==40){e=80;++k;}else if(e==43){e=81;++k;}}
+        i+=n;
+    }
+    return k;
+}
 void tidy_rewrite(std::vector<uint32_t> &words){
     std::vector<uint32_t> out;
+    if(nan_minmax){size_t k=nan_minmax_swap(words);if(k)nan_minmax_swaps.fetch_add(k,std::memory_order_relaxed);}
     if(ldc_fold){size_t k=xbg_spirv_ldc_fold(words.data(),words.size(),out);if(k){words.swap(out);ldc_folds.fetch_add(k,std::memory_order_relaxed);}}
     if(forward_temps){size_t k=xbg_spirv_forward_temps(words.data(),words.size(),out);if(k){words.swap(out);temps_forwarded.fetch_add(k,std::memory_order_relaxed);}}
 }
@@ -3601,7 +3620,8 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      if(q){warp32=fgetc(q)!='0';fclose(q);}else if(const char *e=getenv("DM_GFX_WARP32"))warp32=atoi(e)!=0;xbg_logf("NVN 32-lane warps in wider subgroups=%d subgroup=%u (marker gfx-warp32)",int(warp32),subgroup.subgroupSize);}
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string base=cut==std::string::npos?dir:dir.substr(0,cut);
      auto sw=[&](const char *marker,const char *env){FILE *q=fopen((base+marker).c_str(),"rb");bool on=false;if(q){on=fgetc(q)!='0';fclose(q);}else if(const char *e=getenv(env))on=atoi(e)!=0;return on;};
-     ldc_fold=sw("/gfx-ldc-fold","DM_GFX_LDC_FOLD");forward_temps=sw("/gfx-forward-temps","DM_GFX_FORWARD_TEMPS");
+     ldc_fold=sw("/gfx-ldc-fold","DM_GFX_LDC_FOLD");forward_temps=sw("/gfx-forward-temps","DM_GFX_FORWARD_TEMPS");nan_minmax=sw("/gfx-nan-minmax","DM_GFX_NAN_MINMAX");
+     xbg_logf("NVN NaN-ignoring min / max / clamp like Maxwell=%d (marker gfx-nan-minmax)",int(nan_minmax));
      xbg_logf("NVN translator output clean-up: component fold=%d (marker gfx-ldc-fold) forwarded temporaries=%d (marker gfx-forward-temps)",int(ldc_fold),int(forward_temps));
      {FILE *q=fopen((base+"/gfx-shader-reuse").c_str(),"rb");shader_reuse=0;if(q){int c=fgetc(q);shader_reuse=c=='0'?0:c=='2'?2:1;fclose(q);}else if(const char *e=getenv("DM_GFX_SHADER_REUSE"))shader_reuse=atoi(e);
       warm::keep_rewritten=shader_reuse!=0;xbg_logf("NVN shader loads take the warm-up's rewritten SPIR-V=%d (marker gfx-shader-reuse; 2 also rewrites and compares)",shader_reuse);}}

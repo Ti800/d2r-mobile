@@ -212,6 +212,12 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // are forwarded. Redmi K50 Ultra camp at scale 0.75: GPU 15.70 -> 14.34 ms a frame, with the same results.
     setenv("DM_GFX_LDC_FOLD", "1", 0);
     setenv("DM_GFX_FORWARD_TEMPS", "1", 0);
+    // 浮点 min / max / clamp 照 Maxwell 的规矩遇 NaN 取另一个操作数（引擎的 gfx-nan-minmax；标记文件仍优先）。不开时一加 13
+    // （Adreno 830）上恰莎打铁的火花靠近画面上沿时，周围一块矩形会黑一帧。
+    // Float min / max / clamp take the other operand when one is NaN, as on Maxwell (the engine's gfx-nan-minmax; a marker file
+    // still wins). Without it, on the OnePlus 13 (Adreno 830) a rectangle around Charsi goes black for a frame when her hammer
+    // sparks come near the top edge of the screen.
+    setenv("DM_GFX_NAN_MINMAX", "1", 0);
     // 帧重叠缺省开：命令缓冲里的 SignalEvent 不提交、留到所在槽退役时再公布（引擎的 gfx-defer-events = 2；标记文件仍优先）。
     // 与呈现端的 gfx-present-overlap 一起，Redmi K50 Ultra 营地从 7.7 fps 到 19.5 fps（PR #9）。
     // Frame overlap on by default: command-buffer SignalEvents do not submit and are published when their slot retires (the
