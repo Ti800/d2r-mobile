@@ -76,7 +76,9 @@ void mtl_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyR
 // in steady state the difference of two neighbours is the frame interval. The HLE's dropped-frame count and the dynamic 3D scale (hle_oe.c, the iOS
 // rules) depend on it; it used to be always 0 (no reading), so the dynamic scale never judged on Android.
 static double g_present_at[1024];
-uint64_t mtl_present(const tex_t *t,double period,const int crop[4]){win_t window={0};window.interval=period>0?1:0;if(crop)memcpy(window.crop,crop,sizeof(window.crop));xbg_present_texture(&window,t);uint64_t n=++g_present_n;
+static _Atomic double g_present_period;   // 本次出图的节拍周期（秒；平台出图读它排上屏时刻） | this present's pacing period (s; the platform present reads it to schedule display time)
+double dm_present_period(void){return g_present_period;}
+uint64_t mtl_present(const tex_t *t,double period,const int crop[4]){g_present_period=period;win_t window={0};window.interval=period>0?1:0;if(crop)memcpy(window.crop,crop,sizeof(window.crop));xbg_present_texture(&window,t);uint64_t n=++g_present_n;
     struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);g_present_at[n%1024]=(double)ts.tv_sec+ts.tv_nsec*1e-9;return n;}
 void mtl_present_wait(uint64_t ticket){if(ticket>g_present_n)die("Unknown present ticket");}
 void mtl_present_flush(void){mtl_drain();}

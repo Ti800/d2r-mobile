@@ -241,6 +241,35 @@ int dm_3d_quality_mode_get(void) { return atomic_load(&g_3d_quality_mode); }
 static _Atomic int g_scale3d_level;
 static _Atomic int g_scale3d_resumed;
 void dm_3d_scale_resumed(void) { atomic_store(&g_scale3d_resumed, 1); }   // 前端：刚回前台。回来头几秒的慢帧是恢复（表面重建、缓存变冷），不是 GPU 吃紧：停判 3 秒 | front end: just returned to foreground. Slow frames in the first few seconds back are recovery (surface rebuild, caches gone cold), not GPU pressure: suspend judging for 3 seconds
+// 按 GPU 耗时的动态 3D 比例（DM_3D_SCALE_GPU=1，鸿蒙缺省开）：上面的控制器按「60 帧、超 25 ms 算掉帧」判，帧率在 30 上下时一进局就降到底，且档位是绝对值。
+// 这里每 2 秒看一次：帧时间 > 35 ms 且 GPU 占帧时间 ≥ 85%（卡在 GPU，发热后常见）→ 降一档；GPU 只占 < 75%（有富余）连续 10 秒 → 升一档。档位 = 配置值 × 系数，
+// 下限 DM_3D_SCALE_GPU_FLOOR（缺省 0.40）。卡在 CPU 时不降（降分辨率不省 CPU）。
+// GPU-time-driven dynamic 3D scale (DM_3D_SCALE_GPU=1, on by default on HarmonyOS): the controller above judges by "60 fps, > 25 ms is a drop", so around 30 fps it hits the bottom as soon as
+// a run starts, and its levels are absolute. Here, every 2 s: frame time > 35 ms with the GPU at >= 85% of it (GPU-bound, common once hot) -> one level down; GPU below 75% (headroom)
+// for 10 s in a row -> one level up. Level = configured value x factor, floor DM_3D_SCALE_GPU_FLOOR (default 0.40). CPU-bound frames do not lower it (resolution does not save CPU).
+static const float g_s3g_mult[] = {0.92f, 0.85f, 0.78f, 0.72f, 0.66f, 0.60f};
+static _Atomic float g_s3g_scale;   // > 0：覆盖动态档（scale3d_tick）| > 0: overrides the dynamic level (scale3d_tick)
+__attribute__((weak)) double xbg_recent_gpu_ms(void) { return -1; }   // 空的弱定义（不是弱声明）：苹果链接器要求弱引用链接时有定义；Vulkan 后端 / 鸿蒙平台层给强定义 | empty weak definitions (not declarations): Apple's linker needs a weak reference to resolve; the Vulkan backend / HarmonyOS platform give the strong ones
+static int s3g_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_3D_SCALE_GPU"); on = e && *e == '1'; } return on; }
+static void s3g_feed(double iv_ms) {
+    static double acc; static unsigned n; static uint64_t hold; static int lv, good, maxlv = -1, was_in; static float cfg;
+    if (maxlv < 0) { const char *e = getenv("DM_3D_SCALE"), *f = getenv("DM_3D_SCALE_GPU_FLOOR"); cfg = e ? strtof(e, NULL) : 0.75f; float fl = f ? strtof(f, NULL) : 0.40f;
+        maxlv = 0; for (int k = 0; k < (int)(sizeof g_s3g_mult / sizeof g_s3g_mult[0]); k++) if (cfg * g_s3g_mult[k] >= fl - 1e-4f) maxlv = k + 1;
+        LOG("3D 比例控制（按 GPU 耗时）：配置 %.2f，最多降 %d 档（最低 %.2f）", cfg, maxlv, maxlv ? cfg * g_s3g_mult[maxlv - 1] : cfg); }
+    uint64_t now = now_ns();
+    if (!dm_ingame_now()) { was_in = 0; acc = 0; n = 0; return; }
+    if (!was_in) { was_in = 1; hold = now + 20 * S3_SEC; }   // 刚进局的 20 秒是装载 | the first 20 s of a run are loading
+    if (iv_ms > 0) { acc += iv_ms; n++; }
+    if (acc < 2000 || !n) return;
+    double fr = acc / n, g = xbg_recent_gpu_ms ? xbg_recent_gpu_ms() : -1; acc = 0; n = 0;
+    if (now < hold || g <= 0) return;
+    int old = lv;
+    if (fr > 35.0 && g >= 0.85 * fr && lv < maxlv) { lv++; good = 0; }
+    else if (lv > 0 && g < 0.75 * fr) { if (++good >= 5) { lv--; good = 0; } }
+    else good = 0;
+    if (lv != old) { hold = now + 4 * S3_SEC; atomic_store(&g_s3g_scale, lv ? cfg * g_s3g_mult[lv - 1] : 0.0f);
+        LOG("3D 比例控制（按 GPU 耗时）：帧 %.1f ms、GPU %.1f ms → %s到第 %d 档（3D 比例 %.2f）", fr, g, lv > old ? "降" : "升", lv, lv ? cfg * g_s3g_mult[lv - 1] : cfg); }
+}
 void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_perf_present 转来）：实际上屏间隔 ms，−1 = 被丢弃，0 = 无读数 | called by the present thread every frame (forwarded from diag.c dm_perf_present): actual present interval in ms, −1 = dropped, 0 = no reading
     static scale3d_ctl c; static int on = -1; static long inj0 = -1, inj1 = -1;
     if (on < 0) { const char *e = getenv("DM_3D_SCALE_DYN"), *j = getenv("DM_3D_SCALE_DYN_INJECT"); on = !(e && !strcmp(e, "0")) && !getenv("DM_THERMAL_NOFALLBACK");
@@ -249,6 +278,7 @@ void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_per
         c.max_level = s3_max_level(s3_cfg(), fl);
         LOG("3D 比例控制：%s，配置 %.2f，下限 %.2f（第 %d 档）", on ? "开" : "关", s3_cfg(), s3_level_scale(s3_cfg(), c.max_level), c.max_level); }
     if (!on) return;
+    if (s3g_on() && atomic_load(&g_3d_quality_mode) != 1) { s3g_feed(iv_ms); return; }
     if (atomic_load(&g_3d_quality_mode) == 1) { if (c.level) { c.level = 0; LOG("3D 比例控制：画质优先，回到配置值"); } atomic_store(&g_scale3d_level, 0); return; }
     uint64_t now = now_ns();
     if (atomic_exchange(&g_scale3d_resumed, 0)) scale3d_ctl_hold(&c, now, 3 * S3_SEC);
@@ -274,6 +304,7 @@ static void scale3d_tick(void) {
     }
     // 动态档：0 = 配置值，k = 表里第 k 个低于配置值的比例 | Dynamic level: 0 = configured value, k = the k-th table scale below the configured value
     int lv = atomic_load(&g_scale3d_level); float dyn = s3_level_scale(want_cfg, lv);
+    if (s3g_on()) { float g = atomic_load(&g_s3g_scale); dyn = g > 0 && g < want_cfg ? g : want_cfg; }   // GPU 时间控制器（DM_3D_SCALE_GPU=1，鸿蒙缺省开）覆盖帧间隔档 | GPU-time controller (DM_3D_SCALE_GPU=1, on by default on HarmonyOS) overrides the frame-interval level
     float want = dm_nvn_ruler_truth() ? 1.0f : dyn;
     if (want == cur || !main || dm_nvn_frame_count() < 30) return;
     uintptr_t renderer = *(uintptr_t *)(main->base + 0x31e0848); if (!renderer) return;

@@ -76,6 +76,23 @@ static void tsd_probe(void) {
     if (!ok) die("bionic 键表布局不符（键表偏移 %#llx 对键 %#x 不成立）", (unsigned long long)g_tsd_off, (unsigned)g_keygate);
     LOG("bionic 键表偏移 %#llx", (unsigned long long)g_tsd_off);
 }
+#elif defined(__OHOS__)
+// 鸿蒙（musl）：tpidr_el0 − 272 处是 struct pthread 的 tsd 指针，键 k 的值 = tsd[k]（Mate 90 / API 26 真机实测，子线程与主线程一致，
+// 见 dm/harmony/probe）。偏移由 patch_nso.py DM_TARGET=ohos 写进改写代码；这里装载时复核，系统 musl 布局一变即停，不读错槽。
+// HarmonyOS (musl): tpidr_el0 - 272 holds struct pthread's tsd pointer, and key k's value = tsd[k] (measured on a Mate 90 / API 26,
+// same for worker and main threads; see dm/harmony/probe). patch_nso.py DM_TARGET=ohos bakes the offset into the patch code; the
+// loader re-checks it here and stops if the system musl layout ever changes, rather than reading the wrong slot.
+#define DM_PATCH_TARGET 2
+#define DM_OHOS_TSD_OFF 272
+static uint8_t *tsd_base(void) { uint64_t tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp)); return *(uint8_t **)(tp - DM_OHOS_TSD_OFF); }
+static uint64_t slot_off(pthread_key_t k) { return (uint64_t)k * 8; }
+static void tsd_probe(void) {
+    void *const magic = (void *)0x6d4d7d5d4d3d2d1dull;
+    pthread_setspecific(g_keygate, magic);
+    int ok = *(void **)(tsd_base() + slot_off(g_keygate)) == magic;
+    pthread_setspecific(g_keygate, 0);
+    if (!ok) die("musl 线程键布局不符（tpidr_el0-%d 处不是 tsd 指针）：系统 libc 变了，需重测偏移并重出改写产物", DM_OHOS_TSD_OFF);
+}
 #else
 #define DM_PATCH_TARGET 0
 static uint8_t *tsd_base(void) { uint64_t b; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(b)); return (uint8_t *)(b & ~7ull); }
@@ -216,8 +233,9 @@ static void read_layout(module_t *m, const char *dir) {
     fclose(f);
     if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != 0xff)
         die("%s: 产物是旧改写器出的，换成当前代号（dm/PRODUCT）的产物", path);
+    static const char *const tname[] = {"苹果", "安卓", "鸿蒙"}, *const tflag[] = {"apple", "android", "ohos"};
     if (target != DM_PATCH_TARGET) die("%s: 产物是给%s出的（TARGET %lu），本机要 %s 的产物（patch_nso.py 用 DM_TARGET=%s 重出）", path,
-                                       target ? "安卓" : "苹果", target, DM_PATCH_TARGET ? "安卓" : "苹果", DM_PATCH_TARGET ? "android" : "apple");
+                                       target < 3 ? tname[target] : "未知平台", target, tname[DM_PATCH_TARGET], tflag[DM_PATCH_TARGET]);
 }
 
 static void install_key_page(module_t *m) {

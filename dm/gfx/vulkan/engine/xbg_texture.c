@@ -1,3 +1,8 @@
+#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+#include <pthread.h>
 #include "xbg_texture.h"
 #include <string.h>
 #include "../../tex/nvn_deswizzle.h"
@@ -192,7 +197,81 @@ int xbg_decode_block(uint32_t fmt,const void *block,size_t bn,void *out,size_t o
     for(unsigned i=0;i<16;i++) for(unsigned j=0;j<4;j++) dst[i*4+j]=rgba[i][j];
     return 0;
 }
+/* BC 软解并行：马良 GPU 不支持 BC（textureCompressionBC=0），游戏的 BC 贴图全在翻译线程上逐块软解成 RGBA。
+ * 选角 / 进局装载时翻译线程 ~80% 忙在 xbg_decode_block，游戏线程等它传完贴图；进局后新贴图流入也在帧里解。
+ * 块与块互不依赖，大图（>= 4096 块）按块行分给常驻工作线程和调用线程一起解，输出逐字节相同。DM_BC_THREADS=工作线程数（缺省 0 = 串行：Mate90 实测逐张唤醒同步比解码本身贵，4 线程时选角装载里 BC 软解 9.1 s 对串行 4.9 s）。
+ * Parallel BC software decode: the Maleoon GPU has no BC (textureCompressionBC=0), so the game's BC textures are decoded block by block into RGBA on the
+ * translation thread. While loading the menu / a run the translation thread is ~80% busy in xbg_decode_block and the game thread waits for the uploads;
+ * after entering, newly streamed textures are decoded in-frame too. Blocks are independent: large images (>= 4096 blocks) are split by block rows between
+ * resident worker threads and the calling thread; the output is byte-identical. DM_BC_THREADS = worker count (default 0 = serial: on Mate90 waking and synchronizing per image cost more than the decode; with 4 threads BC decode took 9.1 s of the menu load vs 4.9 s serial). */
+/* 整块快路径：BC1–BC3 与旧路径同一套整数算式（调色板按块算一次、打包成 32 位像素），直接按行距写进目标，省掉 128 字节中转和逐像素拷贝；
+ * BC7 直接用 bcdec 按行距解进目标。只处理完整的 4x4 内部块、每像素 4 字节；边缘块和其他格式走原路径。DM_BC_FASTVERIFY=1 逐张与原路径逐字节比对。
+ * Full-block fast path: BC1–BC3 use the same integer arithmetic as the old path (palette computed once per block, packed as 32-bit pixels) and write
+ * straight into the destination at its row pitch, skipping the 128-byte staging and per-pixel copies; BC7 is decoded by bcdec straight into the destination.
+ * Only full interior 4x4 blocks at 4 bytes per pixel; edge blocks and other formats take the old path. DM_BC_FASTVERIFY=1 compares every image byte for byte. */
+static int bc_fast_block(uint32_t fmt,const uint8_t *b,uint8_t *d,size_t pitch) {
+    if(fmt==0x4d || fmt==0x4e){uint64_t aligned[2];memcpy(aligned,b,16);bcdec_bc7(aligned,d,(int)pitch);return 1;}
+    if(fmt<0x41 || fmt>0x48)return 0;
+    unsigned base=fmt>=0x45?fmt-4:fmt; const uint8_t *cb=base<=0x42?b:b+8; int four=base>0x42, opaque=base==0x41;
+    unsigned c0=cb[0]|cb[1]<<8, c1=cb[2]|cb[3]<<8, v[4][4];
+    for(unsigned k=0;k<2;k++){unsigned c=k?c1:c0,r=(c>>11)&31,g=(c>>5)&63,bl=c&31;v[k][0]=(r<<3)|(r>>2);v[k][1]=(g<<2)|(g>>4);v[k][2]=(bl<<3)|(bl>>2);v[k][3]=255;}
+    for(unsigned j=0;j<3;j++){v[2][j]=(four || c0>c1)?(2*v[0][j]+v[1][j])/3:(v[0][j]+v[1][j])/2;v[3][j]=(four || c0>c1)?(v[0][j]+2*v[1][j])/3:0;}
+    v[2][3]=255; v[3][3]=(four || c0>c1 || opaque)?255:0;
+    uint32_t pal[4]; for(unsigned k=0;k<4;k++)pal[k]=v[k][0]|v[k][1]<<8|v[k][2]<<16|v[k][3]<<24;
+    uint32_t bits=(uint32_t)cb[4]|(uint32_t)cb[5]<<8|(uint32_t)cb[6]<<16|(uint32_t)cb[7]<<24;
+    uint32_t alpha[16]; int has_alpha=base>=0x43;
+    if(base==0x43){uint64_t a=0;for(unsigned k=0;k<8;k++)a|=(uint64_t)b[k]<<(8*k);for(unsigned i=0;i<16;i++)alpha[i]=(uint32_t)(((a>>(i*4))&15)*17);}
+    else if(base==0x44){
+        uint32_t a16[8]={b[0]*257u,b[1]*257u},a8[8];
+        for(unsigned k=2;k<8;k++)a16[k]=b[0]>b[1]?((8-k)*a16[0]+(k-1)*a16[1]+3)/7:k<6?((6-k)*a16[0]+(k-1)*a16[1]+2)/5:k==6?0:65535;
+        for(unsigned k=0;k<8;k++)a8[k]=(uint8_t)((a16[k]+128)/257);
+        uint64_t ab=0;for(unsigned k=0;k<6;k++)ab|=(uint64_t)b[k+2]<<(k*8);
+        for(unsigned i=0;i<16;i++)alpha[i]=a8[(ab>>(i*3))&7];
+    }
+    for(unsigned y=0;y<4;y++){uint8_t *row=d+y*pitch;
+        for(unsigned x=0;x<4;x++){unsigned i=y*4+x;uint32_t px=pal[(bits>>(i*2))&3];if(has_alpha)px=(px&0x00ffffffu)|alpha[i]<<24;memcpy(row+x*4,&px,4);}}
+    return 1;
+}
+typedef struct {
+    uint32_t fmt,w,h,depth; const uint8_t *src; size_t row,image,blocks,rows,units; unsigned bpp,block_bytes; uint8_t *dst;
+    atomic_size_t next; atomic_int err; atomic_uint active;
+} bc_job;
+static int bc_rows(bc_job *j,size_t unit) {   /* 一个单位 = 一层里的 4 个块行 | one unit = 4 block rows of one layer */
+    size_t per=(j->rows+3)/4,z=unit/per,by0=(unit%per)*4; uint8_t pixels[128];
+    for(size_t by=by0;by<by0+4 && by<j->rows;by++)for(size_t bx=0;bx<j->blocks;bx++){
+        int r=xbg_decode_block(j->fmt,j->src+z*j->image+by*j->row+bx*j->block_bytes,j->block_bytes,pixels,sizeof(pixels));if(r)return r;
+        for(unsigned y=0;y<4 && by*4+y<j->h;y++)for(unsigned x=0;x<4 && bx*4+x<j->w;x++)
+            memcpy(j->dst+(((size_t)z*j->h+by*4+y)*j->w+bx*4+x)*j->bpp,pixels+(y*4+x)*j->bpp,j->bpp);
+    }
+    return 0;
+}
+static void bc_run(bc_job *j) {
+    for(;;){size_t u=atomic_fetch_add(&j->next,1);if(u>=j->units)return;int r=bc_rows(j,u);if(r)atomic_store(&j->err,r);}
+}
+static pthread_mutex_t bc_mu=PTHREAD_MUTEX_INITIALIZER,bc_submit=PTHREAD_MUTEX_INITIALIZER;static pthread_cond_t bc_cv=PTHREAD_COND_INITIALIZER,bc_done=PTHREAD_COND_INITIALIZER;
+static bc_job *bc_cur;static unsigned bc_gen,bc_threads=0;static int bc_inited;
+static void *bc_worker(void *a) {
+    (void)a; pthread_setname_np(pthread_self(),"xbg-bcdec"); unsigned seen=0;
+    for(;;){pthread_mutex_lock(&bc_mu);while(bc_gen==seen)pthread_cond_wait(&bc_cv,&bc_mu);seen=bc_gen;bc_job *j=bc_cur;if(j)atomic_fetch_add(&j->active,1);pthread_mutex_unlock(&bc_mu);
+        if(!j)continue;bc_run(j);pthread_mutex_lock(&bc_mu);if(atomic_fetch_sub(&j->active,1)==1)pthread_cond_broadcast(&bc_done);pthread_mutex_unlock(&bc_mu);}
+    return NULL;
+}
+static unsigned bc_pool(void) {   /* 首次用时建线程；返回工作线程数 | create threads on first use; returns the worker count */
+    pthread_mutex_lock(&bc_mu);
+    if(!bc_inited){bc_inited=1;const char *e=getenv("DM_BC_THREADS");unsigned n=e?(unsigned)atoi(e):0;if(n>8)n=8;
+        for(unsigned i=0;i<n;i++){pthread_t t;if(pthread_create(&t,NULL,bc_worker,NULL))break;pthread_detach(t);bc_threads++;}}
+    unsigned n=bc_threads;pthread_mutex_unlock(&bc_mu);return n;
+}
+/* 启动剖析计数（宿主 diag.c，DM_BOOTPROF=1 才累加；图形单测里没有宿主 → 弱符号为空）| boot-profile counter (host diag.c, accumulates only with DM_BOOTPROF=1; no host in graphics unit tests → weak symbol is null) */
+void dm_prof_add(int id,uint64_t ns,uint64_t bytes) __attribute__((weak));
+static int bc_decode(uint32_t fmt,uint32_t w,uint32_t h,uint32_t depth,const void *source,size_t source_bytes,size_t row,size_t image,void *output,size_t out_bytes);
 int xbg_decode_bc_linear(uint32_t fmt,uint32_t w,uint32_t h,uint32_t depth,
+    const void *source,size_t source_bytes,size_t row,size_t image,void *output,size_t out_bytes) {
+    struct timespec t0,t1;clock_gettime(CLOCK_MONOTONIC,&t0);int r=bc_decode(fmt,w,h,depth,source,source_bytes,row,image,output,out_bytes);clock_gettime(CLOCK_MONOTONIC,&t1);
+    if(dm_prof_add)dm_prof_add(10,(uint64_t)(t1.tv_sec-t0.tv_sec)*1000000000ull+(uint64_t)(t1.tv_nsec-t0.tv_nsec),out_bytes);   /* 10 = PROF_GFX_BCDEC（dm.h）| 10 = PROF_GFX_BCDEC (dm.h) */
+    return r;
+}
+static int bc_decode(uint32_t fmt,uint32_t w,uint32_t h,uint32_t depth,
     const void *source,size_t source_bytes,size_t row,size_t image,void *output,size_t out_bytes) {
     if(!source || !output || !w || !h || !depth)return -1;
     xbg_bc_format info;if(xbg_bc_format_info(fmt,&info))return -2;
@@ -207,12 +286,33 @@ int xbg_decode_bc_linear(uint32_t fmt,uint32_t w,uint32_t h,uint32_t depth,
     if(image<row*rows || image>SIZE_MAX/depth)return -1;
     size_t needed=image*(depth-1)+row*(rows-1)+minimum;
     if(needed>source_bytes)return -1;
-    uint8_t pixels[128];const uint8_t *src=source;uint8_t *dst=output;
-    for(uint32_t z=0;z<depth;z++)for(size_t by=0;by<rows;by++)for(size_t bx=0;bx<blocks;bx++){
-        int r=xbg_decode_block(fmt,src+z*image+by*row+bx*block_bytes,block_bytes,pixels,sizeof(pixels));if(r)return r;
-        for(unsigned y=0;y<4 && by*4+y<h;y++)for(unsigned x=0;x<4 && bx*4+x<w;x++)
-            memcpy(dst+(((size_t)z*h+by*4+y)*w+bx*4+x)*bpp,pixels+(y*4+x)*bpp,bpp);
+    if(blocks*rows*depth>=4096 && bc_pool()){
+        bc_job j;memset(&j,0,sizeof j);j.fmt=fmt;j.w=w;j.h=h;j.depth=depth;j.src=source;j.row=row;j.image=image;j.blocks=blocks;j.rows=rows;
+        j.units=((rows+3)/4)*depth;j.bpp=bpp;j.block_bytes=block_bytes;j.dst=output;atomic_init(&j.next,0);atomic_init(&j.err,0);atomic_init(&j.active,0);
+        pthread_mutex_lock(&bc_submit);   /* 一次一张：工作线程只认 bc_cur | one image at a time: workers only see bc_cur */
+        pthread_mutex_lock(&bc_mu);bc_cur=&j;bc_gen++;pthread_cond_broadcast(&bc_cv);pthread_mutex_unlock(&bc_mu);
+        bc_run(&j);
+        pthread_mutex_lock(&bc_mu);bc_cur=NULL;while(atomic_load(&j.active))pthread_cond_wait(&bc_done,&bc_mu);pthread_mutex_unlock(&bc_mu);
+        pthread_mutex_unlock(&bc_submit);
+        {static int verify=-1;if(verify<0){const char *e=getenv("DM_BC_VERIFY");verify=e&&*e=='1';}   /* 校验：再串行解一遍逐字节比 | verification: decode serially again and compare byte for byte */
+         if(verify && !atomic_load(&j.err)){uint8_t *ref=malloc(out_size);if(ref){bc_job k=j;k.dst=ref;int bad=0;for(size_t u=0;u<k.units;u++)if(bc_rows(&k,u)){bad=-1;break;}
+             static unsigned long checked,mismatched;checked++;if(!bad && memcmp(ref,output,out_size))mismatched++;
+             if(checked%64==1 || mismatched)fprintf(stderr,"[xbg] BC parallel verify: %lu images, %lu mismatched\n",checked,mismatched);free(ref);}}}
+        return atomic_load(&j.err);
     }
+    uint8_t pixels[128];const uint8_t *src=source;uint8_t *dst=output;
+    static int fast=-1,fverify=0;if(fast<0){const char *e=getenv("DM_BC_FAST");fast=!(e&&*e=='0');e=getenv("DM_BC_FASTVERIFY");fverify=e&&*e=='1';}
+    uint8_t *ref=NULL;if(fast && fverify && bpp==4)ref=malloc(out_size);
+    for(int pass=ref?1:0;pass>=0;pass--){uint8_t *out=pass?ref:dst;int use_fast=fast && bpp==4 && !pass;   /* pass 1 = 原路径参考 | pass 1 = old-path reference */
+    for(uint32_t z=0;z<depth;z++)for(size_t by=0;by<rows;by++)for(size_t bx=0;bx<blocks;bx++){
+        const uint8_t *blk=src+z*image+by*row+bx*block_bytes;
+        if(use_fast && bx*4+4<=w && by*4+4<=h && bc_fast_block(fmt,blk,out+(((size_t)z*h+by*4)*w+bx*4)*4,(size_t)w*4))continue;
+        int r=xbg_decode_block(fmt,blk,block_bytes,pixels,sizeof(pixels));if(r){free(ref);return r;}
+        for(unsigned y=0;y<4 && by*4+y<h;y++)for(unsigned x=0;x<4 && bx*4+x<w;x++)
+            memcpy(out+(((size_t)z*h+by*4+y)*w+bx*4+x)*bpp,pixels+(y*4+x)*bpp,bpp);
+    }}
+    if(ref){static unsigned long checked,mismatched;checked++;if(memcmp(ref,dst,out_size))mismatched++;
+        if(checked%256==1 || mismatched)fprintf(stderr,"[xbg] BC fast verify: %lu images, %lu mismatched (fmt %#x)\n",checked,mismatched,fmt);free(ref);}
     return 0;
 }
 static int decode_verified(const void *source,const xbg_texture *t,uint32_t l,void *out,size_t on) {
