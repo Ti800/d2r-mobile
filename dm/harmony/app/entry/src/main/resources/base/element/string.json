@@ -14,19 +14,19 @@
     },
     {
       "name": "widget_display_name",
-      "value": "小菠萝2"
+      "value": "D2R Mobile 英雄"
     },
     {
       "name": "widget_desc",
-      "value": "最近游玩的角色"
+      "value": "英雄卡片：等级、职业、金币、上次游玩"
     },
     {
       "name": "EntryFormAbility_label",
-      "value": "小菠萝2 卡片"
+      "value": "D2R Mobile 卡片"
     },
     {
       "name": "EntryFormAbility_desc",
-      "value": "显示最近游玩的角色"
+      "value": "桌面显示你的英雄"
     },
     {
       "name": "sync_reason",
